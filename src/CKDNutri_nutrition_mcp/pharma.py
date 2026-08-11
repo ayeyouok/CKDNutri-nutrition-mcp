@@ -153,13 +153,25 @@ def _resolve_drug(drug: str) -> tuple[str, dict[str, Any]] | None:
     text = str(drug or "").strip().lower()
     if not text:
         return None
+    # 1. 完全匹配（药名或别名）
     for name, info in DRUGS.items():
         if text == name.lower():
             return name, info
     for name, info in DRUGS.items():
         keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
-        if any(key in text or text in key for key in keys):
+        if text in keys:
             return name, info
+    # 2. 模糊匹配（仅当输入长度 >= 2，避免单个字符如 "d"/"钙" 的误命中）
+    if len(text) >= 2:
+        for name, info in DRUGS.items():
+            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
+            if any(key.startswith(text) for key in keys):
+                return name, info
+        # 子串包含（仅在输入足够长时，防短输入误判）
+        for name, info in DRUGS.items():
+            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
+            if any(key in text for key in keys):
+                return name, info
     return None
 
 

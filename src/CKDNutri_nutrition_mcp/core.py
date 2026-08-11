@@ -158,22 +158,6 @@ def _interp(lo_anchor: float, hi_anchor: float, lo_value: float, hi_value: float
     return lo_value + (hi_value - lo_value) * ratio
 
 
-def _pd_absorption_fraction(dwell_hours: float) -> float:
-    anchors = PD_ABSORB_ANCHORS
-    if dwell_hours <= anchors[0][0]:
-        return anchors[0][1]
-    if dwell_hours >= anchors[-1][0]:
-        return anchors[-1][1]
-    for i in range(len(anchors) - 1):
-        lo_h, lo_f = anchors[i]
-        hi_h, hi_f = anchors[i + 1]
-        if lo_h <= dwell_hours <= hi_h:
-            if hi_h == lo_h:
-                return lo_f
-            return lo_f + (hi_f - lo_f) * (dwell_hours - lo_h) / (hi_h - lo_h)
-    return anchors[-1][1]
-
-
 def schofield_bmr_kcal(sex: str, age_years: float, weight_kg: float,
                        height_cm: float) -> float | None:
     """Schofield 体重+身高方程，返回 kcal/d。"""
@@ -189,7 +173,10 @@ def schofield_bmr_kcal(sex: str, age_years: float, weight_kg: float,
 
 
 def ideal_body_weight_kg(age_years: float, sex: str, height_cm: float) -> float | None:
-    """按 BMI 第 50 百分位反推参考体重，用于水肿时避免以水重开处方。"""
+    """按 BMI 第 50 百分位反推参考体重，用于水肿时避免以水重开处方。
+    BMI_P50 表仅覆盖 2–18 岁；age_years < 2 时自动夹取 2 岁基准，婴儿体成分与学龄儿童
+    差异较大，推算值仅供参考。
+    """
     if height_cm <= 0:
         return None
     years = sorted(BMI_P50)
@@ -607,7 +594,9 @@ def upsert_food_diary(
         store["entries"] = all_entries
         _save_store(store)
 
-    agg = _aggregate(all_entries)
+    # 仅聚合当前患者记录，防止跨患者数据泄露
+    patient_entries = [e for e in all_entries if e.get("patient_id") == patient_id]
+    agg = _aggregate(patient_entries)
     return {
         "ok": True,
         "data": {
@@ -836,12 +825,20 @@ def calc_growth_zscore(age_years: float, sex: str,
             "WAZ/BAZ 仅 7 岁以下可用（WS/T 423 随附）；7-18 体重/BMI 标准未提供，跳过。")
 
     # PRNT growth_status 建议（供 calc_prnt_targets 输入）
+    # 优先级：HAZ 生长迟缓 > WAZ 低体重/消瘦 > BAZ/BMI 超重
     haz_z = d.get("haz", {}).get("z")
     baz_z = d.get("baz", {}).get("z")
+    waz_z = d.get("waz", {}).get("z")
     if haz_z is not None and haz_z < -2:
         growth_status = "failure"          # 生长迟缓 → 能量取 SDI 上限
+    elif waz_z is not None and waz_z < -2:
+        growth_status = "failure"          # 低体重/消瘦 → 能量取 SDI 上限
     elif baz_z is not None and baz_z >= 1:
-        growth_status = "overweight"        # 超重/肥胖 → 能量向下调整
+        growth_status = "overweight"        # BAZ≥1 → 超重/肥胖，能量向下调整
+    elif baz_z is None and bmi is not None and bmi > 24:
+        # ≥7 岁无 BAZ 标准时，用 BMI>24 粗判超重趋势（中国学龄儿童超重界值）
+        growth_status = "overweight"
+        warnings.append("≥7 岁 BAZ 标准不可用，基于 BMI>24 粗判超重，建议结合腰围/体脂综合评估。")
     else:
         growth_status = "normal"
     d["growth_status_suggestion"] = growth_status
@@ -880,8 +877,7 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     :param date: 评估日期 YYYY-MM-DD
     :param score: PEW 数值分（来自 assess_pew_risk 返回的 score 字段）
     :param level: PEW 风险等级 low / medium / high
-    :param caller: 调用方角色（审计用）；缺省取部署注入的 A207_CALLER（P0-1）
-    :return: 落库后该患者的完整历史点列表
+    :return: 落库后该患者的完整历史点列表（身份由部署环境注入，P0-1）
     """
     caller = get_caller()
     if level not in _PEW_LEVEL_ORDER:
