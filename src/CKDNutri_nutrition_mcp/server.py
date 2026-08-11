@@ -23,10 +23,15 @@ from .core import (
     upsert_food_diary,
 )
 from .diary import sum_diet_intake
-from .foods import lookup_food_nutrients, substitute_food
+from .foods import (
+    calc_pnpr,
+    convert_to_household_measure,
+    lookup_food_nutrients,
+    substitute_food,
+)
 from .mealplan import generate_meal_plan, get_meal_plan_nutrients
-from .measures import convert_to_household_measure
-from .pharma import calc_pd_glucose_absorption, calc_pnpr, check_drug_nutrient_interaction
+from .pharma import check_drug_nutrient_interaction
+from .targets import calc_pd_glucose_absorption
 
 mcp = FastMCP("CKDNutri-nutrition-mcp")
 
