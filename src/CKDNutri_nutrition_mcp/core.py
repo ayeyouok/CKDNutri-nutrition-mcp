@@ -22,6 +22,7 @@ from typing import Any
 from a207_policy import (
     NUTRITION_ASSESSMENT_WRITE_ALLOWED,
     atomic_write_json,
+    enforce_nutrition_tool,
     enforce_read,
     get_caller,
     resolve_state_path,
@@ -612,11 +613,12 @@ def upsert_food_diary(
 
 
 def get_food_diary_summary(patient_id: str) -> dict[str, Any]:
-    """读取并聚合某患者的饮食日记（只读，所有 caller 可读）。
+    """读取并聚合某患者的饮食日记（只读，家长/患儿/临床角色可读）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
+    enforce_nutrition_tool(caller, "get_food_diary_summary")
     store = _load_store()
     entries = [e for e in store.get("entries", []) if e.get("patient_id") == patient_id]
     if not entries:
@@ -880,6 +882,7 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     :return: 落库后该患者的完整历史点列表（身份由部署环境注入，P0-1）
     """
     caller = get_caller()
+    enforce_nutrition_tool(caller, "record_pew_risk")  # 仅临床角色可落 PEW 历史
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
