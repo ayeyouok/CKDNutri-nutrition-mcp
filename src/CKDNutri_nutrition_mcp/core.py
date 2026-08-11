@@ -26,6 +26,7 @@ from a207_policy import (
     get_caller,
     resolve_state_path,
 )
+from .constants import DIALYSIS_ALIAS
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -35,6 +36,17 @@ MCP_NAME = "CKDNutri-nutrition-mcp"
 
 # P1-3：运行时写库不落安装目录。A207_NUTRITION_ASSESSMENT_DATA_DIR 为开发/测试 override。
 _DATA_DIR_ENV = "A207_NUTRITION_ASSESSMENT_DATA_DIR"
+
+
+def _require(value: Any, name: str) -> Any:
+    """入口参数校验（F6）：必填数值/参数传 None 时显式抛出域错误，避免下游 TypeError。
+
+    配合 server 层的 try/except → _invalid()，最终以 {ok:False, error:"INVALID_INPUT"}
+    信封返回，而非把未捕获的 TypeError 暴露给调用方。
+    """
+    if value is None:
+        raise ValueError(f"{name} 不能为 None")
+    return value
 
 
 def _state_path(filename: str) -> str:
@@ -220,11 +232,14 @@ def calc_prnt_targets(
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    _require(age_years, "age_years")
+    _require(weight_kg, "weight_kg")
     sex = sex if sex in ("M", "F") else "M"
     if vegetarian_mode not in _VEG_MULT:
         vegetarian_mode = "mixed"
-    if dialysis_mode not in _DIALYSIS_EXTRA:
-        dialysis_mode = "none"
+    # F7：用 DIALYSIS_ALIAS 单一事实源归一化（兼容 pd/腹透/hemodialysis 等别名），
+    # 避免裸 _DIALYSIS_EXTRA 成员判断把 "pd" 等别名静默降级为 "none"。
+    dialysis_mode = DIALYSIS_ALIAS.get(dialysis_mode, "none") if dialysis_mode else "none"
 
     band = _band_for_age(age_years, sex)
     e_lo, e_hi = band["energy_sdi"]
@@ -373,6 +388,8 @@ def assess_intake_vs_target(
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    _require(age_years, "age_years")
+    _require(weight_kg, "weight_kg")
     required = ("avg_energy_kcal", "avg_protein_g")
     if not all(k in diet for k in required):
         return {"ok": False, "error": "INVALID_INPUT",
@@ -503,6 +520,10 @@ def assess_pew_risk(
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    _require(avg_protein_g, "avg_protein_g")
+    _require(avg_energy_kcal, "avg_energy_kcal")
+    _require(target_protein_g, "target_protein_g")
+    _require(target_energy_kcal, "target_energy_kcal")
     floor_p = target_protein_g * 0.85  # 以目标 85% 作为保守安全下限近似
     pew = _screen_pew(avg_protein_g, avg_energy_kcal, floor_p, target_energy_kcal, albumin_g_L)
     return {"ok": True, "data": {"pew_risk": pew["risk"], "rationale": pew["rationale"]}}
@@ -743,6 +764,7 @@ def calc_growth_zscore(age_years: float, sex: str,
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    _require(age_years, "age_years")
     sex = sex if sex in ("M", "F") else "M"
     ref = _load_growth_ref()
     age_months = age_years * 12.0

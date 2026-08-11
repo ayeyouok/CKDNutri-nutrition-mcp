@@ -249,7 +249,9 @@ def calc_prnt_targets_tool(
 ) -> dict[str, Any]:
     """计算 PRNT 2020 每日能量与蛋白目标。仅 CKD 临床助手。
 
-    dialysis_mode: none / peritoneal / hemodialysis；vegetarian_mode: mixed / lacto_ovo / vegan；
+    ckd_stage: CKD 分期(1-5D)。注意 PRNT 2020 的能量/蛋白数值目标与分期无关
+    （仅由年龄×性别×体重驱动），ckd_stage 仅用于 stage=1 的沿用提示，不影响计算结果。
+    dialysis_mode: none / peritoneal / hemodialysis（兼容 pd/腹透 等别名）；vegetarian_mode: mixed / lacto_ovo / vegan；
     growth_status: normal / failure / overweight（可取 calc_growth_zscore 的 growth_status_suggestion）；
     is_edema=True 时改用 BMI-P50 理想体重开处方（dry weight 原则）。
     """
@@ -346,6 +348,8 @@ def comprehensive_nutrition_assessment_tool(
 ) -> dict[str, Any]:
     """一键营养评估：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定。仅 CKD 临床助手。
 
+    ckd_stage: CKD 分期(1-5D)。注意 PRNT 数值目标与分期无关（仅由年龄×性别×体重驱动），
+    ckd_stage 仅用于 stage=1 的沿用提示，不影响能量/蛋白计算结果。
     内部串联 calc_growth_zscore → calc_prnt_targets → assess_intake_vs_target → assess_pew_risk，
     原 3-4 次 LLM 调用压缩为 1 次。生长状态由 Z 评分自动推导后回灌 PRNT，无需手填。
 
