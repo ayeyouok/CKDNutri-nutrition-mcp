@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-nutrition-mcp"
-version = "0.3.5"
+version = "0.3.6"
 description = "P2 营养计算域——PRNT目标+食物DB+食谱+生长Z+PEW+日记"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0",
     "pydantic>=2",
-    "a207-policy==0.3.3",
+    "a207-policy==0.3.4",
 ]
 
 [project.scripts]

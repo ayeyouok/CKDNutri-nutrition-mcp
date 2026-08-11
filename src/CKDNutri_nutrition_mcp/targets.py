@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from a207_policy import enforce_read, get_caller
+from ._policy import enforce_read, get_caller
 
 from .constants import (
     GLUCOSE_KCAL_PER_G,

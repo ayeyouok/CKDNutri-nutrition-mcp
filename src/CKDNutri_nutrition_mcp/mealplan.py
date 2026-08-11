@@ -16,7 +16,7 @@ import json
 import os
 from typing import Any, Optional
 
-from a207_policy import enforce_read, get_caller
+from ._policy import enforce_read, get_caller
 
 MCP_NAME = "CKDNutri-nutrition-mcp"
 

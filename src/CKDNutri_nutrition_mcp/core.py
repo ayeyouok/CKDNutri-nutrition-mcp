@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from a207_policy import (
+from ._policy import (
     NUTRITION_ASSESSMENT_WRITE_ALLOWED,
     atomic_write_json,
     enforce_read,
