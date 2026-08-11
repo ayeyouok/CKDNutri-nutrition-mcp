@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._policy import enforce_read, get_caller
+from a207_policy import enforce_read, get_caller
 
 from .constants import MCP_NAME
 
