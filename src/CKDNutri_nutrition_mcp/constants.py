@@ -1,0 +1,124 @@
+# -*- coding: utf-8 -*-
+"""参考表与阈值常量。
+
+单位口径（与 contracts/pcp-schema.json 一致）：
+  能量 kcal / 蛋白 g / 体重 kg / 身高 cm / 电解质 mg（食物）或 mmol/L（血液）。
+
+PRNT 2020 出处：Shaw V, Polderman N, Renken-Terhaerdt J, et al.
+Energy and protein requirements for children with CKD stages 2-5 and on dialysis.
+Pediatr Nephrol. 2020;35(3):519-531.
+"""
+
+# 本包在 a207_policy 权限矩阵中的登记名（方案 A：闸门按此查表，不在包内判角色）
+MCP_NAME = "CKDNutri-nutrition-mcp"
+
+GUIDELINE = "PRNT 2020"
+GUIDELINE_REF = (
+    "Shaw V, et al. Energy and protein requirements for children with CKD "
+    "stages 2-5 and on dialysis - clinical practice recommendations from the "
+    "Pediatric Renal Nutrition Taskforce. Pediatr Nephrol 2020;35:519-531."
+)
+FOOD_TABLE_REF = "中国食物成分表（第6版）代表值，每 100 g 可食部；数值经四舍五入"
+
+# --- PRNT 能量/蛋白 SDI 年龄锚点 -------------------------------------------
+# age_months: 锚点月龄；energy: kcal/kg/d (低, 高) 按性别；protein: g/kg/d (低, 高)
+SDI_ANCHORS = (
+    {"age_months": 3, "band": "0-3 月龄",
+     "energy": {"M": (82.0, 107.0), "F": (82.0, 107.0)}, "protein": (1.40, 2.50)},
+    {"age_months": 9, "band": "6-9 月龄",
+     "energy": {"M": (72.0, 82.0), "F": (72.0, 82.0)}, "protein": (1.10, 1.30)},
+    {"age_months": 12, "band": "12 月龄",
+     "energy": {"M": (72.0, 92.0), "F": (72.0, 92.0)}, "protein": (0.90, 1.14)},
+    {"age_months": 24, "band": "2 岁",
+     "energy": {"M": (81.0, 95.0), "F": (79.0, 92.0)}, "protein": (0.90, 1.05)},
+    {"age_months": 60, "band": "4-6 岁",
+     "energy": {"M": (67.0, 93.0), "F": (64.0, 90.0)}, "protein": (0.85, 0.95)},
+    {"age_months": 114, "band": "9-10 岁",
+     "energy": {"M": (55.0, 69.0), "F": (49.0, 63.0)}, "protein": (0.90, 0.95)},
+    {"age_months": 192, "band": "15-17 岁",
+     "energy": {"M": (40.0, 55.0), "F": (36.0, 46.0)}, "protein": (0.80, 0.90)},
+)
+
+# --- 分期/透析对应的蛋白处方区间 (g/kg/d) ------------------------------------
+# 依据：PRNT 2020 对透析患儿在 SDI 基础上补偿丢失；CKD 3-5 期非透析在保证生长
+# 前提下将蛋白控制在 SDI 上限附近而不过量（本项目锁定的临床落地区间）。
+PROTEIN_BAND = {
+    "none_early": None,          # CKD 1-2 期：不做限制，直接用 SDI 区间
+    "none_ckd345": (0.80, 1.00),  # CKD 3-5 期非透析
+    "hemodialysis": (1.00, 1.20),
+    "peritoneal": (1.00, 1.20),
+}
+DIALYSIS_ALIAS = {
+    "none": "none", "非透析": "none", "no": "none", "": "none", "nd": "none",
+    "hd": "hemodialysis", "hemodialysis": "hemodialysis", "血透": "hemodialysis",
+    "血液透析": "hemodialysis",
+    "pd": "peritoneal", "peritoneal": "peritoneal", "腹透": "peritoneal",
+    "腹膜透析": "peritoneal", "capd": "peritoneal", "apd": "peritoneal",
+}
+DIALYSIS_LABEL = {"none": "非透析", "hemodialysis": "血液透析", "peritoneal": "腹膜透析"}
+
+# --- Schofield 静息能量消耗方程（体重+身高版，MJ/d，身高以 m 计）-------------
+SCHOFIELD = {
+    ("M", 3): (0.0007, 6.349, -2.584),
+    ("M", 10): (0.082, 0.545, 1.736),
+    ("M", 18): (0.071, 2.132, -1.184),
+    ("F", 3): (0.068, 4.281, -1.730),
+    ("F", 10): (0.071, 0.677, 1.553),
+    ("F", 18): (0.035, 1.948, 0.837),
+}
+PAL_DEFAULT = 1.4          # CKD 患儿常见轻体力活动系数
+KJ_PER_KCAL = 4.184
+
+# --- BMI 第 50 百分位参考（用于水肿时估算干体重）---------------------------
+BMI_P50 = {
+    2: (16.4, 16.1), 3: (16.0, 15.7), 4: (15.8, 15.4), 5: (15.5, 15.3),
+    6: (15.5, 15.3), 7: (15.7, 15.5), 8: (16.0, 15.9), 9: (16.4, 16.4),
+    10: (16.9, 16.9), 11: (17.4, 17.5), 12: (18.0, 18.2), 13: (18.6, 18.9),
+    14: (19.3, 19.6), 15: (19.9, 20.2), 16: (20.5, 20.7), 17: (21.1, 21.1),
+    18: (21.7, 21.4),
+}
+
+# --- 腹膜透析葡萄糖吸收 -----------------------------------------------------
+GLUCOSE_KCAL_PER_G = 3.4   # 葡萄糖一水合物（腹透液用糖）
+PD_ABSORB_ANCHORS = ((1.0, 0.30), (2.0, 0.38), (4.0, 0.55),
+                     (6.0, 0.65), (8.0, 0.72), (12.0, 0.80))
+PD_TRANSPORT_FACTOR = {"high": 1.15, "high_average": 1.05, "average": 1.0,
+                       "low_average": 0.92, "low": 0.85}
+PD_GLUCOSE_KCAL_PER_KG_REF = (7.5, 9.08)  # PRNT 引用的日吸收参考区间
+
+# --- 食物电解质分级阈值（mg / 100 g 可食部）--------------------------------
+K_LEVELS = ((150.0, "low", "低钾"), (250.0, "medium", "中等钾"),
+            (400.0, "high", "高钾"), (float("inf"), "very_high", "极高钾"))
+P_LEVELS = ((80.0, "low", "低磷"), (160.0, "medium", "中等磷"),
+            (300.0, "high", "高磷"), (float("inf"), "very_high", "极高磷"))
+NA_HIGH_MG_PER_100G = 400.0
+# 磷蛋白比 mg P / g 蛋白：肾病选食核心指标
+PNPR_LEVELS = ((12.0, "preferred", "优选"), (16.0, "acceptable", "可接受"),
+               (float("inf"), "caution", "慎选"))
+
+# --- 烹调处理对电解质的保留系数 ---------------------------------------------
+COOKING_LOSS = {
+    "raw": {"factor": {"potassium_mg": 1.0, "phosphorus_mg": 1.0, "sodium_mg": 1.0},
+            "label": "不做处理（生重/原值）"},
+    "blanch": {"factor": {"potassium_mg": 0.50, "phosphorus_mg": 0.80, "sodium_mg": 0.90},
+               "label": "焯水后弃汤（适用叶菜）"},
+    "boil_discard": {"factor": {"potassium_mg": 0.40, "phosphorus_mg": 0.75, "sodium_mg": 0.85},
+                     "label": "切小块水煮后弃汤（适用薯类/根茎）"},
+    "soak": {"factor": {"potassium_mg": 0.70, "phosphorus_mg": 0.90, "sodium_mg": 0.95},
+             "label": "切块冷水浸泡 2 小时并换水"},
+    "boil_meat": {"factor": {"potassium_mg": 0.70, "phosphorus_mg": 0.90, "sodium_mg": 0.90},
+                  "label": "肉类水煮后弃汤"},
+}
+COOKING_ALIAS = {"生": "raw", "不处理": "raw", "焯水": "blanch", "焯": "blanch",
+                 "水煮弃汤": "boil_discard", "水煮": "boil_discard",
+                 "浸泡": "soak", "泡水": "soak", "煮肉弃汤": "boil_meat"}
+
+DEKALIUM_TIPS = {
+    "叶菜": "叶菜先焯水 3-5 分钟并弃掉焯水，再下锅炒，钾可去掉约一半。",
+    "薯类": "薯类去皮切小块，冷水浸泡 2 小时换水，再水煮弃汤，钾可去掉约六成。",
+    "根茎": "根茎类切薄片浸泡后水煮弃汤，避免连汤食用。",
+    "菌藻": "干菌藻类泡发后弃掉泡发水，不要用泡发水煮汤。",
+    "水果": "高钾水果控制单次分量，不喝果汁与果泥浓缩制品（同样重量钾更集中）。",
+    "畜肉": "肉类先水煮弃汤再烹调，可去掉部分钾；不喝浓汤与肉汁。",
+    "default": "汤汁中钾磷钠含量高，吃菜不喝汤是最简单有效的一步。",
+}
