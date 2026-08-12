@@ -9,6 +9,8 @@ v0.3.2 修复：工具包装层签名与 core 全面对齐（此前 11 个工具
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -41,7 +43,19 @@ mcp = FastMCP("CKDNutri-nutrition-mcp")
 
 def _invalid(exc):
     if isinstance(exc, CallerError):
-        raise
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与 care _guard /
+        # clinical-data _guard_access 同格式），不再向上抛导致 500。此前本包 9 个临床工具
+        # 裸调 enforce_nutrition_tool，越权即 500 崩溃。PermissionDenied 带 caller/action/reason，
+        # CallerUnknown 缺字段时降级文案。
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
+                          f"（{getattr(exc, 'reason', str(exc))}）"}
+    # BUG-52（2026-08-12）：区分"入参错误"与"内部数据错误"——FileNotFoundError/
+    # OSError（数据文件缺失）与 JSONDecodeError（数据损坏）是运维层错误，
+    # 归 INTERNAL_ERROR 而非 INVALID_INPUT（后者误导调用方以为入参不合法）。
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError)):
+        return {"ok": False, "error": "INTERNAL_ERROR",
+                "detail": f"内部数据错误：{exc}"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
@@ -435,6 +449,9 @@ def comprehensive_nutrition_assessment_tool(
             pew = assess_pew_risk(
                 float(diet.get("avg_protein_g", 0.0)), float(diet.get("avg_energy_kcal", 0.0)),
                 float(target_p), float(target_e), serum_albumin_g_l,
+                # BUG-42：PEW 蛋白下限用 PRNT 官方 SDI 下限（floor_g_per_day），
+                # 不用"目标×85%"近似（婴儿段会把 1.52-2.1 g/kg 的合规摄入误判为低于安全下限）
+                floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
             )
             if pew.get("ok"):
                 level = pew["data"]["pew_risk"]

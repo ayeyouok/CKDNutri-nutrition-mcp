@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import os
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,9 @@ MCP_NAME = "CKDNutri-nutrition-mcp"
 
 # P1-3：运行时写库不落安装目录。A207_NUTRITION_ASSESSMENT_DATA_DIR 为开发/测试 override。
 _DATA_DIR_ENV = "A207_NUTRITION_ASSESSMENT_DATA_DIR"
+
+# BUG-53（2026-08-12）：日记/PEW 存储 read-modify-write 并发保护（与 P3 care 同口径）
+_STORE_LOCK = threading.Lock()
 
 
 def _require(value: Any, name: str) -> Any:
@@ -316,7 +320,9 @@ def calc_prnt_targets(
     protein_floor_g = protein_floor_per_kg * eff_weight
 
     # Schofield 交叉校验（信息性，不改变 SDI 权威数）：PAL×BMR 与 SDI 目标对照
-    schofield_bmr = schofield_bmr_kcal(sex, age_years, weight_kg, height_cm)
+    # BUG-49（2026-08-12）：用 eff_weight（水肿校正后理想体重）而非原始 weight_kg——
+    # 水肿患儿的"水重"会让 BMR 虚高、deviation 偏负，误触发 divergent 提示。
+    schofield_bmr = schofield_bmr_kcal(sex, age_years, eff_weight, height_cm)
     schofield_cross = None
     if schofield_bmr:
         pal_adjusted = round(schofield_bmr * PAL_DEFAULT, 1)
@@ -545,9 +551,14 @@ def assess_pew_risk(
     target_protein_g: float,
     target_energy_kcal: float,
     albumin_g_L: float | None = None,
+    floor_protein_g: float | None = None,
 ) -> dict[str, Any]:
     """独立 PEW 风险筛查接口（供编排层直接传入已算好的均值与目标）。
 
+    floor_protein_g（BUG-42 修复，2026-08-12）：PRNT 官方蛋白安全下限（=SDI 下限×体重），
+    应传入 calc_prnt_targets 返回的 protein.floor_g_per_day。缺省时退化为
+    "目标×85%"近似（婴儿段会偏高：0 月段官方下限 1.52 远低于 85% 目标 2.13，
+    会把合规摄入误判为低于安全下限）——独立调用方建议显式传官方下限。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
@@ -557,7 +568,7 @@ def assess_pew_risk(
     _require(avg_energy_kcal, "avg_energy_kcal")
     _require(target_protein_g, "target_protein_g")
     _require(target_energy_kcal, "target_energy_kcal")
-    floor_p = target_protein_g * 0.85  # 以目标 85% 作为保守安全下限近似
+    floor_p = floor_protein_g if floor_protein_g is not None else target_protein_g * 0.85
     pew = _screen_pew(avg_protein_g, avg_energy_kcal, floor_p, target_energy_kcal, albumin_g_L)
     return {"ok": True, "data": {"pew_risk": pew["risk"], "rationale": pew["rationale"]}}
 
@@ -621,26 +632,27 @@ def upsert_food_diary(
     if not entries:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "entries 不能为空"}
 
-    store = _load_store()
-    existing = store.get("entries", [])
-    stamped = []
-    for e in entries:
-        stamped.append({
-            "patient_id": patient_id,
-            "date": e.get("date", datetime.now().strftime("%Y-%m-%d")),
-            "meal": e.get("meal", ""),
-            "food": e.get("food", ""),
-            "energy_kcal": float(e.get("energy_kcal", 0.0)),
-            "protein_g": float(e.get("protein_g", 0.0)),
-            "potassium_mg": float(e.get("potassium_mg", 0.0)),
-            "phosphorus_mg": float(e.get("phosphorus_mg", 0.0)),
-            "sodium_mg": float(e.get("sodium_mg", 0.0)),
-        })
-    all_entries = existing + stamped
-
-    if write_mode:
-        store["entries"] = all_entries
-        _save_store(store)
+    with _STORE_LOCK:
+        store = _load_store()
+        existing = store.get("entries", [])
+        stamped = []
+        for e in entries:
+            stamped.append({
+                "patient_id": patient_id,
+                "date": e.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "meal": e.get("meal", ""),
+                "food": e.get("food", ""),
+                "energy_kcal": float(e.get("energy_kcal", 0.0)),
+                "protein_g": float(e.get("protein_g", 0.0)),
+                "potassium_mg": float(e.get("potassium_mg", 0.0)),
+                "phosphorus_mg": float(e.get("phosphorus_mg", 0.0)),
+                "sodium_mg": float(e.get("sodium_mg", 0.0)),
+            })
+        all_entries = existing + stamped
+    
+        if write_mode:
+            store["entries"] = all_entries
+            _save_store(store)
 
     # 仅聚合当前患者记录，防止跨患者数据泄露
     patient_entries = [e for e in all_entries if e.get("patient_id") == patient_id]
@@ -812,6 +824,12 @@ def calc_growth_zscore(age_years: float, sex: str,
     # BUG-19：sex 非法值显式报错，不再静默按男性计算
     if sex not in ("M", "F"):
         raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
+    # Code Smells-15（2026-08-12）：身高/体重必须为正——此前 height_cm=0 会算出
+    # (0-中位数)/SD 的 -26 级荒谬 Z 分，静默返回"生长迟缓"误导临床。
+    if height_cm is not None and height_cm <= 0:
+        raise ValueError("height_cm 必须 > 0")
+    if weight_kg is not None and weight_kg <= 0:
+        raise ValueError("weight_kg 必须 > 0")
     ref = _load_growth_ref()
     age_months = age_years * 12.0
     results: dict[str, Any] = {"ok": True, "data": {}}
@@ -940,22 +958,23 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
-    store = _load_pew_store()
-    pts = store.get(patient_id, [])
-    pts.append({
-        "date": date,
-        "score": score,
-        "level": level,
-        "recorded_at": datetime.now().isoformat(timespec="seconds"),
-        "caller": caller,
-    })
-    # 同日只保留最新一次（覆盖更新）
-    by_date: dict = {}
-    for p in pts:
-        by_date[p["date"]] = p
-    ordered = [by_date[k] for k in sorted(by_date.keys())]
-    store[patient_id] = ordered
-    _save_pew_store(store)
+    with _STORE_LOCK:
+        store = _load_pew_store()
+        pts = store.get(patient_id, [])
+        pts.append({
+            "date": date,
+            "score": score,
+            "level": level,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "caller": caller,
+        })
+        # 同日只保留最新一次（覆盖更新）
+        by_date: dict = {}
+        for p in pts:
+            by_date[p["date"]] = p
+        ordered = [by_date[k] for k in sorted(by_date.keys())]
+        store[patient_id] = ordered
+        _save_pew_store(store)
     return {"ok": True, "patient_id": patient_id, "points": ordered}
 
 
@@ -989,5 +1008,4 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
         "points": pts,
         "trend": trend,
     }
-
 

@@ -16,7 +16,8 @@ NUTRIENT_ALIAS = {
     "蛋白": "protein", "蛋白质": "protein", "protein": "protein",
     "能量": "energy", "热量": "energy", "energy": "energy",
     "铁": "iron", "iron": "iron", "fe": "iron",
-    "镁": "magnesium", "magnesium": "magnesium", "mg": "magnesium",
+    "镁": "magnesium", "magnesium": "magnesium",
+    # 注：不收录 "mg" 别名——"mg" 同时是毫克单位缩写，收录会把"剂量 mg"误解析为"镁"（P3-12）
     "维生素d": "vitamin_d", "vitamin_d": "vitamin_d", "vd": "vitamin_d", "维d": "vitamin_d",
     "脂溶性维生素": "vitamin_d", "液体": "fluid", "水": "fluid", "fluid": "fluid",
 }

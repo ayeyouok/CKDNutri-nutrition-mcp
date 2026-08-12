@@ -65,16 +65,29 @@ def _sum_items(items: list[dict]) -> dict:
 
 
 def _achievement(tot: dict, t_energy: float, t_protein: float, t_k: float, t_p: float, t_na: float) -> dict:
+    """达成率。能量/蛋白是"摄入目标"（越高越好，超 100 保留）；钾/磷/钠是
+    **限制性上限目标**（超限有害）——达成率 cap 在 100%，超标单独以 *_exceeded 标注，
+    避免"磷超标 150%"被读成更高达成率拉高整体（BUG-41 修复，2026-08-12）。"""
     def pct(actual: float, target: float) -> int:
         if target <= 0:
             return 0
         return round(actual / target * 100)
+
+    def cap_pct(actual: float, target: float) -> int:
+        if target <= 0:
+            return 0
+        return min(round(actual / target * 100), 100)
+
     return {
         "energy_pct": pct(tot["energy_kcal"], t_energy),
         "protein_pct": pct(tot["protein_g"], t_protein),
-        "potassium_pct": pct(tot["potassium_mg"], t_k),
-        "phosphorus_pct": pct(tot["phosphorus_mg"], t_p),
-        "sodium_pct": pct(tot["sodium_mg"], t_na),
+        "potassium_pct": cap_pct(tot["potassium_mg"], t_k),
+        "phosphorus_pct": cap_pct(tot["phosphorus_mg"], t_p),
+        "sodium_pct": cap_pct(tot["sodium_mg"], t_na),
+        # 限制性上限目标：是否超限（true 表示当日该营养素超过上限）
+        "potassium_exceeded": tot["potassium_mg"] > t_k if t_k > 0 else False,
+        "phosphorus_exceeded": tot["phosphorus_mg"] > t_p if t_p > 0 else False,
+        "sodium_exceeded": tot["sodium_mg"] > t_na if t_na > 0 else False,
     }
 
 
