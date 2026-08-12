@@ -30,7 +30,7 @@ def _absorption_fraction(dwell_hours: float) -> float:
         lo_h, lo_f = anchors[index]
         hi_h, hi_f = anchors[index + 1]
         if lo_h <= dwell_hours <= hi_h:
-            lo, hi = anchors[index], anchors[index + 1]
+            # 💭（2026-08-12 五包审查）：去掉重复解包（lo/hi 与 lo_h/hi_h 同值）
             if hi_h == lo_h:
                 return lo_f
             ratio = (dwell_hours - lo_h) / (hi_h - lo_h)

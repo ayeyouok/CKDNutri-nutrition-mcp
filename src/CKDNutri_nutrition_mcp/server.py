@@ -10,6 +10,7 @@ v0.3.2 修复：工具包装层签名与 core 全面对齐（此前 11 个工具
 from __future__ import annotations
 
 import json
+import logging
 
 from typing import Any, Optional
 
@@ -27,10 +28,9 @@ from .core import (
     record_pew_risk,
     upsert_food_diary,
 )
+from .constants import DIALYSIS_ALIAS
 from .diary import sum_diet_intake
 from .foods import (
-    calc_pnpr,
-    convert_to_household_measure,
     lookup_food_nutrients,
     substitute_food,
 )
@@ -40,23 +40,41 @@ from .targets import calc_pd_glucose_absorption
 
 mcp = FastMCP("CKDNutri-nutrition-mcp")
 
+# B2（2026-08-12 五包审查）：异常分级归类统一到 care/assessment 口径——
+# ① ValueError（core 业务/参数校验）归 INVALID_INPUT 且 detail 保留；
+# ② 内部数据错误（文件/JSON/RuntimeError）归 INTERNAL_ERROR；
+# ③ 未知系统异常（TypeError/KeyError/AttributeError 等内部 Code Bug）归
+#   INTERNAL_ERROR 且 detail **脱敏**（不裸暴露 str(exc)，完整堆栈仅服务端日志）。
+logger = logging.getLogger("CKDNutri-nutrition-mcp")
+
 
 def _invalid(exc):
     if isinstance(exc, CallerError):
-        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与 care _guard /
-        # clinical-data _guard_access 同格式），不再向上抛导致 500。此前本包 9 个临床工具
-        # 裸调 enforce_nutrition_tool，越权即 500 崩溃。PermissionDenied 带 caller/action/reason，
-        # CallerUnknown 缺字段时降级文案。
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封，不再向上抛 500。
+        # 2026-08-12（七审，care 同口径）：caller/action/reason 三重 or 保底——
+        # getattr 默认值在属性显式置 None/空串时不生效。
+        logger.warning("营养服务鉴权拒绝: exc=%s", exc)
+        caller = getattr(exc, "caller", None) or "?"
+        action = getattr(exc, "action", None) or "access"
+        reason = getattr(exc, "reason", None) or str(exc) or "无明确原因"
         return {"ok": False, "error": "FORBIDDEN",
-                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
-                          f"（{getattr(exc, 'reason', str(exc))}）"}
-    # BUG-52（2026-08-12）：区分"入参错误"与"内部数据错误"——FileNotFoundError/
-    # OSError（数据文件缺失）与 JSONDecodeError（数据损坏）是运维层错误，
-    # 归 INTERNAL_ERROR 而非 INVALID_INPUT（后者误导调用方以为入参不合法）。
-    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError)):
+                "detail": f"caller={caller} 无权 {action}（{reason}）"}
+    # BUG-52 + B2（2026-08-12）：内部数据错误（含 B1 损坏文件 RuntimeError）归
+    # INTERNAL_ERROR；detail **脱敏**——OSError/FileNotFoundError 的 str 含服务端
+    # 绝对路径，原样返回泄露文件系统结构；完整异常仅留服务端日志。
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError)):
+        logger.warning("营养服务内部数据错误: %s", exc)
         return {"ok": False, "error": "INTERNAL_ERROR",
-                "detail": f"内部数据错误：{exc}"}
-    return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+                "detail": "内部数据错误（error_code=NUTR_DATA），详情见服务端日志"}
+    if isinstance(exc, ValueError):
+        # core 层业务/参数校验异常——detail 对调用方有明确语义，保留
+        logger.info("营养服务参数校验拦截: %s", exc)
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+    # 未知系统异常 = 内部 Code Bug——归 INTERNAL_ERROR（编排层不应重试/误判入参），
+    # detail 脱敏，完整堆栈仅服务端日志。
+    logger.error("营养服务未预期异常（内部 bug，error_code=NUTR_UNKNOWN）", exc_info=exc)
+    return {"ok": False, "error": "INTERNAL_ERROR",
+            "detail": "营养服务内部错误（error_code=NUTR_UNKNOWN），请查服务端日志"}
 
 
 def _stage_int(value: Any, default: int = 1) -> int:
@@ -109,10 +127,15 @@ def get_food_diary_summary_tool(patient_id: str, guardian_token: str = "") -> di
 # ---- food 组（食物查询，全角色可见） ----
 
 @mcp.tool
-def lookup_food_nutrients_tool(food_name: str, portion: Optional[str] = None) -> dict[str, Any]:
-    """查食物营养成分。portion 可传家庭量具（如“一碗”“半个”），缺省按 100 g。"""
+def lookup_food_nutrients_tool(food_name: str, portion: Optional[str] = None,
+                               include_household: bool = True) -> dict[str, Any]:
+    """查食物营养成分。portion 可传家庭量具（如“一碗”“半个”），缺省按 100 g。
+
+    include_household=True（默认）时，输出内嵌 measure（家庭量具表达）与
+    pnpr（磷蛋白比+分级），无需再单独调用换算/磷蛋白比工具。
+    """
     try:
-        return lookup_food_nutrients(food_name, portion)
+        return lookup_food_nutrients(food_name, portion, include_household=include_household)
     except Exception as exc:
         return _invalid(exc)
 
@@ -122,15 +145,6 @@ def substitute_food_tool(food: str, constraint: str = "等能量", top_n: int = 
     """按约束推荐替换食物（等能量 / 低钾 / 低磷 / 低钠 等）。"""
     try:
         return substitute_food(food, constraint, top_n)
-    except Exception as exc:
-        return _invalid(exc)
-
-
-@mcp.tool
-def convert_to_household_measure_tool(food_name: str, grams: float) -> dict[str, Any]:
-    """克重 → 家庭量具换算，并同时给出该克重的营养素。"""
-    try:
-        return convert_to_household_measure(food_name, float(grams))
     except Exception as exc:
         return _invalid(exc)
 
@@ -146,56 +160,6 @@ def sum_diet_intake_tool(diary: list, target: Optional[dict] = None) -> dict[str
     """
     try:
         return sum_diet_intake(diary, target)
-    except Exception as exc:
-        return _invalid(exc)
-
-
-@mcp.tool
-def calc_pnpr_tool(
-    food: Optional[str] = None,
-    protein_g: Optional[float] = None,
-    phosphorus_mg: Optional[float] = None,
-    grams: float = 100.0,
-) -> dict[str, Any]:
-    """磷蛋白比 PNPR（mg 磷 / g 蛋白）：同等蛋白供给下的磷负荷指标。
-
-    两种用法：传 food（查内置食物表，按 grams 缩放）；或直接传 protein_g + phosphorus_mg。
-    """
-    try:
-        return calc_pnpr(food, protein_g, phosphorus_mg, grams)
-    except Exception as exc:
-        return _invalid(exc)
-
-
-@mcp.tool
-def calc_pd_glucose_absorption_tool(
-    dwell_hours: float,
-    dialysate_glucose_g: Optional[float] = None,
-    dialysate_volume_ml: Optional[float] = None,
-    glucose_conc_pct: Optional[float] = None,
-    exchanges_per_day: int = 1,
-    transport_type: str = "average",
-    weight_kg: Optional[float] = None,
-) -> dict[str, Any]:
-    """腹透葡萄糖倒灌：估算吸收克数与额外能量（须从膳食能量目标中扣减）。
-
-    每袋糖量二选一：直接给 dialysate_glucose_g；或给 dialysate_volume_ml + glucose_conc_pct
-    （如 1000 ml 的 1.5% 糖液 = 15 g），本层自动换算。
-    transport_type: low / low_average / average / high_average / high。
-    """
-    try:
-        glucose_g = dialysate_glucose_g
-        if glucose_g is None:
-            if dialysate_volume_ml is None or glucose_conc_pct is None:
-                return {"ok": False, "error": "INVALID_INPUT",
-                        "detail": "需提供 dialysate_glucose_g，或同时提供 dialysate_volume_ml 与 glucose_conc_pct"}
-            glucose_g = float(dialysate_volume_ml) * float(glucose_conc_pct) / 100.0
-        return calc_pd_glucose_absorption(
-            float(glucose_g), float(dwell_hours),
-            exchanges_per_day=int(exchanges_per_day),
-            transport_type=transport_type,
-            weight_kg=weight_kg,
-        )
     except Exception as exc:
         return _invalid(exc)
 
@@ -361,6 +325,12 @@ def comprehensive_nutrition_assessment_tool(
     include_intake: bool = False,
     patient_id: str = "",
     pd_glucose_kcal_per_day: Optional[float] = None,
+    pd_dwell_hours: Optional[float] = None,
+    pd_dialysate_glucose_g: Optional[float] = None,
+    pd_dialysate_volume_ml: Optional[float] = None,
+    pd_glucose_conc_pct: Optional[float] = None,
+    pd_exchanges_per_day: int = 1,
+    pd_transport_type: str = "average",
 ) -> dict[str, Any]:
     """一键营养评估：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定。仅 CKD 临床助手。
 
@@ -372,14 +342,44 @@ def comprehensive_nutrition_assessment_tool(
     摄入来源优先级：显式 avg_protein_g/avg_energy_kcal > include_intake+patient_id 查饮食日记。
     两者都没有则跳过摄入与 PEW 环节（仅出 Z 评分 + 目标）。
 
-    pd_glucose_kcal_per_day: 腹透患儿从透析液吸收的葡萄糖供能（kcal/day），
-    会扣减膳食能量目标（BUG-08 修复：此前 DAG 未透传该参数，腹透能量目标偏高）。
+    腹透能量修正（v2.4 工具收敛）：pd_glucose_kcal_per_day 可直接传入（已算好的
+    吸收能量）；也可以传 pd_dwell_hours + （pd_dialysate_glucose_g 或
+    pd_dialysate_volume_ml+pd_glucose_conc_pct），由本 DAG 内部调用腹透葡萄糖吸收
+    计算并自动扣减——LLM 无需先调独立工具。非腹透患儿不触发。
     """
     try:
         # BUG-03 修复：DAG 一键评估属临床工具（已登记 CLINICAL_TOOLS），入口显式收口，
         # 不依赖子函数各自的 enforce_*（防御纵深）。
         enforce_nutrition_tool(get_caller(), "comprehensive_nutrition_assessment")
         stage = _stage_int(ckd_stage)
+
+        # v2.4：腹透吸收在 DAG 内部计算（C3 下沉）——非腹透一律不触发。
+        # 显式 pd_glucose_kcal_per_day 优先；否则按透析模式 + 处方参数内部算。
+        pd_kcal = pd_glucose_kcal_per_day
+        pd_notes: list[str] = []
+        normalized_dialysis = DIALYSIS_ALIAS.get(
+            str(dialysis_mode or "").strip().lower(), "none")
+        if pd_kcal is None and normalized_dialysis == "peritoneal":
+            if pd_dialysate_glucose_g is None and (
+                    pd_dialysate_volume_ml is None or pd_glucose_conc_pct is None):
+                pd_notes.append("腹透患儿未提供透析液糖量/留腹时长，能量目标未扣减葡萄糖吸收。")
+            else:
+                glucose_g = pd_dialysate_glucose_g
+                if glucose_g is None:
+                    glucose_g = float(pd_dialysate_volume_ml) * float(pd_glucose_conc_pct) / 100.0
+                pd_result = calc_pd_glucose_absorption(
+                    float(glucose_g), float(pd_dwell_hours or 0.0),
+                    exchanges_per_day=int(pd_exchanges_per_day or 1),
+                    transport_type=pd_transport_type or "average",
+                    weight_kg=float(weight_kg) if weight_kg else None,
+                )
+                if pd_result.get("ok"):
+                    pd_kcal = pd_result["data"]["absorbed_energy_kcal_per_day"]
+                    pd_notes.append(
+                        f"DAG 内部计算腹透葡萄糖吸收 {pd_kcal} kcal/d，已从膳食能量目标扣减。")
+                else:
+                    pd_notes.append("腹透葡萄糖吸收计算失败：" +
+                                    str(pd_result.get("detail", "未知原因")))
 
         # 1) 生长 Z 评分（一次调用同时给 HAZ/WAZ/BAZ 与 growth_status 建议）
         z = calc_growth_zscore(float(age_years), sex,
@@ -395,7 +395,7 @@ def comprehensive_nutrition_assessment_tool(
             height_cm=float(height_cm or 0.0), ckd_stage=stage,
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
             growth_status=growth_status, is_edema=bool(is_edema),
-            pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
+            pd_glucose_kcal_per_day=pd_kcal,
         )
         if not prnt.get("ok"):
             return prnt
@@ -410,7 +410,7 @@ def comprehensive_nutrition_assessment_tool(
                 "prnt_targets": prnt["data"],
                 "intake_assessment": None,
                 "pew": None,
-                "notes": [],
+                "notes": list(pd_notes),
             },
         }
         d = result["data"]
@@ -442,7 +442,7 @@ def comprehensive_nutrition_assessment_tool(
                 ckd_stage=stage, dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
                 growth_status=growth_status, height_cm=float(height_cm or 0.0),
                 is_edema=bool(is_edema),
-                pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,  # BUG-08：透传腹透扣减
+                pd_glucose_kcal_per_day=pd_kcal,  # BUG-08：透传腹透扣减
                 albumin_g_L=serum_albumin_g_l,  # BUG-61：白蛋白参与摄入路径 PEW 筛查
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake

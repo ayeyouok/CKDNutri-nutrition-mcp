@@ -30,7 +30,68 @@ def test_calc_prnt_targets():
     assert "ok" in r and "data" in r
 
 
+def test_calc_prnt_targets_validation():
+    """S2（2026-08-12 五包审查）回归：fail-closed 校验 + lacto_ovo 同义别名。"""
+    from CKDNutri_nutrition_mcp import core
+
+    def _raises(fn, label):
+        try:
+            fn()
+        except ValueError:
+            return
+        raise AssertionError(f"期望 {label} 抛 ValueError")
+
+    # weight_kg <= 0 拒绝（此前静默产出 0/负能量目标）
+    _raises(lambda: core.calc_prnt_targets(age_years=6, sex="F", weight_kg=0, height_cm=130),
+            "weight_kg=0")
+    # 负年龄拒绝（与 calc_growth_zscore 同口径）
+    _raises(lambda: core.calc_prnt_targets(age_years=-1, sex="F", weight_kg=20, height_cm=130),
+            "age_years=-1")
+    # growth_status 非法值拒绝（此前静默取 SDI 中点）
+    _raises(lambda: core.calc_prnt_targets(age_years=6, sex="F", weight_kg=20, height_cm=130,
+                                           growth_status="invalid"), "growth_status=invalid")
+    # vegetarian_mode 非法值拒绝（此前静默降级 mixed，蛋白需求低估 20%）
+    _raises(lambda: core.calc_prnt_targets(age_years=6, sex="F", weight_kg=20, height_cm=130,
+                                           vegetarian_mode="ovo-lacto"), "vegetarian_mode=ovo-lacto")
+    # lacto_ovo 与 ovo_lacto 同义：按文档传 lacto_ovo 应生效蛋奶素倍数 1.2（此前静默降级 1.0）
+    r = core.calc_prnt_targets(age_years=6, sex="F", weight_kg=20, height_cm=130,
+                               vegetarian_mode="lacto_ovo")
+    assert r["ok"] is True and r["data"]["protein"]["vegetarian_multiplier"] == 1.2
+
+
+def test_corrupt_store_fail_closed():
+    """B1（2026-08-12 五包审查）回归：损坏/类型错误的状态库必须抛 RuntimeError，
+    不得静默返回空库被 RMW 覆盖清空（对齐 care BUG-65/67）。"""
+    import tempfile
+
+    from CKDNutri_nutrition_mcp import core
+
+    tmp = tempfile.mkdtemp(prefix="a207-nutri-corrupt-")
+    # 日记库：损坏 JSON
+    (Path(tmp) / core.DIARY_STORE_FILENAME).write_text("{broken json", encoding="utf-8")
+    # PEW 库：合法 JSON 但非 dict（[1,2]）
+    (Path(tmp) / core.PEW_STORE_FILENAME).write_text("[1,2]", encoding="utf-8")
+    os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = tmp
+    try:
+        try:
+            core._load_store()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("损坏日记库应抛 RuntimeError（B1）")
+        try:
+            core._load_pew_store()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("非 dict PEW 库应抛 RuntimeError（B1）")
+    finally:
+        os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_calc_prnt_targets()
+    test_calc_prnt_targets_validation()
+    test_corrupt_store_fail_closed()
     print("P2 SMOKE OK")

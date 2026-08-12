@@ -107,7 +107,10 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
     return None
 
 # 素食蛋白倍数：蛋奶素 1.2 / 纯素 1.3（植物蛋白生物利用度低）
-_VEG_MULT = {"mixed": 1.0, "ovo_lacto": 1.2, "vegan": 1.3}
+# S2（2026-08-12 五包审查）：补 "lacto_ovo" 同义别名键——server 层 docstring 长期写
+# "lacto_ovo" 而本表只有 "ovo_lacto"，调用方按文档传 lacto_ovo 会被旧逻辑静默降级
+# mixed（蛋白需求低估 20%）。两键同值，均合法。
+_VEG_MULT = {"mixed": 1.0, "ovo_lacto": 1.2, "lacto_ovo": 1.2, "vegan": 1.3}
 
 # 透析蛋白额外补充（g/kg/day）：PD 0.15-0.3，HD 0.1
 _DIALYSIS_EXTRA = {
@@ -279,8 +282,23 @@ def calc_prnt_targets(
     # BUG-19：sex 非法值不再静默按男性处理，显式报错（calc_prnt_targets 与 calc_growth_zscore 同口径）
     if sex not in ("M", "F"):
         raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
+    # S2（2026-08-12 五包审查）：fail-closed 补齐——
+    # ① 负年龄显式拒绝（与 calc_growth_zscore 同口径，不再静默钳位 0.0）；
+    # ② weight_kg 必须 > 0（0/负值此前会静默产出 0/负能量目标，无法检出配置错误）；
+    # ③ growth_status 枚举校验（此前非法值静默落 else 取 SDI 中点，掩盖配置错误）；
+    # ④ vegetarian_mode 枚举校验（此前非法值静默降级 mixed——如拼错的 "ovo-lacto"
+    #    会被当杂食计算，蛋白需求低估 20%）。同义别名 lacto_ovo 已在 _VEG_MULT 收录。
+    if age_years < 0:
+        raise ValueError("age_years 不能为负")
+    if weight_kg <= 0:
+        raise ValueError("weight_kg 必须 > 0")
+    if growth_status not in ("normal", "failure", "overweight"):
+        raise ValueError(
+            f"growth_status 必须是 normal / failure / overweight 之一，收到：{growth_status!r}")
     if vegetarian_mode not in _VEG_MULT:
-        vegetarian_mode = "mixed"
+        raise ValueError(
+            f"vegetarian_mode 必须是 mixed / ovo_lacto / vegan 之一（lacto_ovo 与 ovo_lacto "
+            f"同义），收到：{vegetarian_mode!r}")
     # F7：用 DIALYSIS_ALIAS 单一事实源归一化（兼容 pd/腹透/hemodialysis 等别名），
     # 避免裸 _DIALYSIS_EXTRA 成员判断把 "pd" 等别名静默降级为 "none"。
     dialysis_mode = DIALYSIS_ALIAS.get(dialysis_mode, "none") if dialysis_mode else "none"
@@ -601,14 +619,28 @@ def assess_pew_risk(
 # 3. 3 日饮食日记：写入(store) + 聚合(diet_diary_3d) + 读取
 # ---------------------------------------------------------------------------
 def _load_store() -> dict[str, Any]:
+    # B1（2026-08-12 五包审查）：损坏/类型错误文件禁止静默返回空库——否则下次
+    # upsert_food_diary 的 load→append→save 会用"仅新条目"覆盖整个日记库，历史数据
+    # 永久丢失。对齐 care _load_store（BUG-65/67）：JSON 损坏或非 dict 顶层一律抛
+    # RuntimeError（server._invalid 归 INTERNAL_ERROR），运维可发现并恢复备份。
     path = _diary_store_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {"entries": []}
-    return {"entries": []}
+    if not os.path.exists(path):
+        return {"entries": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"日记库 {Path(path).name} JSON 损坏，拒绝加载（防止静默清空），"
+            f"请检查磁盘/恢复备份: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"日记库 {Path(path).name} 读取失败，拒绝加载（防止静默清空）: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"日记库 {Path(path).name} 数据类型错误：期望 dict，实际为 {type(data).__name__}，"
+            f"拒绝加载（防止静默清空）")
+    return data
 
 
 def _save_store(store: dict[str, Any]) -> None:
@@ -708,12 +740,17 @@ def upsert_food_diary(
         "ok": True,
         "data": {
             "patient_id": patient_id,
-            "stored_count": len(stamped),
+            # S5（2026-08-12 五包审查）：write_mode=False（预演）时 stored_count 归 0，
+            # 并补 persisted 显式标注（对齐 clinical-data upsert_lab_result 的 persisted
+            # 字段）——此前预演也返回 stored_count=len(stamped)，"存了 N 条"与实际未写矛盾。
+            "stored_count": len(stamped) if write_mode else 0,
+            "persisted": bool(write_mode),
             "write_mode": write_mode,
             "day_count": agg["day_count"],
             "entry_count": agg["entry_count"],
             "diet_diary_3d": {k: _round(v, 1) for k, v in agg["diet_diary_3d"].items()},
-            "note": "聚合最近 3 个不重复日期；diet_diary_3d 已对齐 PCP nutrition_assessment 形状。",
+            "note": ("聚合最近 3 个不重复日期；diet_diary_3d 已对齐 PCP nutrition_assessment "
+                     "形状。write_mode=False 时仅预演不落盘（stored_count=0）。"),
         },
     }
 
@@ -764,13 +801,17 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
 # ---------------------------------------------------------------------------
 _GROWTH_REF_PATH = os.path.join(os.path.dirname(__file__), "data", "growth_ref_cn.json")
 _GROWTH_REF = None
+# S3（2026-08-12 五包审查）：懒加载并发锁（double-checked locking，对齐 assessment）
+_GROWTH_REF_LOCK = threading.Lock()
 
 
 def _load_growth_ref() -> dict:
     global _GROWTH_REF
     if _GROWTH_REF is None:
-        with open(_GROWTH_REF_PATH, "r", encoding="utf-8") as f:
-            _GROWTH_REF = json.load(f)
+        with _GROWTH_REF_LOCK:
+            if _GROWTH_REF is None:  # S3：防多线程首调重复 I/O
+                with open(_GROWTH_REF_PATH, "r", encoding="utf-8") as f:
+                    _GROWTH_REF = json.load(f)
     return _GROWTH_REF
 
 
@@ -1037,11 +1078,26 @@ _PEW_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def _load_pew_store() -> dict:
+    # B1（2026-08-12 五包审查）：同 _load_store——PEW 历史库损坏/类型错误禁止静默
+    # 返回 {}（否则 record_pew_risk 的 RMW 会清空全部 PEW 时间线），fail-closed 抛错。
+    path = _pew_store_path()
     try:
-        with open(_pew_store_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"PEW 历史库 {Path(path).name} JSON 损坏，拒绝加载（防止静默清空），"
+            f"请检查磁盘/恢复备份: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"PEW 历史库 {Path(path).name} 读取失败，拒绝加载（防止静默清空）: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"PEW 历史库 {Path(path).name} 数据类型错误：期望 dict，实际为 {type(data).__name__}，"
+            f"拒绝加载（防止静默清空）")
+    return data
 
 
 def _save_pew_store(store: dict) -> None:

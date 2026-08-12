@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Optional
 
 from a207_policy import enforce_nutrition_tool, get_caller
@@ -32,13 +33,17 @@ _MEAL_SPLIT = {
 
 _FOODS_PATH = os.path.join(os.path.dirname(__file__), "data", "foods_ckd.json")
 _FOODS: Optional[list[dict]] = None
+# S3（2026-08-12 五包审查）：懒加载并发锁（double-checked locking）
+_FOODS_LOCK = threading.Lock()
 
 
 def _load_foods() -> list[dict]:
     global _FOODS
     if _FOODS is None:
-        with open(_FOODS_PATH, "r", encoding="utf-8") as fh:
-            _FOODS = json.load(fh)["foods"]
+        with _FOODS_LOCK:
+            if _FOODS is None:  # S3：防多线程首调重复 I/O
+                with open(_FOODS_PATH, "r", encoding="utf-8") as fh:
+                    _FOODS = json.load(fh)["foods"]
     return _FOODS
 
 

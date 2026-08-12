@@ -106,8 +106,13 @@ def _dekalium_tip(row: dict[str, Any]) -> str:
 
 
 def lookup_food_nutrients(food: str, portion: str | None = None,
-                          cooking: str | None = None) -> dict[str, Any]:
+                          cooking: str | None = None,
+                          include_household: bool = True) -> dict[str, Any]:
     """查询食物成分。portion 支持家庭量具（半碗/1个/两勺）或克重。
+
+    include_household=True（默认）：输出内嵌家庭量具表达（measure）与磷蛋白比
+    （pnpr + grade），替代原独立工具 convert_to_household_measure / calc_pnpr
+    ——派生字段不再独占工具位（v2.4 工具收敛）。
 
     基名查询（如“早籼”“鸡蛋”）若含多规格，返回整簇变体供选择；具体规格名（如
     “早籼（标一）”）仍返回单条并计算，保证计算路径精确不变。
@@ -150,6 +155,25 @@ def lookup_food_nutrients(food: str, portion: str | None = None,
         "warnings": warnings,
         "source": FOOD_TABLE_REF,
     }
+    # v2.4 工具收敛：量具表达（克重↔家用单位）从独立工具下沉为查询投影字段。
+    if include_household:
+        measure = to_household(row, scaled["grams"])
+        data["measure"] = {
+            "grams": measure["grams"],
+            "primary": measure["primary"],
+            "alternatives": measure["alternatives"],
+        }
+    # v2.4 工具收敛：磷蛋白比（PNPR）从独立工具下沉为派生字段。
+    protein = scaled["protein_g"]
+    phosphorus = scaled["phosphorus_mg"]
+    if protein and protein > 0:
+        ratio = phosphorus / protein
+        code, label = pnpr_grade(ratio)
+        data["pnpr"] = {
+            "pnpr_mg_per_g": round(ratio, 1), "grade": code, "grade_label": label,
+            "interpretation": f"每摄入 1 g 蛋白质同时带入 {ratio:.1f} mg 磷。"
+                              f"限磷患儿应优先选择磷蛋白比低的蛋白来源（如蛋清）。",
+        }
     if row["potassium_level"] in ("high", "very_high"):
         data["dekalium_tip"] = _dekalium_tip(row)
     alternatives = [item["name"] for item in search_food(food, limit=4)

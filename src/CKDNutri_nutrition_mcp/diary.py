@@ -8,7 +8,7 @@ from a207_policy import enforce_read, get_caller
 
 from .constants import FOOD_TABLE_REF, GUIDELINE, MCP_NAME
 from .core import _normalize_date
-from .fooddb import find_food, scale_nutrients
+from .fooddb import find_food, pnpr_grade, scale_nutrients
 from .measures import parse_portion
 
 SUM_KEYS = ("energy_kcal", "protein_g", "fat_g", "carb_g",
@@ -132,6 +132,17 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     if unmatched:
         data["warnings"] = [f"有 {len(unmatched)} 条未匹配，汇总值偏低，"
                             f"请补录后重算再做临床判断。"]
+    # v2.4 工具收敛：磷蛋白比（PNPR）作为汇总派生字段输出（原 calc_pnpr 独立工具下沉）。
+    avg_protein = average.get("protein_g", 0.0)
+    avg_phosphorus = average.get("phosphorus_mg", 0.0)
+    if avg_protein and avg_protein > 0:
+        ratio = avg_phosphorus / avg_protein
+        code, label = pnpr_grade(ratio)
+        data["pnpr"] = {
+            "pnpr_mg_per_g": round(ratio, 1), "grade": code, "grade_label": label,
+            "interpretation": f"日均每摄入 1 g 蛋白质同时带入 {ratio:.1f} mg 磷，"
+                              f"该值基于每日平均摄入汇总。",
+        }
     # BUG-64：非法日期显式警告（不再静默拆散跨天统计）
     if bad_dates:
         data["warnings"] = (data.get("warnings") or []) + [
