@@ -207,11 +207,23 @@ def check_drug_nutrient_interaction(drug: str, nutrient: str | None = None) -> d
                              "advice": advice, "monitoring": monitor.replace("monitor: ", ""),
                              "severity": severity})
 
+    # BUG-63（2026-08-12）：交互状态显式化——interactions 为空**不代表"安全无交互"**，
+    # 而是"未收录该营养素交互记录"；此前仅靠 message 字段，自动化/LLM 只读
+    # interactions 列表会误判为无相互作用。
+    if key is None:
+        status = "all_effects"        # 未指定营养素，返回该药全部已收录交互
+    elif interactions:
+        status = "has_interactions"
+    else:
+        status = "no_record"          # 药物已知，但该营养素无收录记录
+
     data = {"drug": name, "matched_input": drug, "drug_class": info["drug_class"],
             "interactions": interactions,
+            "interaction_status": status,
             "all_nutrients_covered": [NUTRIENT_LABEL[item] for item in info["effects"]],
             "note": "本表为膳食-用药协同提示，用于食谱与宣教；剂量与用法调整由主诊医师决定。"}
     if key and not interactions:
-        data["message"] = (f"未收录「{name}」与「{NUTRIENT_LABEL[key]}」的直接交互，"
+        data["message"] = (f"未收录「{name}」与「{NUTRIENT_LABEL[key]}」的直接交互"
+                           f"（interaction_status=no_record），不代表无相互作用；"
                            f"该药已收录的相关营养素为：{'、'.join(data['all_nutrients_covered'])}。")
     return {"ok": True, "data": data}

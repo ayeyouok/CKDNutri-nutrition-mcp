@@ -130,6 +130,13 @@ def lookup_food_nutrients(food: str, portion: str | None = None,
     warnings = food_warnings(row, scaled)
     if not resolved["resolved"]:
         warnings.append(resolved["basis"])
+    # BUG-63（2026-08-12）：可食部克重契约提示——系统按"可食部克重"计算营养素，
+    # 带皮/骨/壳食物（edible_pct<100）若调用方按"买来重量"录入会高估实际摄入
+    # （如排骨可食部 60%，150g 带骨按可食部算会高估 1.67 倍）。
+    if row.get("edible_pct", 100) < 100:
+        warnings.append(
+            f"「{row['name']}」可食部约 {row['edible_pct']:.0f}%，系统按可食部克重计算；"
+            "若输入克重含皮/骨/壳，请先换算为去骨去皮后的可食部重量。")
 
     data = {
         "query": food,
@@ -157,7 +164,9 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
 
     constraint 可选：等能量(默认) / 低钾 / 低磷 / 低钠 / 低蛋白。
     等能量（默认，最贴合“家里没有某食物”的平替场景）：在同角色内找能量接近（±30%）
-    且钾不更高的食物；低钾/低磷/低钠/低蛋白：在同角色内找该项更低的食物。
+    且按能量密度折算后钾、磷总量不更高的食物（BUG-60：按每 100g 静态含量过滤会因
+    等能量缩放放大克数，导致总钾/总磷反超）；低钾/低磷/低钠/低蛋白：在同角色内找
+    该项（每 100g）更低的食物。
     候选池按食物角色收敛，杜绝把油脂当肉、把内脏当主食等荒谬替换。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
@@ -174,14 +183,31 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
     field, label, mode = mapped
     role, pool = _candidate_pool(row)
     if mode == "iso_energy":
-        base = row["energy_kcal"] or 1.0
+        # BUG-64（2026-08-13）：零能量食物（矿泉水/无糖饮料等）无"等能量平替"意义——
+        # 此前 base=row["energy"] or 1.0 会去找 1 kcal 级替代品，推荐一堆荒谬小份固体。
+        if row["energy_kcal"] <= 0:
+            return {"ok": True, "data": {
+                "base": food_card(row), "constraint": label, "role": role, "options": [],
+                "message": "该食物为 0 能量（如饮品），'等能量'平替无临床意义；"
+                           "如需降低钾/磷请改用'低钾/低磷'约束，或直接控制摄入量。",
+                "tip": _dekalium_tip(row), "source": FOOD_TABLE_REF}}
+        base = row["energy_kcal"]
+        # BUG-60（2026-08-12）：钾/磷约束改为"每千卡密度"口径。原按每 100g 静态含量过滤，
+        # 低能量密度替代品等能量缩放后克数放大，总钾/总磷会反超原食物（实测 豆腐→鹅蛋
+        # 等能量 104g 时 K 74→77）。按密度折算后，"等能量替换且钾、磷不更高"才真正成立。
+        k_density_row = row["potassium_mg"] / base
+        p_density_row = row["phosphorus_mg"] / base
         candidates = [item for item in pool
-                      if abs(item["energy_kcal"] - base) / base <= 0.30
-                      and item["potassium_mg"] <= row["potassium_mg"]]
+                      if item["energy_kcal"] > 0   # BUG-59：显式排除零能量项
+                      and abs(item["energy_kcal"] - base) / base <= 0.30
+                      and item["potassium_mg"] / item["energy_kcal"] <= k_density_row
+                      and item["phosphorus_mg"] / item["energy_kcal"] <= p_density_row]
         candidates.sort(key=lambda item: (abs(item["energy_kcal"] - base), -item["protein_g"]))
-        rationale = "同食物角色内能量接近（±30%）且钾不更高的食物，便于等能量平替"
+        rationale = "同食物角色内能量接近（±30%）且按能量密度折算后钾、磷总量不更高的食物，便于等能量平替"
     else:
-        candidates = [item for item in pool if item[field] < row[field]]
+        candidates = [item for item in pool
+                      if item["energy_kcal"] > 0   # BUG-59：零能量项非有效替换，显式排除
+                      and item[field] < row[field]]
         candidates.sort(key=lambda item: (item[field], -item["energy_kcal"]))
         rationale = f"同食物角色内{label}低于「{row['name']}」的食物，按{label}升序推荐"
 

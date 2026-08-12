@@ -76,8 +76,20 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
     if match:
         value = float(match.group(1))
         unit = match.group(2).lower()
-        grams = value * 1000.0 if unit in ("kg", "千克", "公斤") else value
-        return {"grams": grams, "resolved": True, "basis": f"按输入重量 {grams:.0f} g 计"}
+        if unit in ("kg", "千克", "公斤"):
+            grams = value * 1000.0
+            basis = f"按输入重量 {grams:.0f} g 计"
+        elif unit in ("ml", "毫升", "cc"):
+            # BUG-63（2026-08-12）：体积按水密度 1 g/ml 折算并显式标注——油≈0.92、
+            # 奶≈1.03、蜂蜜≈1.42 等密度≠1 的食物会引入误差（油 100ml 高估约 8% 能量，
+            # 对限能量患儿属偏保守方向），特殊食物请按实际密度换算克重。
+            grams = value
+            basis = (f"按体积 {value:.0f} ml 以水密度折算 {grams:.0f} g"
+                     f"（密度≈1 g/ml；油/奶/蜂蜜等密度≠1，建议手动换算克重）")
+        else:
+            grams = value
+            basis = f"按输入重量 {grams:.0f} g 计"
+        return {"grams": grams, "resolved": True, "basis": basis}
 
     quantity, rest = _parse_quantity(text)
     unit = _find_unit(rest) or _find_unit(text)

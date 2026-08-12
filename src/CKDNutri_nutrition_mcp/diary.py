@@ -7,6 +7,7 @@ from typing import Any
 from a207_policy import enforce_read, get_caller
 
 from .constants import FOOD_TABLE_REF, GUIDELINE, MCP_NAME
+from .core import _normalize_date
 from .fooddb import find_food, scale_nutrients
 from .measures import parse_portion
 
@@ -54,6 +55,10 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     per_day: dict[str, dict[str, Any]] = {}
     unmatched: list[dict[str, Any]] = []
     contributions: list[dict[str, Any]] = []
+    # BUG-64（2026-08-13）：记录无法归一化的日期——计算路径宽容分桶但必须显式警告，
+    # 否则与写入路径（_normalize_date fail-closed 拒绝）行为割裂，用户算出一版
+    # "能算但存不进"的结果，跨天统计被静默拆散。
+    bad_dates: list[str] = []
 
     for index, entry in enumerate(diary):
         if not isinstance(entry, dict):
@@ -75,7 +80,13 @@ def sum_diet_intake(diary: list[dict[str, Any]],
             basis = resolved["basis"]
         scaled = scale_nutrients(row, grams, entry.get("cooking"))
 
-        date = str(entry.get("date") or "未标注日期")
+        # BUG-60：读取路径宽容归一化——可解析的变体日期统一为 ISO，无法解析的保留原样分桶
+        raw_date = entry.get("date")
+        try:
+            date = _normalize_date(raw_date) if raw_date else "未标注日期"
+        except ValueError:
+            date = str(raw_date)
+            bad_dates.append(str(raw_date))  # BUG-64：计数并随结果警告
         bucket = per_day.setdefault(date, {"date": date, "items": 0, "totals": _blank_totals()})
         bucket["items"] += 1
         for key in SUM_KEYS:
@@ -121,6 +132,11 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     if unmatched:
         data["warnings"] = [f"有 {len(unmatched)} 条未匹配，汇总值偏低，"
                             f"请补录后重算再做临床判断。"]
+    # BUG-64：非法日期显式警告（不再静默拆散跨天统计）
+    if bad_dates:
+        data["warnings"] = (data.get("warnings") or []) + [
+            f"{len(bad_dates)} 条记录日期无法归一化为 YYYY-MM-DD（如 {bad_dates[0]!r}），"
+            "已按原样分桶，跨天统计可能被拆散；请使用 YYYY-MM-DD 格式。"]
     if target:
         data["achievement"] = _achievement(average, target)
         data["guideline"] = GUIDELINE

@@ -443,6 +443,7 @@ def comprehensive_nutrition_assessment_tool(
                 growth_status=growth_status, height_cm=float(height_cm or 0.0),
                 is_edema=bool(is_edema),
                 pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,  # BUG-08：透传腹透扣减
+                albumin_g_L=serum_albumin_g_l,  # BUG-61：白蛋白参与摄入路径 PEW 筛查
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake
 

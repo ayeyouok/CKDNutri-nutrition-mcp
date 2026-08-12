@@ -92,6 +92,8 @@ def _achievement(tot: dict, t_energy: float, t_protein: float, t_k: float, t_p: 
 
 
 def _split_meals(items: list[dict]) -> list[dict]:
+    # BUG-59（2026-08-12）：提前建 name→food 索引，避免循环内逐条 O(N) 线性扫描
+    by_name = {f["name"]: f for f in _load_foods()}
     meals = [{ "meal": name, "items": [], "totals": None } for name in _MEAL_NAMES]
     for it in items:
         split = _MEAL_SPLIT.get(it["cat"], [0, 0, 0, 0])
@@ -100,7 +102,7 @@ def _split_meals(items: list[dict]) -> list[dict]:
             if g <= 0:
                 continue
             f = g / 100.0
-            food = next(x for x in _load_foods() if x["name"] == it["food"])
+            food = by_name[it["food"]]
             meals[mi]["items"].append({
                 "food": it["food"], "cat": food["cat"], "grams": g,
                 "energy_kcal": round(food["energy_per_100g"] * f, 1),
@@ -163,6 +165,9 @@ def generate_meal_plan(
         raise ValueError("食物库过滤后为空：请检查 exclude_foods / vegetarian 设置（可能把所有蛋白源都排除了）")
 
     days_out: list[dict] = []
+    # BUG-63（2026-08-12）：收集能量负平衡警告——主食+蛋白+蔬果已超目标时脂肪按 0 仍
+    # 超标，此前静默返回不平衡食谱，仅靠达成率>100% 提示不够明确。
+    plan_warnings: list[str] = []
     for d in range(days):
         staple = staples[d % len(staples)]
         prot = prots[d % len(prots)]
@@ -170,6 +175,13 @@ def generate_meal_plan(
         fr = fruits[d % len(fruits)]
         fat = fats[0]
 
+        # BUG-61（2026-08-12）：防御 0 能量/0 蛋白数据——主食/蛋白源除数必须 >0，
+        # 否则 ZeroDivisionError（当前 foods_ckd.json 无此数据，属数据鲁棒性防护；
+        # 与下方 fat 的 energy_per_100g>0 守卫同口径）
+        if staple["energy_per_100g"] <= 0 or prot["protein_per_100g"] <= 0:
+            raise ValueError(
+                f"食物库含 0 能量/0 蛋白条目（主食={staple['name']}, 蛋白源={prot['name']}），"
+                "无法按目标生成食谱，请检查数据")
         staple_g = max(10, round(target_energy_kcal * 0.5 / staple["energy_per_100g"] * 100))
         prot_g = max(10, round(target_protein_g * 0.7 / prot["protein_per_100g"] * 100))
         veg_g = 100
@@ -183,6 +195,10 @@ def generate_meal_plan(
         e_veg = veg_g * veg["energy_per_100g"] / 100
         e_fruit = fruit_g * fr["energy_per_100g"] / 100
         rem = target_energy_kcal - (e_staple + e_prot + e_veg + e_fruit)
+        if rem < 0:
+            plan_warnings.append(
+                f"第 {d + 1} 天：主食+蛋白+蔬果能量已达 {round(e_staple + e_prot + e_veg + e_fruit, 0):.0f} kcal，"
+                f"超过目标 {target_energy_kcal:.0f} kcal，脂肪按 0 计仍超标——请削减主食/蛋白分量")
         fat_g = max(0, round(rem / (fat["energy_per_100g"] / 100))) if fat["energy_per_100g"] > 0 else 0
 
         items = [
@@ -199,6 +215,7 @@ def generate_meal_plan(
     return {
         "days": days_out,
         "overall_achievement": overall,
+        "warnings": plan_warnings,  # BUG-63：能量负平衡/需削减主食提示（空列表=无警告）
         "targets": {
             "energy_kcal": target_energy_kcal, "protein_g": target_protein_g,
             "potassium_mg": target_k_mg, "phosphorus_mg": target_p_mg, "sodium_mg": target_na_mg,

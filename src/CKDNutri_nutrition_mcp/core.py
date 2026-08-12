@@ -150,15 +150,24 @@ PD_GLUCOSE_KCAL_PER_KG_REF = (7.5, 9.08)  # PRNT 引用的日吸收参考区间
 # 单位为：能量 kcal/kg/day；蛋白 g/kg/day；每日总量 g。
 # ---------------------------------------------------------------------------
 _PRNT_BANDS = [
-    (0.0,    0.0833, "足月新生儿(0月)", (93, 107), (93, 107), (1.52, 2.50), (8, 12)),
-    (0.0833, 0.1667, "1月龄",          (93, 120), (93, 120), (1.52, 1.80), (8, 12)),
-    (0.1667, 0.4167, "3月龄",          (82, 98),  (82, 98),  (1.40, 1.52), (8, 12)),
-    (0.4167, 1.0,    "6-9月龄",        (72, 82),  (72, 82),  (1.10, 1.30), (9, 14)),
-    (1.0,    1.5,    "12月龄",         (72, 120), (72, 120), (0.90, 1.14), (11, 14)),
-    (1.5,    3.0,    "2岁",            (81, 95),  (79, 92),  (0.90, 1.05), (11, 15)),
-    (3.0,    7.0,    "4-6岁",          (67, 93),  (64, 90),  (0.85, 0.95), (16, 22)),
-    (7.0,    12.0,   "9-10岁",         (55, 69),  (49, 63),  (0.90, 0.95), (26, 40)),
-    (12.0,   18.01,  "15-17岁",        (40, 55),  (36, 46),  (0.80, 0.90),
+    # BUG-64（2026-08-13）：婴儿段严格按 PRNT 2020（Shaw et al., Pediatr Nephrol 2020;35:519-531）
+    # Table 1 SDI 逐月拆分（0/1/2/3/4/5/6-9/10-11/12 月）——原代码 [2,5) 与 [5,12) 两段过粗：
+    # 2 月龄被错用 3-4 月参数（能量 82-98 vs 应 93-120，低估 ~14%），5 月龄被错用 6-9 月参数
+    # （蛋白 1.10-1.30 vs 应 1.30-1.52，低估 ~15%），10-11 月龄蛋白 g/day 也偏高。
+    # 列：(age_min, age_max, label, 能量M, 能量F, 蛋白(g/kg), 蛋白总量(g/day))，年龄单位=岁。
+    (0.0,    0.0833, "0月",             (93, 107), (93, 107), (1.52, 2.50), (8, 12)),
+    (0.0833, 0.1667, "1月",             (93, 120), (93, 120), (1.52, 1.80), (8, 12)),
+    (0.1667, 0.25,   "2月",             (93, 120), (93, 120), (1.40, 1.52), (8, 12)),
+    (0.25,   0.3333, "3月",             (82, 98),  (82, 98),  (1.40, 1.52), (8, 12)),
+    (0.3333, 0.4167, "4月",             (82, 98),  (82, 98),  (1.30, 1.52), (9, 13)),
+    (0.4167, 0.5,    "5月",             (72, 82),  (72, 82),  (1.30, 1.52), (9, 13)),
+    (0.5,    0.75,   "6-9月",           (72, 82),  (72, 82),  (1.10, 1.30), (9, 14)),
+    (0.75,   1.0,    "10-11月",         (72, 82),  (72, 82),  (1.10, 1.30), (9, 15)),
+    (1.0,    1.5,    "12月龄",          (72, 120), (72, 120), (0.90, 1.14), (11, 14)),
+    (1.5,    3.0,    "2岁",             (81, 95),  (79, 92),  (0.90, 1.05), (11, 15)),
+    (3.0,    7.0,    "4-6岁",           (67, 93),  (64, 90),  (0.85, 0.95), (16, 22)),
+    (7.0,    12.0,   "9-10岁",          (55, 69),  (49, 63),  (0.90, 0.95), (26, 40)),
+    (12.0,   18.01,  "15-17岁",         (40, 55),  (36, 46),  (0.80, 0.90),
      {"M": (52, 65), "F": (45, 49)}),
 ]
 
@@ -205,6 +214,8 @@ def schofield_bmr_kcal(sex: str, age_years: float, weight_kg: float,
     """Schofield 体重+身高方程，返回 kcal/d。"""
     if weight_kg <= 0 or height_cm <= 0:
         return None
+    # bracket 语义（Schofield 年龄分段）：3=<3 岁、10=3-10 岁、18=>10 岁——键 (sex, 分段)
+    # 中的数字是"分段标识"而非年龄/系数本身，避免维护者误读为"3 岁专属系数"。
     bracket = 3 if age_years < 3 else (10 if age_years < 10 else 18)
     coefficients = SCHOFIELD.get((sex, bracket))
     if not coefficients:
@@ -414,12 +425,15 @@ def assess_intake_vs_target(
     height_cm: float = 0.0,
     is_edema: bool = False,
     pd_glucose_kcal_per_day: float | None = None,
+    albumin_g_L: float | None = None,
 ) -> dict[str, Any]:
     """对照 PRNT 目标评估 3 日饮食日记均值，给出达成率、缺口/过量、PEW 风险。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     diet 需含：avg_energy_kcal / avg_protein_g / avg_potassium_mg / avg_phosphorus_mg /
               avg_sodium_mg（与 PCP nutrition_assessment.diet_diary_3d 对齐）。
+    albumin_g_L（BUG-61，2026-08-12）：血清白蛋白 g/L，参与 PEW 筛查
+    （<35 记低白蛋白预警）；此前硬编码 None，白蛋白始终不参与本路径评估。
     """
     caller = get_caller()
     # BUG-01：临床判读工具级 ACL（仅 doctor）
@@ -428,15 +442,21 @@ def assess_intake_vs_target(
     _require(weight_kg, "weight_kg")
     if sex not in ("M", "F"):
         raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
+    # BUG-61：diet 空值/非字典显式拒绝（此前 diet=None 会触发未捕获 TypeError）
+    if not isinstance(diet, dict) or not diet:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "diet 需为字典且含 avg_energy_kcal / avg_protein_g"}
     required = ("avg_energy_kcal", "avg_protein_g")
     if not all(k in diet for k in required):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "diet 需含 avg_energy_kcal 与 avg_protein_g"}
-    avg_e = float(diet.get("avg_energy_kcal", 0.0))
-    avg_p = float(diet.get("avg_protein_g", 0.0))
-    avg_k = float(diet.get("avg_potassium_mg", 0.0))
-    avg_ph = float(diet.get("avg_phosphorus_mg", 0.0))
-    avg_na = float(diet.get("avg_sodium_mg", 0.0))
+    # BUG-61 后补（2026-08-12）：键存在但值为 None（JSON null）时 .get(k, 0.0) 仍返回
+    # None，float(None) 会抛未捕获 TypeError——统一 `or 0.0` 清洗，空值按 0 处理。
+    avg_e = float(diet.get("avg_energy_kcal") or 0.0)
+    avg_p = float(diet.get("avg_protein_g") or 0.0)
+    avg_k = float(diet.get("avg_potassium_mg") or 0.0)
+    avg_ph = float(diet.get("avg_phosphorus_mg") or 0.0)
+    avg_na = float(diet.get("avg_sodium_mg") or 0.0)
 
     tgt = calc_prnt_targets(
         age_years=age_years, sex=sex, weight_kg=weight_kg, height_cm=height_cm,
@@ -472,8 +492,8 @@ def assess_intake_vs_target(
     # PE 比（蛋白 4 kcal/g）
     pe_ratio = (avg_p * 4.0 / avg_e * 100.0) if avg_e > 0 else 0.0
 
-    # PEW 风险（简化筛查，非完整诊断）
-    pew = _screen_pew(avg_p, avg_e, floor_p, target_e, albumin_g_L=None)
+    # PEW 风险（简化筛查，非完整诊断）；BUG-61：白蛋白透传，不再硬编码 None
+    pew = _screen_pew(avg_p, avg_e, floor_p, target_e, albumin_g_L)
 
     flags: list[str] = []
     if e_status == "deficit":
@@ -525,7 +545,11 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
 
     if protein_deficit and energy_deficit:
         risk = "high"
-        rationale = "蛋白质低于安全下限且能量摄入 <80% 目标，符合蛋白质-能量消耗（PEW）高风险特征。"
+        # BUG-63（2026-08-12）：明确标注"简化筛查"——避免把摄入不足直接读成 PEW 确诊，
+        # 防止对短期厌食患儿过度干预（管饲等）；确诊需结合人体测量与生化指标。
+        rationale = ("蛋白质低于安全下限且能量摄入 <80% 目标，提示 PEW 高风险。"
+                     "（本结果为基于摄入/白蛋白的简化筛查；确诊需结合体重丢失、"
+                     "中臂肌围等人体测量与生化指标）")
     elif protein_deficit or energy_deficit or low_albumin:
         risk = "medium"
         parts = []
@@ -593,21 +617,42 @@ def _save_store(store: dict[str, Any]) -> None:
 
 
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """取最近 3 个不重复日期的条目做均值，返回 diet_diary_3d 形状。"""
+    """取最近 3 个不重复日期的条目，按**天数**求每日均值，返回 diet_diary_3d 形状。
+
+    BUG-61（2026-08-12）：分母必须是天数而非餐次条目数——原除以 len(used) 得到的是
+    "平均每餐"，患者一天记 3 餐时日均值被缩 3 倍，与日目标（target_kcal_per_day）
+    对照会触发能量不足误报与 PEW 假阳性。
+    """
     by_day: dict[str, list[dict[str, Any]]] = {}
     for e in entries:
         by_day.setdefault(e.get("date", ""), []).append(e)
     days = sorted(by_day.keys(), reverse=True)[:3]
     used = [e for d in days for e in by_day[d]]
-    n = max(len(used), 1)
+    num_days = max(len(days), 1)
     avg = {
-        "avg_energy_kcal": sum(e.get("energy_kcal", 0.0) for e in used) / n,
-        "avg_protein_g": sum(e.get("protein_g", 0.0) for e in used) / n,
-        "avg_potassium_mg": sum(e.get("potassium_mg", 0.0) for e in used) / n,
-        "avg_phosphorus_mg": sum(e.get("phosphorus_mg", 0.0) for e in used) / n,
-        "avg_sodium_mg": sum(e.get("sodium_mg", 0.0) for e in used) / n,
+        "avg_energy_kcal": sum(e.get("energy_kcal", 0.0) for e in used) / num_days,
+        "avg_protein_g": sum(e.get("protein_g", 0.0) for e in used) / num_days,
+        "avg_potassium_mg": sum(e.get("potassium_mg", 0.0) for e in used) / num_days,
+        "avg_phosphorus_mg": sum(e.get("phosphorus_mg", 0.0) for e in used) / num_days,
+        "avg_sodium_mg": sum(e.get("sodium_mg", 0.0) for e in used) / num_days,
     }
     return {"day_count": len(days), "entry_count": len(used), "diet_diary_3d": avg}
+
+
+def _normalize_date(value: Any, field: str = "date") -> str:
+    """把日期串归一化为 ISO YYYY-MM-DD（BUG-60，2026-08-12）。
+
+    接受 YYYY-MM-DD / YYYY/M/D / YYYY.M.D（容忍前后空白）；解析失败显式抛错
+    （fail-closed）。此前日期作为不透明字符串直接落库，"2026-3-1" 与 "2026-03-01"
+    会被 _aggregate 当作不同日期分桶，跨天统计被拆散、平均值失真。
+    """
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"{field} 必须为有效日期（YYYY-MM-DD），收到：{value!r}")
 
 
 def upsert_food_diary(
@@ -637,9 +682,11 @@ def upsert_food_diary(
         existing = store.get("entries", [])
         stamped = []
         for e in entries:
+            # BUG-60：写入前归一化日期（容忍 YYYY-M-D / YYYY/M/D 等变体，非法日期显式拒绝）
+            raw_date = e.get("date") or datetime.now().strftime("%Y-%m-%d")
             stamped.append({
                 "patient_id": patient_id,
-                "date": e.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "date": _normalize_date(raw_date, "date"),
                 "meal": e.get("meal", ""),
                 "food": e.get("food", ""),
                 "energy_kcal": float(e.get("energy_kcal", 0.0)),
@@ -746,13 +793,31 @@ def _interp_sd(table: list, age_key: float):
     return table[-1][1], table[-1][2]
 
 
+def _valid_sd(s: Any) -> bool:
+    """SD 必须为正的有限数值（Z=(X-m)/s；s<=0 或 NaN 会产生无意义/反向 Z 分）。
+
+    BUG-59（2026-08-12）：原判 `s in (None, 0)` 仅拦零值，负数与 NaN（NaN<=0 为 False）
+    仍会穿透；统一收紧为"正有限数"。
+    """
+    return isinstance(s, (int, float)) and s == s and s > 0
+
+
+# BUG-59（2026-08-12）：身高参照表静态化缓存（数据只随 growth_ref_cn.json 变化，
+# 与 _GROWTH_REF 同生命周期）——此前 calc_growth_zscore 每次评估都重新合并+排序。
+_HEIGHT_TABLE_CACHE: dict[str, list] = {}
+
+
 def _height_table(sex: str) -> list:
     """合并 height_under7(月) 与 height_7_18(岁→月)，返回按月升序的 [age_months, m, s]。"""
+    cached = _HEIGHT_TABLE_CACHE.get(sex)
+    if cached is not None:
+        return cached
     ref = _load_growth_ref()
     merged = [list(r) for r in ref["height_under7"][sex]]
     for age_years, m, s in ref["height_7_18"][sex]:
         merged.append([age_years * 12, m, s])
     merged.sort(key=lambda r: r[0])
+    _HEIGHT_TABLE_CACHE[sex] = merged
     return merged
 
 
@@ -824,12 +889,21 @@ def calc_growth_zscore(age_years: float, sex: str,
     # BUG-19：sex 非法值显式报错，不再静默按男性计算
     if sex not in ("M", "F"):
         raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
+    # BUG-60：负年龄显式拒绝——此前会按 0 月边界钳位算出无临床意义的 Z 分
+    if age_years < 0:
+        raise ValueError("age_years 不能为负")
     # Code Smells-15（2026-08-12）：身高/体重必须为正——此前 height_cm=0 会算出
     # (0-中位数)/SD 的 -26 级荒谬 Z 分，静默返回"生长迟缓"误导临床。
     if height_cm is not None and height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
     if weight_kg is not None and weight_kg <= 0:
         raise ValueError("weight_kg 必须 > 0")
+    # BUG-63（2026-08-12）：生理学合理上界——过高/过重（录入错误）会算出荒谬 Z 分
+    # （如 300cm → Z≈+26 判"上"）；**不做下限收紧**（早产儿 40-45cm 合法，下限保持 >0）。
+    if height_cm is not None and height_cm > 250:
+        raise ValueError(f"height_cm {height_cm} 超出生理学合理范围（≤250 cm），请核查数据")
+    if weight_kg is not None and weight_kg > 200:
+        raise ValueError(f"weight_kg {weight_kg} 超出生理学合理范围（≤200 kg），请核查数据")
     ref = _load_growth_ref()
     age_months = age_years * 12.0
     results: dict[str, Any] = {"ok": True, "data": {}}
@@ -839,14 +913,29 @@ def calc_growth_zscore(age_years: float, sex: str,
     d["sex"] = sex
     d["standards"] = ref["meta"]["standards"]
     warnings: list[str] = []
+    # BUG-63（2026-08-12）：原始 Z 分（未 round）用于 growth_status 临床判定——
+    # d["haz"]["z"] 等是 round(…,2) 后的展示值，直接用它判定会在 -2 边界引入 ±0.005
+    # 抖动（如 -2.004 round 成 -2.00 → `-2.0 < -2` 为 False 漏判生长迟缓）。
+    haz_z: float | None = None
+    waz_z: float | None = None
+    baz_z: float | None = None
+
+    # BUG-60：>18 岁（>216 月）超出 WS/T 423/612 适用域——不再静默按 216 月边界钳位，
+    # 显式标注越界并提示结果仅供参考（负年龄已在入口拒绝）。
+    if age_months > 216:
+        d["age_out_of_bounds"] = True
+        warnings.append(
+            "age_years 超出中国卫健委标准适用上限（18 岁），Z 评分按 18 岁边界参考值计算，"
+            "仅供参考，不作临床判定依据。")
 
     # HAZ（身高别年龄）—— 合并 0-18
     if height_cm is not None:
         m, s = _interp_sd(_height_table(sex), age_months)
-        if m is None or s in (None, 0):
+        if m is None or not _valid_sd(s):
             warnings.append("身高参考数据缺失，无法计算 HAZ。")
         else:
             haz = (height_cm - m) / s
+            haz_z = haz  # BUG-63：原始值用于判定
             d["haz"] = {
                 "z": _round(haz, 2),
                 "median_cm": _round(m, 1),
@@ -858,14 +947,21 @@ def calc_growth_zscore(age_years: float, sex: str,
     else:
         warnings.append("未提供 height_cm，跳过 HAZ。")
 
+    # BUG-61（2026-08-12）：BMI 自动推算提前——原写在 <84 月分块内，≥7 岁（age_months>=84）
+    # 且未显式传 bmi 时恒为 None，下方"BMI>24 学龄超重粗判"分支永不触发，超重漏诊并误判 normal。
+    if bmi is None and height_cm and weight_kg:
+        h_m = height_cm / 100.0
+        bmi = weight_kg / (h_m * h_m)
+
     # WAZ / BAZ（仅 <84 月，WS/T 423）
     if age_months < 84:
         if weight_kg is not None:
             m, s = _interp_sd(ref["weight"][sex], age_months)
-            if m is None or s in (None, 0):
+            if m is None or not _valid_sd(s):
                 warnings.append("体重参考数据缺失，无法计算 WAZ。")
             else:
                 waz = (weight_kg - m) / s
+                waz_z = waz  # BUG-63：原始值用于判定
                 d["waz"] = {
                     "z": _round(waz, 2),
                     "median_kg": _round(m, 2),
@@ -876,15 +972,13 @@ def calc_growth_zscore(age_years: float, sex: str,
                 }
         else:
             warnings.append("未提供 weight_kg，跳过 WAZ。")
-        if bmi is None and height_cm and weight_kg:
-            h_m = height_cm / 100.0
-            bmi = weight_kg / (h_m * h_m)
         if bmi is not None:
             m, s = _interp_sd(ref["bmi"][sex], age_months)
-            if m is None or s in (None, 0):
+            if m is None or not _valid_sd(s):
                 warnings.append("BMI 参考数据缺失，无法计算 BAZ。")
             else:
                 baz = (bmi - m) / s
+                baz_z = baz  # BUG-63：原始值用于判定
                 d["baz"] = {
                     "z": _round(baz, 2),
                     "median": _round(m, 2),
@@ -901,9 +995,8 @@ def calc_growth_zscore(age_years: float, sex: str,
 
     # PRNT growth_status 建议（供 calc_prnt_targets 输入）
     # 优先级：HAZ 生长迟缓 > WAZ 低体重/消瘦 > BAZ/BMI 超重
-    haz_z = d.get("haz", {}).get("z")
-    baz_z = d.get("baz", {}).get("z")
-    waz_z = d.get("waz", {}).get("z")
+    # BUG-63：haz_z/waz_z/baz_z 均为未 round 的原始值（grade/nutrition 一直用原始值，
+    # 此前 growth_status 误用 d[*]["z"] 的 round 后值，-2 边界 ±0.005 抖动）
     if haz_z is not None and haz_z < -2:
         growth_status = "failure"          # 生长迟缓 → 能量取 SDI 上限
     elif waz_z is not None and waz_z < -2:
@@ -914,6 +1007,19 @@ def calc_growth_zscore(age_years: float, sex: str,
         # ≥7 岁无 BAZ 标准时，用 BMI>24 粗判超重趋势（中国学龄儿童超重界值）
         growth_status = "overweight"
         warnings.append("≥7 岁 BAZ 标准不可用，基于 BMI>24 粗判超重，建议结合腰围/体脂综合评估。")
+    elif baz_z is None and bmi is not None and age_months >= 84:
+        # BUG-63（2026-08-12）：≥7 岁 BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI 粗筛
+        # 提示，杜绝"严重消瘦被判 normal 且无警告"的漏诊。**不改 growth_status**
+        # （7-8 岁 BMI 14 属正常范围，扁平阈值直接调能量会误伤；仅提示人工评估）。
+        if bmi < 14:
+            warnings.append(
+                f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
+                "请立即结合中臂肌围等人体测量人工评估。")
+        else:
+            warnings.append(
+                f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 未达超重界值（≤24）；"
+                "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
+        growth_status = "normal"
     else:
         growth_status = "normal"
     d["growth_status_suggestion"] = growth_status
@@ -958,6 +1064,8 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
+    # BUG-60：PEW 历史按日期排序去重，日期必须归一化，否则异形日期破坏时间线
+    date = _normalize_date(date, "date")
     with _STORE_LOCK:
         store = _load_pew_store()
         pts = store.get(patient_id, [])
