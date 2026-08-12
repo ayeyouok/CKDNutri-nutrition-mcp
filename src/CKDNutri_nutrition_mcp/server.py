@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from a207_policy import CallerError
+from a207_policy import CallerError, enforce_nutrition_tool, get_caller
 
 from .core import (
     assess_intake_vs_target,
@@ -71,22 +71,23 @@ def main():
 # ---- diet 组（饮食记录，全角色可见） ----
 
 @mcp.tool
-def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = True) -> dict[str, Any]:
-    """写入每日饮食日记。仅 CKD 家庭助手 / 儿童陪伴可写（MX-3）。
+def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = True,
+                           guardian_token: str = "") -> dict[str, Any]:
+    """写入每日饮食日记。家长/医生可写（MX-3），家长须携带 guardian_token 完成患儿绑定。
 
     entries 每项：{date, meal, food, energy_kcal, protein_g, potassium_mg, phosphorus_mg, sodium_mg}
     """
     try:
-        return upsert_food_diary(patient_id, entries, write_mode)
+        return upsert_food_diary(patient_id, entries, write_mode, guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
 
 @mcp.tool
-def get_food_diary_summary_tool(patient_id: str) -> dict[str, Any]:
-    """查最近饮食日记脱敏摘要（含最近 3 日均值 diet_diary_3d）。"""
+def get_food_diary_summary_tool(patient_id: str, guardian_token: str = "") -> dict[str, Any]:
+    """查最近饮食日记脱敏摘要（含最近 3 日均值 diet_diary_3d）。家长须携带 guardian_token。"""
     try:
-        return get_food_diary_summary(patient_id)
+        return get_food_diary_summary(patient_id, guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
@@ -345,6 +346,7 @@ def comprehensive_nutrition_assessment_tool(
     avg_energy_kcal: Optional[float] = None,
     include_intake: bool = False,
     patient_id: str = "",
+    pd_glucose_kcal_per_day: Optional[float] = None,
 ) -> dict[str, Any]:
     """一键营养评估：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定。仅 CKD 临床助手。
 
@@ -355,8 +357,14 @@ def comprehensive_nutrition_assessment_tool(
 
     摄入来源优先级：显式 avg_protein_g/avg_energy_kcal > include_intake+patient_id 查饮食日记。
     两者都没有则跳过摄入与 PEW 环节（仅出 Z 评分 + 目标）。
+
+    pd_glucose_kcal_per_day: 腹透患儿从透析液吸收的葡萄糖供能（kcal/day），
+    会扣减膳食能量目标（BUG-08 修复：此前 DAG 未透传该参数，腹透能量目标偏高）。
     """
     try:
+        # BUG-03 修复：DAG 一键评估属临床工具（已登记 CLINICAL_TOOLS），入口显式收口，
+        # 不依赖子函数各自的 enforce_*（防御纵深）。
+        enforce_nutrition_tool(get_caller(), "comprehensive_nutrition_assessment")
         stage = _stage_int(ckd_stage)
 
         # 1) 生长 Z 评分（一次调用同时给 HAZ/WAZ/BAZ 与 growth_status 建议）
@@ -367,12 +375,13 @@ def comprehensive_nutrition_assessment_tool(
             return z
         growth_status = z["data"].get("growth_status_suggestion", "normal")
 
-        # 2) PRNT 目标（回灌生长状态与水肿校正）
+        # 2) PRNT 目标（回灌生长状态与水肿校正；BUG-08：透传 pd_glucose_kcal_per_day）
         prnt = calc_prnt_targets(
             age_years=float(age_years), sex=sex, weight_kg=float(weight_kg),
             height_cm=float(height_cm or 0.0), ckd_stage=stage,
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
             growth_status=growth_status, is_edema=bool(is_edema),
+            pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
         )
         if not prnt.get("ok"):
             return prnt
@@ -399,6 +408,9 @@ def comprehensive_nutrition_assessment_tool(
                     "avg_energy_kcal": float(avg_energy_kcal)}
             d["notes"].append("摄入均值来自调用方直接提供。")
         elif include_intake and patient_id:
+            # BUG-29 说明（2026-08-12）：DAG 仅临床角色可调（入口 enforce_nutrition_tool 已拦家长），
+            # 故此处 get_food_diary_summary 以 doctor 身份调用，_guard_guardian 对非 parent 直接放行，
+            # 无需（也不应）透传 guardian_token——若未来 DAG 入口放开给受限角色，此处须补绑定校验。
             summary = get_food_diary_summary(patient_id)
             dd = (summary.get("data") or {}).get("diet_diary_3d") if summary.get("ok") else None
             if dd:
@@ -416,6 +428,7 @@ def comprehensive_nutrition_assessment_tool(
                 ckd_stage=stage, dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
                 growth_status=growth_status, height_cm=float(height_cm or 0.0),
                 is_edema=bool(is_edema),
+                pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,  # BUG-08：透传腹透扣减
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake
 

@@ -147,7 +147,12 @@ def find_food_cluster(query: str) -> list[dict[str, Any]] | None:
 
 def scale_nutrients(row: dict[str, Any], grams: float,
                     cooking: str | None = None) -> dict[str, Any]:
-    """按克重缩放营养素；cooking 指定时套用烹调保留系数。"""
+    """按克重缩放营养素；cooking 指定时套用烹调保留系数。
+
+    BUG-34 说明（2026-08-12）：数据表为「每 100 g **可食部**」，edible_pct（可食部比例）
+    供展示/参考，不参与缩放——**调用方传入的 grams 一律按可食部克重理解**（家长量具
+    换算 unit_grams 亦按可食部定义）。带皮带骨/带壳重量需调用方自行换算，避免高估。
+    """
     ratio = max(grams, 0.0) / 100.0
     method = COOKING_ALIAS.get((cooking or "").strip(), (cooking or "raw").strip())
     if method not in COOKING_LOSS:
@@ -203,6 +208,6 @@ def food_warnings(row: dict[str, Any], scaled: dict[str, Any] | None = None) -> 
         notes.append(f"高钠食物：每 100 g 含钠 {row['sodium_mg']:.0f} mg，限钠者按量控制。")
     ratio = row["pnpr_mg_per_g"]
     if ratio is not None and ratio > PNPR_LEVELS[1][0]:
-        notes.append(f"磷蛋白比 {ratio:.1f} mg/g 偏高（>16 判为慎选），"
+        notes.append(f"磷蛋白比 {ratio:.1f} mg/g 偏高（>{PNPR_LEVELS[1][0]:.0f} 判为慎选），"
                      f"同等蛋白摄入下磷负荷更重。")
     return notes

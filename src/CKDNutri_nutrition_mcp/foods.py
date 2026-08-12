@@ -80,10 +80,27 @@ def _cluster_view(query: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }}
 
 
+# BUG-33（2026-08-12）：DEKALIUM_TIPS 的键是口语分类（"叶菜""薯类"…），与 CSV 的实际
+# category 值（"嫩茎、叶、花菜类""薯芋类"…）不对齐 → 叶菜/根茎/菌藻/畜肉提示零命中、
+# 永远 fallback "吃菜不喝汤"。增加 CSV 分类 → 提示键 的映射，匹配走 category 子串。
+_DEKALIUM_CATEGORY_KEYS: dict[str, tuple[str, ...]] = {
+    "叶菜": ("嫩茎、叶、花菜类", "野生蔬菜类", "水生蔬菜类"),
+    "薯类": ("薯类", "薯芋类", "淀粉类"),
+    "根茎": ("根菜类",),
+    "菌藻": ("菌类", "藻类"),
+    "水果": ("仁果类", "核果类", "热带、亚热带水果", "浆果类", "柑橘类", "瓜果类"),
+    "畜肉": ("猪", "牛", "羊", "马", "驴", "蓄肉类其他", "禽肉类其他",
+             "鸡", "鸭", "鹅", "火鸡"),
+}
+
+
 def _dekalium_tip(row: dict[str, Any]) -> str:
-    for key in (row["subcategory"], row["category"]):
-        for tip_key, tip in DEKALIUM_TIPS.items():
-            if tip_key != "default" and tip_key in key:
+    keys = {row.get("subcategory", ""), row.get("category", "")}
+    for tip_key, tip in DEKALIUM_TIPS.items():
+        if tip_key == "default":
+            continue
+        for token in _DEKALIUM_CATEGORY_KEYS.get(tip_key, (tip_key,)):
+            if token and any(token in k for k in keys if k):
                 return tip
     return DEKALIUM_TIPS["default"]
 
@@ -105,7 +122,6 @@ def lookup_food_nutrients(food: str, portion: str | None = None,
     # 别名层：当查询是“裸基名”（无规格后缀，如「早籼」「鸡蛋」）且存在 ≥3 个规格变体时，
     # 返回整簇供选择——满足“查早籼同时列出 标一/标二/特等”的需求；
     # 仅 2 个变体的常见食物（香蕉+红皮 等）与具体规格查询仍走精确单条，保证计算不出错。
-    exact_name = (food == row["name"])
     cluster = find_food_cluster(food)
     if cluster is not None and len(cluster) >= 3 and base_name(food) == food:
         return _cluster_view(food, cluster)

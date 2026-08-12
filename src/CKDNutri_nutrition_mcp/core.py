@@ -20,12 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from a207_policy import (
-    NUTRITION_ASSESSMENT_WRITE_ALLOWED,
     atomic_write_json,
     enforce_nutrition_tool,
-    enforce_read,
     get_caller,
     resolve_state_path,
+    verify_guardian_token,
 )
 from .constants import DIALYSIS_ALIAS
 
@@ -59,11 +58,49 @@ def _state_path(filename: str) -> str:
     return str(resolve_state_path(filename))
 
 
-DIARY_STORE = _state_path("diary_store.json")
+# BUG-18：DIARY_STORE/PEW_STORE 不再在模块加载时固化路径（env 变化需重启才能生效），
+# 改为每次读写时解析，测试/部署中切换 A207_DATA_DIR 立即生效。
+DIARY_STORE_FILENAME = "diary_store.json"
+PEW_STORE_FILENAME = "pew_history_store.json"
 
-# 允许调用方集合（仅 upsert 写工具做 MX-3 收口校验用）
-# P1-1：唯一事实源在 a207_policy，本包不再维护第二份。
-_WRITE_ALLOWED_CALLERS = NUTRITION_ASSESSMENT_WRITE_ALLOWED
+
+def _diary_store_path() -> str:
+    return _state_path(DIARY_STORE_FILENAME)
+
+
+def _pew_store_path() -> str:
+    return _state_path(PEW_STORE_FILENAME)
+
+# 写权判定经 enforce_nutrition_tool 工具级 ACL（P1-1：单一事实源在 a207_policy），
+# 本包不再维护本地写白名单（2026-08-12 双轨制清理）。
+
+# ---------------------------------------------------------------------------
+# 家长-患儿绑定核验（与 P1 his.py 共享 guardian_tokens.json 状态库）
+# 需求：家长受限视图必须经监护人令牌绑定核验（同 HIS get_labs 的 _guard_guardian）。
+# 2026-08-12 修复：此前 M3 饮食日记读写均无绑定校验，家长可跨患者读写任意患儿日记。
+# 令牌由 P1 his.issue_guardian_token（仅 doctor）签发并持久化到
+# resolve_state_path("guardian_tokens.json") —— 本包经同一路径读取，零跨包 import。
+# BUG-30/36（2026-08-12）：令牌校验统一收敛到 a207_policy.verify_guardian_token
+# （含 expires_at 过期校验 + 恒定时间比对 + 旧令牌兼容），删除本地副本——
+# 此前本地 _token_matches 无过期校验，令牌轮换后旧令牌在本包仍有效。
+# ---------------------------------------------------------------------------
+
+
+def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
+                    tool: str) -> dict[str, Any] | None:
+    """家长每次读写日记前必须通过绑定核验，缺 token 即拒绝，不给降级视图。
+
+    校验走 a207_policy.verify_guardian_token（统一实现，含过期校验，BUG-30/36）。
+    """
+    if caller != "parent_assistant":
+        return None
+    if not guardian_token:
+        return {"ok": False, "error": "GUARDIAN_UNVERIFIED",
+                "detail": f"caller=parent_assistant 调用 {tool} 必须携带 guardian_token"}
+    if not verify_guardian_token(patient_id, guardian_token):
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"guardian_token 与 patient_id={patient_id} 不匹配或已过期"}
+    return None
 
 # 素食蛋白倍数：蛋奶素 1.2 / 纯素 1.3（植物蛋白生物利用度低）
 _VEG_MULT = {"mixed": 1.0, "ovo_lacto": 1.2, "vegan": 1.3}
@@ -219,10 +256,14 @@ def calc_prnt_targets(
       - Schofield 交叉校验：独立估算 BMR，信息性对照 SDI 目标，不覆盖权威数。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-01 修复：临床组工具必须工具级 ACL 收口（仅 doctor），矩阵读权不足以表达
+    # "临床判读仅临床角色"（parent 对 P2 拥有 R/W）。
+    enforce_nutrition_tool(caller, "calc_prnt_targets")
     _require(age_years, "age_years")
     _require(weight_kg, "weight_kg")
-    sex = sex if sex in ("M", "F") else "M"
+    # BUG-19：sex 非法值不再静默按男性处理，显式报错（calc_prnt_targets 与 calc_growth_zscore 同口径）
+    if sex not in ("M", "F"):
+        raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
     if vegetarian_mode not in _VEG_MULT:
         vegetarian_mode = "mixed"
     # F7：用 DIALYSIS_ALIAS 单一事实源归一化（兼容 pd/腹透/hemodialysis 等别名），
@@ -375,9 +416,12 @@ def assess_intake_vs_target(
               avg_sodium_mg（与 PCP nutrition_assessment.diet_diary_3d 对齐）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-01：临床判读工具级 ACL（仅 doctor）
+    enforce_nutrition_tool(caller, "assess_intake_vs_target")
     _require(age_years, "age_years")
     _require(weight_kg, "weight_kg")
+    if sex not in ("M", "F"):
+        raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
     required = ("avg_energy_kcal", "avg_protein_g")
     if not all(k in diet for k in required):
         return {"ok": False, "error": "INVALID_INPUT",
@@ -507,7 +551,8 @@ def assess_pew_risk(
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-01：临床判读工具级 ACL（仅 doctor）
+    enforce_nutrition_tool(caller, "assess_pew_risk")
     _require(avg_protein_g, "avg_protein_g")
     _require(avg_energy_kcal, "avg_energy_kcal")
     _require(target_protein_g, "target_protein_g")
@@ -521,9 +566,10 @@ def assess_pew_risk(
 # 3. 3 日饮食日记：写入(store) + 聚合(diet_diary_3d) + 读取
 # ---------------------------------------------------------------------------
 def _load_store() -> dict[str, Any]:
-    if os.path.exists(DIARY_STORE):
+    path = _diary_store_path()
+    if os.path.exists(path):
         try:
-            with open(DIARY_STORE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return {"entries": []}
@@ -532,7 +578,7 @@ def _load_store() -> dict[str, Any]:
 
 def _save_store(store: dict[str, Any]) -> None:
     # OD-014（P2-3）：原子写，避免半写截断静默丢数据
-    atomic_write_json(DIARY_STORE, store)
+    atomic_write_json(_diary_store_path(), store)
 
 
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -557,20 +603,21 @@ def upsert_food_diary(
     patient_id: str,
     entries: list[dict[str, Any]] | None = None,
     write_mode: bool = True,
+    guardian_token: str | None = None,
 ) -> dict[str, Any]:
-    """写入/追加饮食条目（MX-3 收口：仅 parent_assistant / child_companion）。
+    """写入/追加饮食条目（MX-3 收口：家长/医生，2026-08-12 需求对齐临床=✔）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     条目由调用方经 M5 计算养分后填入（能量/蛋白/钾/磷/钠），M3 仅做存储与聚合，
     不反向调用 M5，保证各包自包含。
+    家长写入必须携带 guardian_token 完成患儿绑定核验（2026-08-12 修复：
+    此前无绑定校验，家长可向任意患儿写入日记污染数据）。
     """
     caller = get_caller()
-    if caller not in _WRITE_ALLOWED_CALLERS:
-        return {
-            "ok": False,
-            "error": "FORBIDDEN",
-            "detail": f"caller={caller} not allowed for upsert_food_diary (MX-3: parent_assistant|child_companion)",
-        }
+    enforce_nutrition_tool(caller, "upsert_food_diary")
+    denied = _guard_guardian(caller, patient_id, guardian_token, "upsert_food_diary")
+    if denied:
+        return denied
     if not entries:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "entries 不能为空"}
 
@@ -612,13 +659,18 @@ def upsert_food_diary(
     }
 
 
-def get_food_diary_summary(patient_id: str) -> dict[str, Any]:
-    """读取并聚合某患者的饮食日记（只读，家长/患儿/临床角色可读）。
+def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
+    """读取并聚合某患者的饮食日记（只读，家长/医生/临床角色可读）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
+    家长读取必须携带 guardian_token 完成患儿绑定核验（2026-08-12 修复：
+    此前无绑定校验，家长可跨患者读取任意患儿日记原始条目）。
     """
     caller = get_caller()
     enforce_nutrition_tool(caller, "get_food_diary_summary")
+    denied = _guard_guardian(caller, patient_id, guardian_token, "get_food_diary_summary")
+    if denied:
+        return denied
     store = _load_store()
     entries = [e for e in store.get("entries", []) if e.get("patient_id") == patient_id]
     if not entries:
@@ -754,9 +806,12 @@ def calc_growth_zscore(age_years: float, sex: str,
     - 返回各指标 z、5 等级、营养状况分类，并给出 PRNT `growth_status` 建议（failure/overweight/normal）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-01：临床判读工具级 ACL（仅 doctor）
+    enforce_nutrition_tool(caller, "calc_growth_zscore")
     _require(age_years, "age_years")
-    sex = sex if sex in ("M", "F") else "M"
+    # BUG-19：sex 非法值显式报错，不再静默按男性计算
+    if sex not in ("M", "F"):
+        raise ValueError(f"sex 必须是 'M' 或 'F'，收到：{sex!r}")
     ref = _load_growth_ref()
     age_months = age_years * 12.0
     results: dict[str, Any] = {"ok": True, "data": {}}
@@ -853,14 +908,13 @@ def calc_growth_zscore(age_years: float, sex: str,
 # ---------------------------------------------------------------------------
 # 依据 ADR-007：PEW 是 M3 assess_pew_risk 的产出，其历史时间线由 M3 拥有并落库；
 # M4 仅作为聚合 facade 从 M3 读取（零跨包 import，M4 不自己存 PEW）。
-# 存储为 data/pew_history_store.json，按 patient_id 追加历史点。
-PEW_STORE = _state_path("pew_history_store.json")
+# 存储为 <state>/pew_history_store.json，按 patient_id 追加历史点（路径延迟解析，见 BUG-18）。
 _PEW_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def _load_pew_store() -> dict:
     try:
-        with open(PEW_STORE, "r", encoding="utf-8") as f:
+        with open(_pew_store_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -868,7 +922,7 @@ def _load_pew_store() -> dict:
 
 def _save_pew_store(store: dict) -> None:
     # OD-014（P2-3）：原子写，避免半写截断静默丢数据
-    atomic_write_json(PEW_STORE, store)
+    atomic_write_json(_pew_store_path(), store)
 
 
 def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dict[str, Any]:
@@ -913,7 +967,9 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     :return: 按日期升序的历史点 + 趋势判断（improving / worsening / stable / no_data）
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-01 修复：PEW 历史属临床判读（NUTRITION_ASSESSMENT_CLINICAL_TOOLS 已登记），
+    # 原实现用 enforce_read 导致家长（矩阵 R/W）可读 PEW 临床历史。
+    enforce_nutrition_tool(caller, "get_pew_history")
     store = _load_pew_store()
     pts = store.get(patient_id, [])
     trend = "no_data"

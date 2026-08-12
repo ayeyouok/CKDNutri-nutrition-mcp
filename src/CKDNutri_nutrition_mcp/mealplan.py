@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Optional
 
-from a207_policy import enforce_read, get_caller
+from a207_policy import enforce_nutrition_tool, get_caller
 
 MCP_NAME = "CKDNutri-nutrition-mcp"
 
@@ -126,7 +126,9 @@ def generate_meal_plan(
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-02 修复：recipe 组仅临床助手（需求 recipe 组 临床=✔ 家庭=✘），
+    # 原实现仅 enforce_read，家长（矩阵 R/W）可调用食谱生成。
+    enforce_nutrition_tool(caller, "generate_meal_plan")
     if target_energy_kcal <= 0 or target_protein_g <= 0:
         raise ValueError("target_energy_kcal 与 target_protein_g 必须 > 0")
     if days <= 0:
@@ -161,7 +163,10 @@ def generate_meal_plan(
         fruit_g = 100
 
         e_staple = staple_g * staple["energy_per_100g"] / 100
-        e_prot = prot_g * prot["protein_per_100g"] * 4 / 100  # 蛋白 4 kcal/g
+        # BUG-30 修复（2026-08-12）：蛋白能量统一用食物表总能量（energy_per_100g），
+        # 此前用"蛋白g × 4 kcal/g"简化——对鸡蛋/瘦肉等含脂肪蛋白源会低估其能量贡献，
+        # 导致 rem（脂肪额度）偏高、day_totals 实际能量系统性超 target。
+        e_prot = prot_g * prot["energy_per_100g"] / 100
         e_veg = veg_g * veg["energy_per_100g"] / 100
         e_fruit = fruit_g * fr["energy_per_100g"] / 100
         rem = target_energy_kcal - (e_staple + e_prot + e_veg + e_fruit)
@@ -187,6 +192,9 @@ def generate_meal_plan(
         },
         "vegetarian": vegetarian,
         "days_count": days,
+        # BUG-31 透明标注（2026-08-12）：食谱基于 CKD 适宜食物子集（近似值），
+        # 与 lookup_food_nutrients 的全量中国食物成分表数值可能不同——跨工具核对时以全量库为准。
+        "source": "CKD 适宜食物子集（近似值）；如需精确成分请以 lookup_food_nutrients（全量食物成分表）核对",
     }
 
 
@@ -196,7 +204,8 @@ def get_meal_plan_nutrients(plan: dict) -> dict:
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # BUG-02 修复：recipe 组仅临床助手
+    enforce_nutrition_tool(caller, "get_meal_plan_nutrients")
     totals = {k: 0.0 for k in ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg", "sodium_mg")}
     n = len(plan["days"])
     for d in plan["days"]:

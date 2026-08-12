@@ -54,7 +54,14 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
         return {"ok": False, "error": "INVALID_INPUT", "detail": "dwell_hours 必须为正数"}
 
     transport = str(transport_type or "average").strip().lower()
-    factor = PD_TRANSPORT_FACTOR.get(transport, 1.0)
+    factor = PD_TRANSPORT_FACTOR.get(transport)
+    if factor is None:
+        # P3：未知转运类型不再静默回退 average，给出显式提示
+        factor = 1.0
+        warnings: list[str] = [f"未识别的 transport_type「{transport}」已按 average(1.0) 计算，"
+                               f"可用：{'/'.join(PD_TRANSPORT_FACTOR)}"]
+    else:
+        warnings: list[str] = []
     fraction = min(max(_absorption_fraction(float(dwell_hours)) * factor, 0.20), 0.90)
     exchanges = max(int(exchanges_per_day or 1), 1)
 
@@ -62,7 +69,6 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
     absorbed_total = absorbed_per_exchange * exchanges
     kcal_total = absorbed_total * GLUCOSE_KCAL_PER_G
 
-    warnings: list[str] = []
     per_kg = None
     if weight_kg and weight_kg > 0:
         per_kg = round(kcal_total / weight_kg, 2)
