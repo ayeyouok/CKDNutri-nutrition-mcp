@@ -24,15 +24,7 @@ FOOD_TABLE_REF = "中国食物成分表（第6版）代表值，每 100 g 可食
 # BUG-32（2026-08-12）：原 SDI_ANCHORS 为死代码（全仓库无引用），且 3/12 月龄数值
 # 与 core._PRNT_BANDS（实际计算引擎）不一致，删除以避免双轨漂移；计算以 core 为准。
 
-# --- 分期/透析对应的蛋白处方区间 (g/kg/d) ------------------------------------
-# 依据：PRNT 2020 对透析患儿在 SDI 基础上补偿丢失；CKD 3-5 期非透析在保证生长
-# 前提下将蛋白控制在 SDI 上限附近而不过量（本项目锁定的临床落地区间）。
-PROTEIN_BAND = {
-    "none_early": None,          # CKD 1-2 期：不做限制，直接用 SDI 区间
-    "none_ckd345": (0.80, 1.00),  # CKD 3-5 期非透析
-    "hemodialysis": (1.00, 1.20),
-    "peritoneal": (1.00, 1.20),
-}
+# --- 分期/透析别名（单一事实源；透析蛋白额外补充在 core._DIALYSIS_EXTRA）-----
 DIALYSIS_ALIAS = {
     "none": "none", "非透析": "none", "no": "none", "": "none", "nd": "none",
     "hd": "hemodialysis", "hemodialysis": "hemodialysis", "血透": "hemodialysis",

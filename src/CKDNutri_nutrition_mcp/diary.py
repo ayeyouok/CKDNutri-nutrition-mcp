@@ -15,9 +15,14 @@ SUM_KEYS = ("energy_kcal", "protein_g", "fat_g", "carb_g",
             "potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")
 
 # 目标字段的兼容别名：既接受本包的输出，也接受 PCP 风格字段
+# 五审（2026-08-13）：补 energy_target_kcal_per_day / protein_target_g_per_day——
+# _normalize_target 把 PRNT 信封拍平后（energy.target_kcal_per_day →
+# energy_target_kcal_per_day），这两键才会出现在目标 dict 顶层。
 TARGET_ALIAS = {
-    "energy_kcal": ("energy_kcal_per_day", "energy_kcal", "target_kcal_per_day", "avg_energy_kcal"),
-    "protein_g": ("protein_g_per_day", "protein_g", "target_g_per_day", "avg_protein_g"),
+    "energy_kcal": ("energy_kcal_per_day", "energy_kcal", "target_kcal_per_day",
+                    "energy_target_kcal_per_day", "avg_energy_kcal"),
+    "protein_g": ("protein_g_per_day", "protein_g", "target_g_per_day",
+                  "protein_target_g_per_day", "avg_protein_g"),
     "potassium_mg": ("potassium_mg_per_day", "potassium_mg", "k_mg_per_day", "avg_potassium_mg"),
     "phosphorus_mg": ("phosphorus_mg_per_day", "phosphorus_mg", "p_mg_per_day", "avg_phosphorus_mg"),
     "sodium_mg": ("sodium_mg_per_day", "sodium_mg", "na_mg_per_day", "avg_sodium_mg"),
@@ -29,6 +34,25 @@ FIELD_LABEL = {"energy_kcal": "能量", "protein_g": "蛋白质", "potassium_mg"
 
 def _blank_totals() -> dict[str, float]:
     return {key: 0.0 for key in SUM_KEYS}
+
+
+def _normalize_target(target: dict[str, Any]) -> dict[str, Any]:
+    """把目标参数归一化为顶层键可查的 dict（供 TARGET_ALIAS 命中）。
+
+    五审（2026-08-13）修复 BUG：docstring 承诺"target 可传 calc_prnt_targets 的
+    结果"，但 PRNT 返回 {ok, data: {energy: {target_kcal_per_day}, protein: {...}}}
+    嵌套结构——TARGET_ALIAS 只查顶层键，全部取不到 → 达成率对照**静默为空**
+    （achievement.items=[] 且无任何提示）。修复：解 {ok,data} 信封 + 把
+    energy/protein 子块键拍平到顶层（target_kcal_per_day → energy_target_kcal_per_day）。
+    """
+    if not isinstance(target, dict) or not isinstance(target.get("data"), dict):
+        return target
+    data = target["data"]
+    if isinstance(data.get("energy"), dict):
+        data = {**data, **{f"energy_{k}": v for k, v in data["energy"].items()}}
+    if isinstance(data.get("protein"), dict):
+        data = {**data, **{f"protein_{k}": v for k, v in data["protein"].items()}}
+    return data
 
 
 def _pick_target(target: dict[str, Any], field: str) -> float | None:
@@ -149,7 +173,9 @@ def sum_diet_intake(diary: list[dict[str, Any]],
             f"{len(bad_dates)} 条记录日期无法归一化为 YYYY-MM-DD（如 {bad_dates[0]!r}），"
             "已按原样分桶，跨天统计可能被拆散；请使用 YYYY-MM-DD 格式。"]
     if target:
-        data["achievement"] = _achievement(average, target)
+        # 五审（2026-08-13）：先归一化 PRNT 信封（{ok,data} 嵌套）——此前直接透传
+        # 导致目标对照静默为空（achievement.items=[]）。兼容扁平简表不受影响。
+        data["achievement"] = _achievement(average, _normalize_target(target))
         data["guideline"] = GUIDELINE
     return {"ok": True, "data": data}
 

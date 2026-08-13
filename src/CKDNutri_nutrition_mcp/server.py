@@ -105,7 +105,7 @@ def main():
 @mcp.tool
 def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = True,
                            guardian_token: str = "") -> dict[str, Any]:
-    """写入每日饮食日记。家长/医生可写（MX-3），家长须携带 guardian_token 完成患儿绑定。
+    """写入每日饮食日记。家长/医生可写，家长须携带 guardian_token 完成患儿绑定。
 
     entries 每项：{date, meal, food, energy_kcal, protein_g, potassium_mg, phosphorus_mg, sodium_mg}
     """
@@ -288,7 +288,7 @@ def assess_pew_risk_tool(
 
 @mcp.tool
 def record_pew_risk_tool(patient_id: str, date: str, score: float, level: str) -> dict[str, Any]:
-    """落库一个 PEW 历史点（ADR-007：PEW 历史归属本包）。level: low / medium / high。"""
+    """落库一个 PEW 风险历史点（供后续趋势评估）。level: low / medium / high。"""
     try:
         return record_pew_risk(patient_id, date, float(score), level)
     except Exception as exc:
@@ -336,14 +336,14 @@ def comprehensive_nutrition_assessment_tool(
 
     ckd_stage: CKD 分期(1-5D)。注意 PRNT 数值目标与分期无关（仅由年龄×性别×体重驱动），
     ckd_stage 仅用于 stage=1 的沿用提示，不影响能量/蛋白计算结果。
-    内部串联 calc_growth_zscore → calc_prnt_targets → assess_intake_vs_target → assess_pew_risk，
+    执行流程：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定，
     原 3-4 次 LLM 调用压缩为 1 次。生长状态由 Z 评分自动推导后回灌 PRNT，无需手填。
 
     摄入来源优先级：显式 avg_protein_g/avg_energy_kcal > include_intake+patient_id 查饮食日记。
     两者都没有则跳过摄入与 PEW 环节（仅出 Z 评分 + 目标）。
 
-    腹透能量修正（v2.4 工具收敛）：pd_glucose_kcal_per_day 可直接传入（已算好的
-    吸收能量）；也可以传 pd_dwell_hours + （pd_dialysate_glucose_g 或
+    腹透能量修正：pd_glucose_kcal_per_day 可直接传入（已算好的吸收能量）；
+    也可以传 pd_dwell_hours + （pd_dialysate_glucose_g 或
     pd_dialysate_volume_ml+pd_glucose_conc_pct），由本 DAG 内部调用腹透葡萄糖吸收
     计算并自动扣减——LLM 无需先调独立工具。非腹透患儿不触发。
     """

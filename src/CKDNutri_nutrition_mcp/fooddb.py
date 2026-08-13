@@ -10,6 +10,7 @@ import csv
 import difflib
 import os
 import re
+import threading
 from typing import Any
 
 from .constants import (
@@ -30,6 +31,10 @@ NUTRIENT_KEYS = ("energy_kcal", "protein_g", "fat_g", "carb_g",
 
 _CACHE: list[dict[str, Any]] | None = None
 _CLUSTER: dict[str, list[dict[str, Any]]] = {}
+# 五审（2026-08-13）：懒加载并发锁（double-checked locking）——此前无锁，多线程
+# 首次调用时 _CLUSTER.clear() 重建与读取竞态（一个线程清空后另一线程读到半空
+# 聚类表，find_food_cluster 漏命中）；refresh=True 同样在锁内重建。
+_CACHE_LOCK = threading.Lock()
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -50,34 +55,38 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
     global _CACHE
     if _CACHE is not None and not refresh:
         return _CACHE
-    rows: list[dict[str, Any]] = []
-    with open(_DATA_FILE, encoding="utf-8-sig", newline="") as handle:
-        for raw in csv.DictReader(handle):
-            if not (raw.get("name") or "").strip():
-                continue
-            row: dict[str, Any] = {
-                "name": raw["name"].strip(),
-                "aliases": [a for a in (raw.get("aliases") or "").split(";") if a],
-                "category": (raw.get("category") or "").strip(),
-                "subcategory": (raw.get("subcategory") or "").strip(),
-                "edible_pct": _to_float(raw.get("edible_pct"), 100.0),
-                "unit_name": (raw.get("unit_name") or "份").strip(),
-                "unit_grams": _to_float(raw.get("unit_grams"), 100.0),
-                "unit_desc": (raw.get("unit_desc") or "").strip(),
-                "note": (raw.get("note") or "").strip(),
-            }
-            for key in NUTRIENT_KEYS:
-                row[key] = _to_float(raw.get(key))
-            row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
-            row["phosphorus_level"], row["phosphorus_label"] = classify(row["phosphorus_mg"], P_LEVELS)
-            row["sodium_high"] = row["sodium_mg"] >= NA_HIGH_MG_PER_100G
-            row["pnpr_mg_per_g"] = round(row["phosphorus_mg"] / row["protein_g"], 1) \
-                if row["protein_g"] > 0 else None
-            rows.append(row)
-    _CLUSTER.clear()
-    for row in rows:
-        _CLUSTER.setdefault(base_name(row["name"]), []).append(row)
-    _CACHE = rows
+    with _CACHE_LOCK:
+        # 五审：double-checked locking——首个线程释放锁后，等待线程直接命中缓存
+        if _CACHE is not None and not refresh:
+            return _CACHE
+        rows: list[dict[str, Any]] = []
+        with open(_DATA_FILE, encoding="utf-8-sig", newline="") as handle:
+            for raw in csv.DictReader(handle):
+                if not (raw.get("name") or "").strip():
+                    continue
+                row: dict[str, Any] = {
+                    "name": raw["name"].strip(),
+                    "aliases": [a for a in (raw.get("aliases") or "").split(";") if a],
+                    "category": (raw.get("category") or "").strip(),
+                    "subcategory": (raw.get("subcategory") or "").strip(),
+                    "edible_pct": _to_float(raw.get("edible_pct"), 100.0),
+                    "unit_name": (raw.get("unit_name") or "份").strip(),
+                    "unit_grams": _to_float(raw.get("unit_grams"), 100.0),
+                    "unit_desc": (raw.get("unit_desc") or "").strip(),
+                    "note": (raw.get("note") or "").strip(),
+                }
+                for key in NUTRIENT_KEYS:
+                    row[key] = _to_float(raw.get(key))
+                row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
+                row["phosphorus_level"], row["phosphorus_label"] = classify(row["phosphorus_mg"], P_LEVELS)
+                row["sodium_high"] = row["sodium_mg"] >= NA_HIGH_MG_PER_100G
+                row["pnpr_mg_per_g"] = round(row["phosphorus_mg"] / row["protein_g"], 1) \
+                    if row["protein_g"] > 0 else None
+                rows.append(row)
+        _CLUSTER.clear()
+        for row in rows:
+            _CLUSTER.setdefault(base_name(row["name"]), []).append(row)
+        _CACHE = rows
     return rows
 
 
@@ -95,23 +104,33 @@ def pnpr_grade(ratio: float | None) -> tuple[str, str]:
 
 
 def _match_score(row: dict[str, Any], query: str) -> float:
-    names = [row["name"]] + list(row["aliases"])
+    """名称/别名匹配打分（分越低越相似，99=未命中）。
+
+    v2.4 修复（2026-08-13）：**别名只做精确匹配**，模糊分支（前缀/子串/相似度）
+    仅对主名生效。原因：别名语义是「同一食物的另一种叫法」，不是「包含该词的食物」——
+    此前「粟米」子串命中别名「粟米油」→ 误匹配「大麻油」；「西红柿」命中「奶柿子」
+    同类误伤。别名一旦精确命中即 score=0（最高优先）。
+    """
     best = 99.0
-    for name in names:
-        if name == query:
-            best = min(best, 0.0)
-        elif name.startswith(query) or query.startswith(name):
-            best = min(best, 1.0)
-        elif query in name:
-            best = min(best, 2.0)
-        elif name in query:
-            best = min(best, 3.0)
-        else:
-            ratio = difflib.SequenceMatcher(None, query, name).ratio()
-            # 阈值收紧到 0.80：1752 食物下表，过低会张冠李戴（如“猪瘦肉”误匹配“猪肉脯”）。
-            # 前缀/子串/精确匹配（score ≤ 3.0）不受影响；below 0.80 一律视为未命中。
-            if ratio >= 0.80:
-                best = min(best, 4.0 + (1.0 - ratio) * 10.0)
+    # 1) 别名：只允许精确匹配（方言词入别名后即精确命中，杜绝子串误伤）
+    for alias in row["aliases"]:
+        if alias == query:
+            return 0.0
+    # 2) 主名：保留前缀/子串/相似度（名称是描述性短语，模糊匹配合理）
+    name = row["name"]
+    if name == query:
+        best = 0.0
+    elif name.startswith(query) or query.startswith(name):
+        best = min(best, 1.0)
+    elif query in name:
+        best = min(best, 2.0)
+    elif name in query:
+        best = min(best, 3.0)
+    else:
+        ratio = difflib.SequenceMatcher(None, query, name).ratio()
+        # 阈值收紧到 0.80：1752 食物下表，过低会张冠李戴（如“猪瘦肉”误匹配“猪肉脯”）。
+        if ratio >= 0.80:
+            best = min(best, 4.0 + (1.0 - ratio) * 10.0)
     return best
 
 

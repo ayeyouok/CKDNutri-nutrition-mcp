@@ -89,9 +89,31 @@ def test_corrupt_store_fail_closed():
         os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
 
 
+def test_diary_target_normalize():
+    """五审（2026-08-13）回归：sum_diet_intake 传 PRNT 完整信封时目标对照不再静默为空。"""
+    from CKDNutri_nutrition_mcp import core
+    from CKDNutri_nutrition_mcp.diary import sum_diet_intake
+
+    prnt = core.calc_prnt_targets(age_years=6, sex="F", weight_kg=20, height_cm=130)
+    r = sum_diet_intake(
+        [{"food": "米饭", "grams": 150}, {"food": "鸡蛋", "grams": 50}],
+        target=prnt)
+    assert r.get("ok") is True, r
+    ach = r["data"].get("achievement")
+    assert ach and ach["items"], "PRNT 信封目标对照不应为空（此前嵌套结构导致静默丢失）"
+    fields = {i["field"] for i in ach["items"]}
+    assert {"energy_kcal", "protein_g"} <= fields, fields
+    # 扁平简表兼容不受影响
+    flat = sum_diet_intake(
+        [{"food": "米饭", "grams": 100}],
+        target={"energy_kcal": 1200, "protein_g": 40})
+    assert flat["data"]["achievement"]["items"], "扁平简表目标对照应保留"
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_calc_prnt_targets()
     test_calc_prnt_targets_validation()
     test_corrupt_store_fail_closed()
+    test_diary_target_normalize()
     print("P2 SMOKE OK")
