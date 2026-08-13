@@ -24,6 +24,7 @@ from typing import Any
 from a207_policy import (
     enforce_nutrition_tool,
     get_caller,
+    validate_patient_id,
     verify_guardian_token,
 )
 from .constants import DIALYSIS_ALIAS
@@ -45,13 +46,22 @@ _STORE_LOCK = threading.Lock()
 
 
 def _require(value: Any, name: str) -> Any:
-    """入口参数校验（F6）：必填数值/参数传 None 时显式抛出域错误，避免下游 TypeError。
+    """入口参数校验（F6 + P0-7 修复 2026-08-13）：必填数值/参数传 None、NaN、Inf 时
+    显式抛出域错误，避免下游 TypeError 或 NaN 静默穿透。
 
     配合 server 层的 try/except → _invalid()，最终以 {ok:False, error:"INVALID_INPUT"}
     信封返回，而非把未捕获的 TypeError 暴露给调用方。
+
+    P0-7：此前只拦 None——`NaN < 0` 恒为 False，calc_growth_zscore(NaN) 会静默产出
+    "成人参照 Z 分"、assess_pew_risk(NaN) 会"PEW 恒判 low"，比报错危险得多。
     """
     if value is None:
         raise ValueError(f"{name} 不能为 None")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        import math
+
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"{name} 必须为有效的有限数值，收到 {value!r}")
     return value
 
 
@@ -327,6 +337,12 @@ def calc_prnt_targets(
             eff_weight = ibw
             weight_basis = "水肿校正理想体重(BMI-P50)"
             e_basis += "；水肿：采用理想体重开处方（dry weight 原则）"
+        else:
+            # P1-7 修复（2026-08-13）：is_edema=True 但身高缺失 → ideal_body_weight_kg
+            # 返回 None，此前**静默跳过校正**按水肿体重开处方（能量/蛋白系统性高估）且
+            # warnings 为空。现在显式告警，提示补身高以启用 dry weight 校正。
+            weight_basis = "实际体重（⚠ 水肿未校正：缺身高无法算理想体重）"
+            e_basis += "；水肿但缺身高，未能按理想体重校正（dry weight 未生效），请补身高后复算"
 
     energy_day = energy_per_kg * eff_weight
 
@@ -556,11 +572,24 @@ def assess_intake_vs_target(
 
 
 def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
-                albumin_g_L: float | None) -> dict[str, str]:
-    """简化 PEW 风险筛查：蛋白低于安全下限 + 能量低于 80% 目标 → 高风险。"""
+                albumin_g_L: float | None) -> dict[str, Any]:
+    """简化 PEW 风险筛查：蛋白低于安全下限 + 能量低于 80% 目标 → 高风险。
+
+    S2 修复（2026-08-13）：返回数值 score（0-100，信号加权）——供
+    record_pew_risk 落库（其 score 契约字段本应来自本函数，此前 assess 不返回
+    score 导致编排层无值可传）。打分规则透明：蛋白缺乏 40 分 + 能量缺乏 40 分 +
+    低白蛋白 20 分；high ≥80、medium 40-60、low 0。
+    """
     protein_deficit = avg_p < floor_p
     energy_deficit = (avg_e / target_e) < 0.8 if target_e > 0 else False
     low_albumin = (albumin_g_L is not None and albumin_g_L < 35)
+
+    # S2：信号加权分（透明、可解释；与等级判定共用信号，不另立口径）
+    score = sum((
+        40.0 if protein_deficit else 0.0,
+        40.0 if energy_deficit else 0.0,
+        20.0 if low_albumin else 0.0,
+    ))
 
     if protein_deficit and energy_deficit:
         risk = "high"
@@ -585,7 +614,7 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
 
     if albumin_g_L is None:
         rationale += "（未提供白蛋白，建议结合血清白蛋白 <35 g/L 与人体测量综合判定）"
-    return {"risk": risk, "rationale": rationale}
+    return {"risk": risk, "rationale": rationale, "score": score}
 
 
 def assess_pew_risk(
@@ -625,7 +654,13 @@ def assess_pew_risk(
                 "detail": "target_protein_g 与 target_energy_kcal 必须 > 0"}
     floor_p = floor_protein_g if floor_protein_g is not None else target_protein_g * 0.85
     pew = _screen_pew(avg_protein_g, avg_energy_kcal, floor_p, target_energy_kcal, albumin_g_L)
-    return {"ok": True, "data": {"pew_risk": pew["risk"], "rationale": pew["rationale"]}}
+    # S2 修复（2026-08-13）：透出数值 score——record_pew_risk.score 契约字段
+    # 的合法来源（此前 assess 不返回 score，编排层无值可传：传 0.0 误导 / 调用失败）。
+    return {"ok": True, "data": {
+        "pew_risk": pew["risk"],
+        "rationale": pew["rationale"],
+        "score": round(float(pew["score"]), 1),
+    }}
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +793,12 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     """
     caller = get_caller()
     enforce_nutrition_tool(caller, "get_food_diary_summary")
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（与 P1 his 同口径，
+    # a207_policy.validate_patient_id ^P[0-9]{4,}$）——畸形 id 不进存储层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_food_diary_summary")
     if denied:
         return denied
@@ -857,7 +898,12 @@ def _height_table(sex: str) -> list:
 
 
 def _grade_5(z: float) -> str:
-    """生长水平 5 等级（标准差法：表2 / WS/T 612 表3.3 同口径）。"""
+    """生长水平 5 等级（标准差法：表2 / WS/T 612 表3.3 同口径）。
+
+    区间：[−∞,−2) 下；[−2,−1) 中下；[−1,1] 中；[1,2] 中上；(2,∞) 上。
+    P2 核实（2026-08-13）：z==2.0 归"中上"符合 WS/T 5 等级惯例（+2SD 含于中上
+    区间，>+2SD 才判"上"），非缺陷，保留。
+    """
     if z < -2:
         return "下"
     if z < -1:
@@ -988,8 +1034,11 @@ def calc_growth_zscore(age_years: float, sex: str,
         h_m = height_cm / 100.0
         bmi = weight_kg / (h_m * h_m)
 
-    # WAZ / BAZ（仅 <84 月，WS/T 423）
-    if age_months < 84:
+    # WAZ / BAZ（仅 ≤81 月，WS/T 423 附录 B —— 参考表最大 81 月龄）
+    # N2 修复（2026-08-13）：上限从 <84 收紧到 <=81——此前 age 81-83 月龄也进
+    # _interp_sd，越界取端点（81 月参考值）被"压平"，产出假 Z 分且无告警。
+    # 81-83 月龄显式跳过 + 告警，不静默使用边界参考值。
+    if age_months <= 81:
         if weight_kg is not None:
             m, s = _interp_sd(ref["weight"][sex], age_months)
             if m is None or not _valid_sd(s):
@@ -1024,6 +1073,12 @@ def calc_growth_zscore(age_years: float, sex: str,
                 }
         else:
             warnings.append("未提供 bmi/身高体重，跳过 BAZ。")
+    elif age_months < 84:
+        # N2 修复：81<age<84 月龄——WS/T 423 附录 B 参考表最大 81 月，无 82-83 月
+        # 参考值；此前静默用 81 月端点值（压平），现在显式告警不产出假 Z 分。
+        warnings.append(
+            f"月龄 {age_months:.0f} 超出 WAZ/BAZ 参考表上限（81 月，WS/T 423 附录 B），"
+            "无法计算 WAZ/BAZ，请结合 BMI 绝对值与生长曲线人工评估。")
     else:
         warnings.append(
             "WAZ/BAZ 仅 7 岁以下可用（WS/T 423 随附）；7-18 体重/BMI 标准未提供，跳过。")
@@ -1087,12 +1142,18 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     每次 assess_pew_risk 评估后，由编排层（router/PCP）调用本函数持久化一个历史点。
     :param patient_id: 患者标识（与 PCP 一致，^P[0-9]{4,}$）
     :param date: 评估日期 YYYY-MM-DD
-    :param score: PEW 数值分（来自 assess_pew_risk 返回的 score 字段）
+    :param score: PEW 数值分（S2 修复 2026-08-13：来自 assess_pew_risk 返回的
+        data.score 字段——信号加权 0-100；此前 assess 不返回 score，本参数无合法来源）
     :param level: PEW 风险等级 low / medium / high
     :return: 落库后该患者的完整历史点列表（身份由部署环境注入，P0-1）
     """
     caller = get_caller()
     enforce_nutrition_tool(caller, "record_pew_risk")  # 仅临床角色可落 PEW 历史
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（畸形 id 不进写库）
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
@@ -1115,7 +1176,9 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
         ordered = [by_date[k] for k in sorted(by_date.keys())]
         store[patient_id] = ordered
         _save_pew_store(store)
-    return {"ok": True, "patient_id": patient_id, "points": ordered}
+    # N4 修复（2026-08-13）：返回信封与其余工具统一 {ok, data}——此前扁平
+    # {ok, patient_id, points} 与 get_pew_history 等不一致，编排层无法统一解包。
+    return {"ok": True, "data": {"patient_id": patient_id, "points": ordered}}
 
 
 def get_pew_history(patient_id: str) -> dict[str, Any]:
@@ -1129,6 +1192,11 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     # BUG-01 修复：PEW 历史属临床判读（NUTRITION_ASSESSMENT_CLINICAL_TOOLS 已登记），
     # 原实现用 enforce_read 导致家长（矩阵 R/W）可读 PEW 临床历史。
     enforce_nutrition_tool(caller, "get_pew_history")
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
     store = _load_pew_store()
     pts = store.get(patient_id, [])
     trend = "no_data"

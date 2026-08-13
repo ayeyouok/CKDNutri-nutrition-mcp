@@ -135,9 +135,18 @@ def _match_score(row: dict[str, Any], query: str) -> float:
 
 
 def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """按名称/别名检索，返回按匹配度升序的候选行。"""
+    """按名称/别名检索，返回按匹配度升序的候选行。
+
+    P0-6 修复（2026-08-13）：**单字符查询拒绝**——中文 1 字（"鱼"/"蛋"/"肉"）在
+    1752 行表里必然子串命中多个不相关食物（实测"鱼"→鱼腥草叶、"蛋"→蛋清肠、
+    "肉"→肉桂），张冠李戴到错误营养值比报错更危险。要求 ≥2 字符；数字查询（如
+    "100g"）同理拒绝。返回空列表由调用方转 INVALID_ARGUMENT / 提示细化关键词。
+    """
     text = (query or "").strip()
-    if not text:
+    if not text or len(text) < 2:
+        return []
+    # 数字串（如 "123"）不是食物名，拒绝
+    if text.isdigit():
         return []
     scored = [(row, _match_score(row, text)) for row in load_foods()]
     hits = sorted([item for item in scored if item[1] < 90.0], key=lambda x: (x[1], x[0]["name"]))
@@ -145,8 +154,33 @@ def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
 
 
 def find_food(query: str) -> dict[str, Any] | None:
-    hits = search_food(query, limit=1)
-    return hits[0] if hits else None
+    """单条精确检索：返回匹配度最高的一行。
+
+    P0-6 修复（2026-08-13）：**同基名多规格时优先营养值完整的行**——food_data.csv
+    存在 11 组重名行（如"鱼丸"两行 K=360/0、P=272/0，"松蘑（干）"K=93/2402）。
+    - 组内存在营养全零的脏行 → 排除后取首个非零行（鱼丸取 K=360/P=272）；
+    - 组内多行营养值**冲突且都非零**（数据源不一致，如松蘑 93 vs 2402）→ 返回 None
+      （调用方提示"名称有多个规格，请细化"，不猜——猜错营养值比报错更危险）；
+    - 单行正常返回。
+    """
+    hits = search_food(query, limit=10)
+    if not hits:
+        return None
+    group = [r for r in hits if base_name(r["name"]) == base_name(hits[0]["name"])]
+    if len(group) > 1:
+        # P0-6：脏行判定 = **四大电解质键全零**（能量/蛋白可能有值但钾磷钠钙缺失，
+        # 实测"鱼丸"脏行 energy=107/protein=11.1 但 K/P/Na/Ca 全 0——对 CKD 患儿
+        # 限钾限磷才是关键，此类行视为数据不完整）。
+        _ELECTROLYTES = ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")
+        complete = [r for r in group if any(r[k] > 0 for k in _ELECTROLYTES)]
+        if len(complete) == 1:
+            return complete[0]  # 唯一完整行（其余为电解质缺失脏行）
+        if len(complete) > 1:
+            profiles = {(r["potassium_mg"], r["phosphorus_mg"], r["protein_g"]) for r in complete}
+            if len(profiles) > 1:
+                return None  # 数据源冲突（如松蘑 93 vs 2402），拒绝猜测
+            return complete[0]
+    return hits[0]
 
 
 def find_food_cluster(query: str) -> list[dict[str, Any]] | None:

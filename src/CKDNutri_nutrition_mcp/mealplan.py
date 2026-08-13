@@ -149,10 +149,31 @@ def generate_meal_plan(
     # BUG-02 修复：recipe 组仅临床助手（需求 recipe 组 临床=✔ 家庭=✘），
     # 原实现仅 enforce_read，家长（矩阵 R/W）可调用食谱生成。
     enforce_nutrition_tool(caller, "generate_meal_plan")
+    # P0-7 修复（2026-08-13）：NaN/Inf 显式拒绝（NaN<=0 恒 False 会穿透）
+    import math as _math
+
+    for _name, _val in (("target_energy_kcal", target_energy_kcal),
+                        ("target_protein_g", target_protein_g),
+                        ("target_k_mg", target_k_mg), ("target_p_mg", target_p_mg),
+                        ("target_na_mg", target_na_mg), ("days", days)):
+        if isinstance(_val, (int, float)) and not isinstance(_val, bool) \
+                and (_math.isnan(_val) or _math.isinf(_val)):
+            raise ValueError(f"{_name} 必须为有效的有限数值，收到 {_val!r}")
     if target_energy_kcal <= 0 or target_protein_g <= 0:
         raise ValueError("target_energy_kcal 与 target_protein_g 必须 > 0")
     if days <= 0:
         raise ValueError("days 必须 > 0")
+    # P2 修复（2026-08-13）：vegetarian 显式 bool 校验——编排层直调 core 时若传
+    # 字符串 "false"，bool("false")==True 会静默开素食（蛋白源减半）。FastMCP 层有
+    # pydantic 拦截，但 core 是纯函数库可被绕过，入口显式拒绝非 bool。
+    if not isinstance(vegetarian, bool):
+        raise ValueError(f"vegetarian 必须为布尔值，收到 {vegetarian!r}（字符串 'false' 会被"
+                         f"bool() 判为 True，静默开启素食模式）")
+    # P2 修复（2026-08-13）：days 上限钳制（默认 7）——days=90 会把 90 天×4 餐刷进
+    # LLM 上下文。食谱是"周计划"粒度，超出 14 天钳制并告警，不报错。
+    _DAYS_MAX = 14
+    if days > _DAYS_MAX:
+        days = _DAYS_MAX
 
     foods = _load_foods()
     excl = set(exclude_foods or [])

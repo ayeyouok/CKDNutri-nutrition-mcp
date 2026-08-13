@@ -45,9 +45,21 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
     """腹透葡萄糖倒灌：估算吸收克数与额外能量（须从膳食能量中扣减）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
+
+    P0-7 修复（2026-08-13）：NaN/Inf 显式拒绝——此前 `dialysate_glucose_g < 0`
+    对 NaN 恒 False，NaN 会静默落到"80% 吸收率假设"，产出自相矛盾的估算。
     """
+    import math
+
     caller = get_caller()
     enforce_read(MCP_NAME)
+    for _name, _val in (("dialysate_glucose_g", dialysate_glucose_g),
+                        ("dwell_hours", dwell_hours),
+                        ("exchanges_per_day", exchanges_per_day)):
+        if isinstance(_val, (int, float)) and not isinstance(_val, bool) \
+                and (math.isnan(_val) or math.isinf(_val)):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 必须为有效的有限数值，收到 {_val!r}"}
     if dialysate_glucose_g is None or dialysate_glucose_g < 0:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "dialysate_glucose_g 不能为负"}
     if dwell_hours is None or dwell_hours <= 0:

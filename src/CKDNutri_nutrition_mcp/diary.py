@@ -18,14 +18,17 @@ SUM_KEYS = ("energy_kcal", "protein_g", "fat_g", "carb_g",
 # 五审（2026-08-13）：补 energy_target_kcal_per_day / protein_target_g_per_day——
 # _normalize_target 把 PRNT 信封拍平后（energy.target_kcal_per_day →
 # energy_target_kcal_per_day），这两键才会出现在目标 dict 顶层。
+# S3 修复（2026-08-13）：移除 avg_* 别名——它们是**实际摄入均值**（日记汇总产出），
+# 不是目标。若误把日记均值当 target 传入，assess_intake_vs_target 会把「摄入 vs 自身
+# 均值」对照，产出 ~100% 达成率假象且无告警。目标键只接受真正的 target 命名空间。
 TARGET_ALIAS = {
     "energy_kcal": ("energy_kcal_per_day", "energy_kcal", "target_kcal_per_day",
-                    "energy_target_kcal_per_day", "avg_energy_kcal"),
+                    "energy_target_kcal_per_day"),
     "protein_g": ("protein_g_per_day", "protein_g", "target_g_per_day",
-                  "protein_target_g_per_day", "avg_protein_g"),
-    "potassium_mg": ("potassium_mg_per_day", "potassium_mg", "k_mg_per_day", "avg_potassium_mg"),
-    "phosphorus_mg": ("phosphorus_mg_per_day", "phosphorus_mg", "p_mg_per_day", "avg_phosphorus_mg"),
-    "sodium_mg": ("sodium_mg_per_day", "sodium_mg", "na_mg_per_day", "avg_sodium_mg"),
+                  "protein_target_g_per_day"),
+    "potassium_mg": ("potassium_mg_per_day", "potassium_mg", "k_mg_per_day"),
+    "phosphorus_mg": ("phosphorus_mg_per_day", "phosphorus_mg", "p_mg_per_day"),
+    "sodium_mg": ("sodium_mg_per_day", "sodium_mg", "na_mg_per_day"),
 }
 LIMIT_KEYS = ("potassium_mg", "phosphorus_mg", "sodium_mg")
 FIELD_LABEL = {"energy_kcal": "能量", "protein_g": "蛋白质", "potassium_mg": "钾",
@@ -56,6 +59,16 @@ def _normalize_target(target: dict[str, Any]) -> dict[str, Any]:
 
 
 def _pick_target(target: dict[str, Any], field: str) -> float | None:
+    # S3 修复（2026-08-13）：检测「摄入均值误当目标」——若 target 里出现 avg_* 键
+    # （日记汇总产出，不是目标），显式报错而非静默对照自身（会产出 ~100% 达成率假象）。
+    for key in ("avg_energy_kcal", "avg_protein_g", "avg_potassium_mg",
+                "avg_phosphorus_mg", "avg_sodium_mg"):
+        if key in target:
+            raise ValueError(
+                f"target 含摄入均值键 {key}——avg_* 是日记实际摄入均值，不是目标。"
+                f"请改用真正的目标命名空间（如 energy_target_kcal_per_day / "
+                f"protein_target_g_per_day / target_kcal_per_day），"
+                f"或先调用 calc_prnt_targets 计算目标后再对照。")
     for alias in TARGET_ALIAS[field]:
         value = target.get(alias)
         if isinstance(value, (int, float)):
@@ -91,8 +104,14 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         name = str(entry.get("food") or entry.get("name") or "").strip()
         row = find_food(name) if name else None
         if row is None:
-            unmatched.append({"index": index, "food": name,
-                              "reason": "内置食物表中未匹配到该名称"})
+            # P0-6：None 可能是「未匹配」或「多规格歧义」（find_food 拒绝猜测）——
+            # 区分提示，引导用户用完整名称/规格词（如"松蘑（干）"而非"松蘑"）。
+            if name and len(name) >= 2:
+                reason = ("内置食物表未唯一匹配该名称（可能多规格歧义或名称过简），"
+                          "请用完整名称（如含规格词）重试")
+            else:
+                reason = "内置食物表中未匹配到该名称"
+            unmatched.append({"index": index, "food": name, "reason": reason})
             continue
         grams = entry.get("grams") or entry.get("weight_g")
         if isinstance(grams, (int, float)) and grams > 0:
