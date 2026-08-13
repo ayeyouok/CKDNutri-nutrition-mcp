@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import os
 from datetime import datetime
@@ -21,13 +22,12 @@ from pathlib import Path
 from typing import Any
 
 from a207_policy import (
-    atomic_write_json,
     enforce_nutrition_tool,
     get_caller,
-    resolve_state_path,
     verify_guardian_token,
 )
 from .constants import DIALYSIS_ALIAS
+from .nutrition_repository import DIARY_STORE_FILENAME, PEW_STORE_FILENAME
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -35,10 +35,12 @@ from .constants import DIALYSIS_ALIAS
 GUIDELINE = "PRNT 2020 (Shaw et al., Pediatr Nephrol 35:519-531)"
 MCP_NAME = "CKDNutri-nutrition-mcp"
 
-# P1-3：运行时写库不落安装目录。A207_NUTRITION_ASSESSMENT_DATA_DIR 为开发/测试 override。
-_DATA_DIR_ENV = "A207_NUTRITION_ASSESSMENT_DATA_DIR"
+# P1-3：运行时写库不落安装目录；v0.5 起存储统一经 nutrition_repository DAO
+# （默认 Tablestore；json 开发模式落 A207_NUTRITION_ASSESSMENT_DATA_DIR / A207_DATA_DIR）。
 
-# BUG-53（2026-08-12）：日记/PEW 存储 read-modify-write 并发保护（与 P3 care 同口径）
+# BUG-53（2026-08-12）：日记/PEW 存储 read-modify-write 并发保护（与 P3 care 同口径）。
+# v0.5（2026-08-13）：存储经 nutrition_repository DAO 访问（默认 Tablestore，json 开发模式）；
+# _STORE_LOCK 保留为进程内优化（LocalJson 端 RMW 串行化；Tablestore 端减少版本冲突）。
 _STORE_LOCK = threading.Lock()
 
 
@@ -53,27 +55,17 @@ def _require(value: Any, name: str) -> Any:
     return value
 
 
-def _state_path(filename: str) -> str:
-    override = os.environ.get(_DATA_DIR_ENV)
-    if override:
-        root = Path(override)
-        root.mkdir(parents=True, exist_ok=True)
-        return str(root / filename)
-    return str(resolve_state_path(filename))
+def _repo():
+    """数据访问层入口（延迟导入避免循环引用）。"""
+    from .nutrition_repository import get_repository
+
+    return get_repository()
 
 
 # BUG-18：DIARY_STORE/PEW_STORE 不再在模块加载时固化路径（env 变化需重启才能生效），
 # 改为每次读写时解析，测试/部署中切换 A207_DATA_DIR 立即生效。
-DIARY_STORE_FILENAME = "diary_store.json"
-PEW_STORE_FILENAME = "pew_history_store.json"
-
-
-def _diary_store_path() -> str:
-    return _state_path(DIARY_STORE_FILENAME)
-
-
-def _pew_store_path() -> str:
-    return _state_path(PEW_STORE_FILENAME)
+# 路径解析与 fail-closed 校验已下沉到 nutrition_repository（LocalJson 后端）。
+# 常量保留导出（smoke 测试引用），实际存储经 _repo()。
 
 # 写权判定经 enforce_nutrition_tool 工具级 ACL（P1-1：单一事实源在 a207_policy），
 # 本包不再维护本地写白名单（2026-08-12 双轨制清理）。
@@ -288,10 +280,13 @@ def calc_prnt_targets(
     # ③ growth_status 枚举校验（此前非法值静默落 else 取 SDI 中点，掩盖配置错误）；
     # ④ vegetarian_mode 枚举校验（此前非法值静默降级 mixed——如拼错的 "ovo-lacto"
     #    会被当杂食计算，蛋白需求低估 20%）。同义别名 lacto_ovo 已在 _VEG_MULT 收录。
-    if age_years < 0:
-        raise ValueError("age_years 不能为负")
-    if weight_kg <= 0:
-        raise ValueError("weight_kg 必须 > 0")
+    # S4（2026-08-13 六审后补）：age_years/weight_kg 增加**有限性**校验——此前
+    # `age_years < 0` 与 `weight_kg <= 0` 对 NaN/Inf 恒 False（NaN 与任何数比较皆 False），
+    # NaN 体重会静默产出 NaN 能量/蛋白目标（脏数据参与临床判定且无任何提示）。
+    if not math.isfinite(age_years) or age_years < 0:
+        raise ValueError("age_years 必须为不小于 0 的有限数值")
+    if not math.isfinite(weight_kg) or weight_kg <= 0:
+        raise ValueError("weight_kg 必须为 > 0 的有限数值")
     if growth_status not in ("normal", "failure", "overweight"):
         raise ValueError(
             f"growth_status 必须是 normal / failure / overweight 之一，收到：{growth_status!r}")
@@ -365,6 +360,12 @@ def calc_prnt_targets(
         }
 
     warnings: list[str] = []
+    # 六审（2026-08-13）：超龄显式提示（对齐 assessment adult_caveat）——age>18 会
+    # 静默套用 15-17 岁段参数，临床可能误当儿童处方执行。
+    if age_years > 18:
+        warnings.append(
+            f"age_years={age_years} 超出 PRNT 2020 儿童适用域（0-18 岁），目标按 15-17 岁段"
+            "参数计算，仅供参考，请改用成人营养指南。")
     if ckd_stage == 1:
         warnings.append("PRNT 2020 覆盖 CKD 2-5D；stage 1 暂沿用同表，请结合临床判断。")
     if dialysis_mode != "none":
@@ -610,6 +611,18 @@ def assess_pew_risk(
     _require(avg_energy_kcal, "avg_energy_kcal")
     _require(target_protein_g, "target_protein_g")
     _require(target_energy_kcal, "target_energy_kcal")
+    # 六审（2026-08-13）：负值/零目标显式拒绝（fail-closed）——此前负蛋白/负能量
+    # 会被 _screen_pew 当作"极低摄入"判高风险（方向碰巧对但数据本身非法），零目标
+    # 会除零/退化为恒真；脏数据应 INVALID_INPUT，不得静默参与临床判定。
+    for _name, _val in (("avg_protein_g", avg_protein_g), ("avg_energy_kcal", avg_energy_kcal),
+                        ("target_protein_g", target_protein_g),
+                        ("target_energy_kcal", target_energy_kcal)):
+        if _val < 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 不能为负，收到 {_val}"}
+    if target_protein_g <= 0 or target_energy_kcal <= 0:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "target_protein_g 与 target_energy_kcal 必须 > 0"}
     floor_p = floor_protein_g if floor_protein_g is not None else target_protein_g * 0.85
     pew = _screen_pew(avg_protein_g, avg_energy_kcal, floor_p, target_energy_kcal, albumin_g_L)
     return {"ok": True, "data": {"pew_risk": pew["risk"], "rationale": pew["rationale"]}}
@@ -619,33 +632,14 @@ def assess_pew_risk(
 # 3. 3 日饮食日记：写入(store) + 聚合(diet_diary_3d) + 读取
 # ---------------------------------------------------------------------------
 def _load_store() -> dict[str, Any]:
-    # B1（2026-08-12 五包审查）：损坏/类型错误文件禁止静默返回空库——否则下次
-    # upsert_food_diary 的 load→append→save 会用"仅新条目"覆盖整个日记库，历史数据
-    # 永久丢失。对齐 care _load_store（BUG-65/67）：JSON 损坏或非 dict 顶层一律抛
-    # RuntimeError（server._invalid 归 INTERNAL_ERROR），运维可发现并恢复备份。
-    path = _diary_store_path()
-    if not os.path.exists(path):
-        return {"entries": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"日记库 {Path(path).name} JSON 损坏，拒绝加载（防止静默清空），"
-            f"请检查磁盘/恢复备份: {exc}") from exc
-    except OSError as exc:
-        raise RuntimeError(
-            f"日记库 {Path(path).name} 读取失败，拒绝加载（防止静默清空）: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            f"日记库 {Path(path).name} 数据类型错误：期望 dict，实际为 {type(data).__name__}，"
-            f"拒绝加载（防止静默清空）")
-    return data
+    # v0.5（2026-08-13）：存储经 DAO 访问（默认 Tablestore；json 开发模式 LocalJson）。
+    # fail-closed 语义（B1：损坏/类型错误禁止静默返回空库，防 RMW 覆盖清空）由
+    # nutrition_repository 实现层保证，本层透传。
+    return _repo().load_diary()
 
 
 def _save_store(store: dict[str, Any]) -> None:
-    # OD-014（P2-3）：原子写，避免半写截断静默丢数据
-    atomic_write_json(_diary_store_path(), store)
+    _repo().save_diary(store)
 
 
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1078,31 +1072,13 @@ _PEW_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def _load_pew_store() -> dict:
-    # B1（2026-08-12 五包审查）：同 _load_store——PEW 历史库损坏/类型错误禁止静默
-    # 返回 {}（否则 record_pew_risk 的 RMW 会清空全部 PEW 时间线），fail-closed 抛错。
-    path = _pew_store_path()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"PEW 历史库 {Path(path).name} JSON 损坏，拒绝加载（防止静默清空），"
-            f"请检查磁盘/恢复备份: {exc}") from exc
-    except OSError as exc:
-        raise RuntimeError(
-            f"PEW 历史库 {Path(path).name} 读取失败，拒绝加载（防止静默清空）: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            f"PEW 历史库 {Path(path).name} 数据类型错误：期望 dict，实际为 {type(data).__name__}，"
-            f"拒绝加载（防止静默清空）")
-    return data
+    # v0.5（2026-08-13）：经 DAO 访问；B1 fail-closed（损坏/类型错误禁止静默清空）
+    # 由 nutrition_repository 实现层保证。
+    return _repo().load_pew()
 
 
 def _save_pew_store(store: dict) -> None:
-    # OD-014（P2-3）：原子写，避免半写截断静默丢数据
-    atomic_write_json(_pew_store_path(), store)
+    _repo().save_pew(store)
 
 
 def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dict[str, Any]:
