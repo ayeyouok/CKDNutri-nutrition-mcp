@@ -136,7 +136,14 @@ def test_prnt_golden_sdi_bands():
     # 整岁边界（N-S1 二审，2026-08-14）：12月龄=12-23月(1.0-2.0)、2岁=24-35月(2.0-3.0)、
     # 3岁=36-47月(3.0-4.0)、4-6岁=48-83月(4.0-7.0)。此前 12月龄只到 1.5、
     # 2岁/3岁/4-6岁起点各提前 0.5 岁 → 18-23/30-35/42-47 月龄错入下一段。
+    # 月龄段（N-S1 三审，2026-08-14）：6-9月=[6/12,10/12)、10-11月=[10/12,12/12)、
+    # 12月龄=[1,2)——此前 10-11月段 (0.75,1.0) 覆盖 9-12 月龄，9 月龄错归 10-11 段。
     cases = [
+        (0.5, "F", "6-9月", (72, 82), (1.10, 1.30)),    # 6 月龄
+        (8/12, "F", "6-9月", (72, 82), (1.10, 1.30)),
+        (9/12, "F", "6-9月", (72, 82), (1.10, 1.30)),   # ★ 9 月龄（此前错归 10-11 段）
+        (10/12, "F", "10-11月", (72, 82), (1.10, 1.30)),  # ★ 10 月龄整入 10-11 段
+        (11/12, "F", "10-11月", (72, 82), (1.10, 1.30)),
         (1.0, "F", "12月龄", (72, 120), (0.90, 1.14)),  # 边界：12 月整入 12 月龄段
         (1.4, "F", "12月龄", (72, 120), (0.90, 1.14)),
         (1.9, "F", "12月龄", (72, 120), (0.90, 1.14)),  # 23 月仍属 12 月龄
@@ -179,6 +186,38 @@ def test_prnt_golden_sdi_bands():
     # 端到端：12 岁女孩目标 = 权威 11-12 岁段中位 50 kcal/kg/d
     r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150, ckd_stage=1)
     _near(r["data"]["energy"]["target_kcal_per_kg"], 50.0)
+
+
+def test_prnt_golden_protein_total_by_sex():
+    """N-S1 三审（2026-08-14）：每日蛋白总量按性别输出（15-17 岁 M/F 分列）。
+
+    用户强调：蛋白质 15-17 岁分男女（M 52-65 / F 45-49）；能量更早自 2 岁起
+    分男女。本测试锁死 calc_prnt_targets 输出的 sdi_total_g_per_day 与
+    energy sdi 的性别拆分（源：theipna.org 2024 实践指南重印 PRNT 2020 Table 1）。
+    """
+    from CKDNutri_nutrition_mcp import core
+
+    # 蛋白总量分性别（15-17 岁）
+    r_f = core.calc_prnt_targets(age_years=15, sex="F", weight_kg=50, ckd_stage=1)
+    r_m = core.calc_prnt_targets(age_years=15, sex="M", weight_kg=55, ckd_stage=1)
+    assert r_f["data"]["protein"]["sdi_total_g_per_day"] == [45, 49], r_f["data"]["protein"]
+    assert r_m["data"]["protein"]["sdi_total_g_per_day"] == [52, 65], r_m["data"]["protein"]
+    # 其他段蛋白总量（性别无关）
+    r = core.calc_prnt_targets(age_years=9, sex="F", weight_kg=30, ckd_stage=1)
+    assert r["data"]["protein"]["sdi_total_g_per_day"] == [26, 40], r["data"]["protein"]
+
+    # 能量性别拆分：12 月龄 M=F；2 岁起 M≠F
+    b_12 = core._band_for_age(1.5, "F")
+    b_2m, b_2f = core._band_for_age(2.5, "M"), core._band_for_age(2.5, "F")
+    assert b_12["energy_sdi"] == [72, 120]
+    assert b_2m["energy_sdi"] == [81, 95] and b_2f["energy_sdi"] == [79, 92]
+    assert b_2m["energy_sdi"] != b_2f["energy_sdi"], "2 岁起能量必须分男女"
+
+    # 月龄蛋白总量（9 月龄归 6-9 段 9-14；10 月龄归 10-11 段 9-15）
+    b_9 = core._band_for_age(9 / 12, "F")
+    b_10 = core._band_for_age(10 / 12, "F")
+    assert b_9["protein_total_daily"] == [9, 14], b_9
+    assert b_10["protein_total_daily"] == [9, 15], b_10
 
 
 def test_prnt_golden_growth_status():
