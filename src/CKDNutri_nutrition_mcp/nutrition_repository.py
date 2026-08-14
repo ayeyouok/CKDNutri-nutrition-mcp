@@ -11,8 +11,11 @@ v0.5（2026-08-13）：统一后端语义 = **默认 Tablestore（生产）+ A20
 Tablestore 表结构：
 - food_diary   主键 patient_id；属性列 entries(JSON 数组)/updated_at
 - pew_history  主键 patient_id；属性列 points(JSON 数组)/updated_at
-日记在业务层为"全量 entries"语义（跨患者），本层按 patient_id 分片存储，
-load_diary 时全表 GetRange 合并回 {"entries": [...]}，业务层零感知。
+日记业务主路径按**患者行**读写（N-MEM-2，2026-08-14）：load_patient_diary /
+save_patient_diary 只 GetRow/写该患者行——此前写路径已按患者分片、读路径仍全表
+GetRange 合并回 {"entries": [...]}，单次"记一顿饭"= 全表扫描 + 回写每个患者行，
+医院级（数千患儿 × 多年日记）OOM + O(患者数) 写放大。全量 load_diary/save_diary
+保留给跨患者聚合场景（当前无消费方），业务主路径不得再走全表。
 """
 from __future__ import annotations
 
@@ -107,11 +110,30 @@ class NutritionRepository(Protocol):
 
     # ---- 饮食日记 ----
     def load_diary(self) -> dict[str, Any]:
-        """读取全部日记条目，返回 {"entries": [...]}；损坏 fail-closed 抛 RuntimeError。"""
+        """读取全部日记条目，返回 {"entries": [...]}；损坏 fail-closed 抛 RuntimeError。
+
+        N-MEM-2（2026-08-14）：仅限跨患者聚合场景；业务单患者主路径必须用
+        load_patient_diary（行级读，勿全表扫描）。
+        """
         ...
 
     def save_diary(self, store: dict[str, Any]) -> None:
-        """原子持久化全部日记条目。"""
+        """原子持久化全部日记条目（按患者分片覆盖写）。"""
+        ...
+
+    def load_patient_diary(self, patient_id: str) -> dict[str, Any]:
+        """读取**单个患者**的日记条目，返回 {"entries": [...]}（行级读，N-MEM-2）。
+
+        无记录 → {"entries": []}；损坏 JSON fail-closed 抛 RuntimeError（同 load_diary）。
+        """
+        ...
+
+    def save_patient_diary(self, patient_id: str,
+                           entries: list[dict[str, Any]]) -> None:
+        """原子持久化**单个患者**的日记条目（行级写，N-MEM-2）。
+
+        覆盖写该患者行（行级 _rev 乐观锁防并发丢更新），不触碰其他患者。
+        """
         ...
 
     # ---- PEW 历史 ----
@@ -165,6 +187,21 @@ class LocalJsonRepository:
 
     def save_diary(self, store: dict[str, Any]) -> None:
         atomic_write_json(_state_path(DIARY_STORE_FILENAME), store)
+
+    def load_patient_diary(self, patient_id: str) -> dict[str, Any]:
+        # 本地 JSON 开发模式：文件即全量，过滤该患者（无分片需求）
+        store = self.load_diary()
+        return {"entries": [e for e in store.get("entries", [])
+                            if e.get("patient_id") == patient_id]}
+
+    def save_patient_diary(self, patient_id: str,
+                           entries: list[dict[str, Any]]) -> None:
+        # 本地 JSON 开发模式：整文件原子写，仅替换该患者条目
+        store = self.load_diary()
+        others = [e for e in store.get("entries", [])
+                  if e.get("patient_id") != patient_id]
+        store["entries"] = others + list(entries)
+        self.save_diary(store)
 
     # ---- PEW 历史 ----
     def load_pew(self) -> dict[str, Any]:
@@ -302,6 +339,8 @@ class TablestoreRepository:
     # ---- 饮食日记（全量 entries ↔ 按患者分片）----
 
     def load_diary(self) -> dict[str, Any]:
+        """全量读取全部患者日记（N-MEM-2：仅跨患者聚合场景；业务单患者主路径
+        必须用 load_patient_diary 行级读，勿全表扫描）。"""
         entries: list[dict[str, Any]] = []
         for item in self._range_all(TABLE_FOOD_DIARY):
             raw = item["attrs"].get("entries")
@@ -335,6 +374,37 @@ class TablestoreRepository:
             self._save_row_locked(TABLE_FOOD_DIARY, self._pk_patient(pid),
                                   {"entries": self._json_col(patient_entries),
                                    "updated_at": _now_iso()})
+
+    def load_patient_diary(self, patient_id: str) -> dict[str, Any]:
+        """行级读**单个患者**日记（N-MEM-2：GetRow(pk=patient_id)，不扫全表）。
+
+        无该患者行 → {"entries": []}；损坏 JSON/类型错误 fail-closed 抛 RuntimeError
+        （X1 口径：拒绝静默清空后经 save 覆盖写回丢数据）。
+        """
+        row = self._get_row(TABLE_FOOD_DIARY, self._pk_patient(patient_id))
+        if row is None:
+            return {"entries": []}
+        raw = row.get("entries")
+        if not isinstance(raw, str):
+            return {"entries": []}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"饮食日记列 entries 损坏（非法 JSON，patient_id={patient_id}）：{exc}"
+                "——拒绝静默清空，请人工修复 Tablestore 该行数据") from exc
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"饮食日记列 entries 类型错误（patient_id={patient_id}）："
+                f"期望 list，实际 {type(data).__name__}——拒绝静默清空")
+        return {"entries": data}
+
+    def save_patient_diary(self, patient_id: str,
+                           entries: list[dict[str, Any]]) -> None:
+        """行级写**单个患者**日记（N-MEM-2：只写该患者行，行级 _rev 乐观锁）。"""
+        self._save_row_locked(TABLE_FOOD_DIARY, self._pk_patient(patient_id),
+                              {"entries": self._json_col(list(entries)),
+                               "updated_at": _now_iso()})
 
     # ---- PEW 历史（{patient_id: [points]} ↔ 按患者分片）----
 
@@ -395,11 +465,12 @@ def ensure_tablestore_tables() -> None:
         options = TableOptions(time_to_live=-1, max_version=1)
         throughput = ReservedThroughput(capacity_unit=CapacityUnit(0, 0))
         client.create_table(meta, options, throughput)
-        print(f"[ensure] 已创建表 {table_name}")
+        logger.info("[ensure] 已创建表 %s", table_name)
 
     _create(TABLE_FOOD_DIARY, [("patient_id", "STRING")])
     _create(TABLE_PEW_HISTORY, [("patient_id", "STRING")])
-    print(f"[ensure] Tablestore 表就绪：{sorted(existing | {TABLE_FOOD_DIARY, TABLE_PEW_HISTORY})}")
+    logger.info("[ensure] Tablestore 表就绪：%s",
+                sorted(existing | {TABLE_FOOD_DIARY, TABLE_PEW_HISTORY}))
 
 
 # P2 修复（2026-08-13）：repository 实例按 backend 缓存——此前每请求 new

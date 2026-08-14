@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import os
+os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 import sys
 from pathlib import Path
 
@@ -195,6 +196,21 @@ def test_repository_backend():
         assert repo.load_diary() == {"entries": []}
         repo.save_diary({"entries": [{"patient_id": "P001", "date": "2026-08-13"}]})
         assert repo.load_diary()["entries"][0]["patient_id"] == "P001"
+        # N-MEM-2（2026-08-14）：患者级读写——只触达/替换该患者条目
+        repo.save_patient_diary("P001", [{"patient_id": "P001", "date": "2026-08-13",
+                                          "entry_id": "e1"}])
+        repo.save_patient_diary("P002", [{"patient_id": "P002", "date": "2026-08-14",
+                                          "entry_id": "e2"}])
+        got1 = repo.load_patient_diary("P001")
+        got2 = repo.load_patient_diary("P002")
+        assert [e["entry_id"] for e in got1["entries"]] == ["e1"], got1
+        assert all(e.get("patient_id") == "P002" for e in got2["entries"]), got2
+        # 覆盖写同一患者：仅替换该患者行，不串扰其他患者
+        repo.save_patient_diary("P001", [{"patient_id": "P001", "date": "2026-08-15",
+                                          "entry_id": "e3"}])
+        assert [e["entry_id"] for e in repo.load_patient_diary("P001")["entries"]] == ["e3"]
+        assert [e["entry_id"] for e in repo.load_patient_diary("P002")["entries"]] == ["e2"]
+        assert len(repo.load_diary()["entries"]) == 2  # P001 1 条 + P002 1 条
         assert repo.load_pew() == {}
         repo.save_pew({"P001": [{"date": "2026-08-13", "score": 1.0}]})
         assert repo.load_pew()["P001"][0]["score"] == 1.0
@@ -209,6 +225,92 @@ def test_repository_backend():
         os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
 
 
+def test_n_mem2_patient_scoped():
+    """N-MEM-2（2026-08-14）：Tablestore 患者级读写只触达该患者行（无全表扫描/写放大）；
+    core.upsert_food_diary 只读/写该患者。"""
+    from CKDNutri_nutrition_mcp import nutrition_repository as repo_mod
+
+    class _FakeDiaryOts:
+        """记录 get_row/put_row 触达的主键，验证行级作用域。"""
+
+        def __init__(self):
+            self.rows: dict = {}      # (table, pk_tuple) -> {name: value}
+            self.get_row_calls = []
+            self.put_row_calls = []
+
+        def get_row(self, table, pk):
+            self.get_row_calls.append((table, tuple(pk)))
+            attrs = self.rows.get((table, tuple(pk)))
+            if attrs is None:
+                return (None, None, None)
+
+            class _R:
+                attribute_columns = [(n, v, 0) for n, v in attrs.items()]
+
+            return (None, _R(), None)
+
+        def put_row(self, table, row, condition):
+            self.put_row_calls.append((table, tuple(row.primary_key)))
+            attrs = {name: value for name, value, *_ in row.attribute_columns}
+            self.rows[(table, tuple(row.primary_key))] = attrs
+
+    fake = _FakeDiaryOts()
+    repo = repo_mod.TablestoreRepository(client=fake)
+    repo.save_patient_diary("P001", [{"patient_id": "P001", "entry_id": "e1",
+                                      "date": "2026-08-14"}])
+    repo.save_patient_diary("P002", [{"patient_id": "P002", "entry_id": "e2",
+                                      "date": "2026-08-14"}])
+    got = repo.load_patient_diary("P001")
+    assert [e["entry_id"] for e in got["entries"]] == ["e1"], got
+    assert all(e.get("patient_id") == "P001" for e in got["entries"])
+    # 只触达对应患者行（save 各 get+put 一次，load 一次 get）——无全表 get_range
+    expect_get = [("food_diary", (("patient_id", "P001"),)),
+                  ("food_diary", (("patient_id", "P002"),)),
+                  ("food_diary", (("patient_id", "P001"),))]
+    assert fake.get_row_calls == expect_get, fake.get_row_calls
+    assert fake.put_row_calls == [("food_diary", (("patient_id", "P001"),)),
+                                  ("food_diary", (("patient_id", "P002"),))], \
+        fake.put_row_calls
+
+    # core 层：upsert_food_diary 只写该患者（LocalJson 后端，独立临时目录）
+    import tempfile
+
+    from CKDNutri_nutrition_mcp import core
+
+    tmp = tempfile.mkdtemp(prefix="a207-nutri-nmem2-")
+    saved_dir = os.environ.get("A207_NUTRITION_ASSESSMENT_DATA_DIR")
+    os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = tmp
+    try:
+        from a207_policy import as_caller
+
+        with as_caller("doctor_assistant"):
+            r1 = core.upsert_food_diary("P0001", [{"date": "2026-08-14",
+                                                   "energy_kcal": 300.0,
+                                                   "protein_g": 10.0,
+                                                   "potassium_mg": 200.0,
+                                                   "phosphorus_mg": 100.0,
+                                                   "sodium_mg": 50.0}])
+            assert r1["ok"] and r1["data"]["stored_count"] == 1, r1
+            r2 = core.upsert_food_diary("P0002", [{"date": "2026-08-14",
+                                                   "energy_kcal": 400.0,
+                                                   "protein_g": 12.0,
+                                                   "potassium_mg": 250.0,
+                                                   "phosphorus_mg": 120.0,
+                                                   "sodium_mg": 60.0}])
+            assert r2["ok"], r2
+        # 行级隔离：P0001 读取不包含 P0002 条目
+        repo = repo_mod.get_repository()
+        all_entries = repo.load_diary()["entries"]
+        assert len(all_entries) == 2, all_entries
+        p1 = repo.load_patient_diary("P0001")["entries"]
+        assert len(p1) == 1 and all(e["patient_id"] == "P0001" for e in p1), p1
+    finally:
+        if saved_dir is not None:
+            os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = saved_dir
+        else:
+            os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_calc_prnt_targets()
@@ -217,4 +319,5 @@ if __name__ == "__main__":
     test_diary_target_normalize()
     test_s4_unauthorized_nan_unit()
     test_repository_backend()
+    test_n_mem2_patient_scoped()
     print("P2 SMOKE OK")

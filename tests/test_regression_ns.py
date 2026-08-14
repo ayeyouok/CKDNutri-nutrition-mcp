@@ -4,6 +4,7 @@
 python 直接运行 + pytest 双模式（对齐 P1 test_tools 风格）。
 """
 import os
+os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 import sys
 import math
 from pathlib import Path

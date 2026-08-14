@@ -830,11 +830,26 @@ def _load_store() -> dict[str, Any]:
     # v0.5（2026-08-13）：存储经 DAO 访问（默认 Tablestore；json 开发模式 LocalJson）。
     # fail-closed 语义（B1：损坏/类型错误禁止静默返回空库，防 RMW 覆盖清空）由
     # nutrition_repository 实现层保证，本层透传。
+    # N-MEM-2（2026-08-14）：全量语义仅保留给跨患者聚合场景，业务主路径勿用。
     return _repo().load_diary()
 
 
 def _save_store(store: dict[str, Any]) -> None:
     _repo().save_diary(store)
+
+
+def _load_patient_store(patient_id: str) -> dict[str, Any]:
+    """患者级读（N-MEM-2）：行级 GetRow(pk=patient_id)，不扫全表。
+
+    医院级（数千患儿 × 多年日记）下，单次"记一顿饭/读一家日记"不再拉全库，
+    消除 OOM 与写放大。
+    """
+    return _repo().load_patient_diary(patient_id)
+
+
+def _save_patient_store(patient_id: str, entries: list[dict[str, Any]]) -> None:
+    """患者级写（N-MEM-2）：只写该患者行（行级 _rev 乐观锁）。"""
+    _repo().save_patient_diary(patient_id, entries)
 
 
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -907,7 +922,10 @@ def upsert_food_diary(
         return {"ok": False, "error": "INVALID_INPUT", "detail": "entries 不能为空"}
 
     with _STORE_LOCK:
-        store = _load_store()
+        # N-MEM-2（2026-08-14）：患者级读——此前 _load_store() 全表 GetRange +
+        # save 回写每个患者行（单次记餐 = 全表扫描 + O(患者数) 写放大，数千患儿
+        # 直接 OOM）。现只读/只写该患者行。
+        store = _load_patient_store(patient_id)
         existing = store.get("entries", [])
         stamped = []
         for e in entries:
@@ -946,14 +964,13 @@ def upsert_food_diary(
                 "sodium_mg": numeric["sodium_mg"],
             })
         all_entries = existing + stamped
-    
-        if write_mode:
-            store["entries"] = all_entries
-            _save_store(store)
 
-    # 仅聚合当前患者记录，防止跨患者数据泄露
-    patient_entries = [e for e in all_entries if e.get("patient_id") == patient_id]
-    agg = _aggregate(patient_entries)
+        if write_mode:
+            # N-MEM-2：患者级写（只写该患者行，行级 _rev 乐观锁）
+            _save_patient_store(patient_id, all_entries)
+
+    # 行级读写已按患者隔离（N-MEM-2），all_entries 即该患者全部条目，无需再 filter
+    agg = _aggregate(all_entries)
     return {
         "ok": True,
         "data": {
@@ -991,8 +1008,10 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_food_diary_summary")
     if denied:
         return denied
-    store = _load_store()
-    entries = [e for e in store.get("entries", []) if e.get("patient_id") == patient_id]
+    # N-MEM-2（2026-08-14）：患者级读（行级 GetRow），行内 entries 即该患者全部
+    # 条目——此前 _load_store() 全表拉取后再 filter，医院级全库扫描。
+    store = _load_patient_store(patient_id)
+    entries = store.get("entries", [])
     if not entries:
         return {
             "ok": True,
