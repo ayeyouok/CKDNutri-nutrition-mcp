@@ -51,6 +51,10 @@ def _item(food: dict, grams: int) -> dict:
     f = grams / 100.0
     return {
         "food": food["name"],
+        # B 方案（2026-08-14）：食物加工状态标注（raw/cooked/dried/soaked）——
+        # 生/熟/干/水发的营养值天然不同（如榛蘑干 K 4629 vs 水发 732），
+        # 输出带状态避免"同一食物两个数值"的歧义；foods_ckd.json 已带 state 字段。
+        "state": food.get("state", "raw"),
         "cat": food["cat"],
         "grams": grams,
         "energy_kcal": round(food["energy_per_100g"] * f, 1),
@@ -117,7 +121,8 @@ def _split_meals(items: list[dict]) -> list[dict]:
             f = g / 100.0
             food = by_name[it["food"]]
             meals[mi]["items"].append({
-                "food": it["food"], "cat": food["cat"], "grams": g,
+                "food": it["food"], "state": food.get("state", "raw"),
+                "cat": food["cat"], "grams": g,
                 "energy_kcal": round(food["energy_per_100g"] * f, 1),
                 "protein_g": round(food["protein_per_100g"] * f, 2),
                 "potassium_mg": round(food["potassium_per_100g"] * f, 1),

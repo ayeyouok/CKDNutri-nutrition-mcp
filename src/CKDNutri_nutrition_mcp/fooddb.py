@@ -190,6 +190,27 @@ def find_food(query: str) -> dict[str, Any] | None:
     # 3) 基名分组：生物变异 vs 真数据冲突
     group = [r for r in hits if base_name(r["name"]) == base_name(hits[0]["name"])]
     if len(group) > 1:
+        # 3.5) B 方案（2026-08-14）：加工状态差异 ≠ 数据冲突——同基名但**名称不同**
+        # （如"榛蘑（干）"vs"榛蘑（水发）"K 4629 vs 732）是干/水发/熟/生的正常
+        # 数值差异（水分稀释），此前被 step 3 的倍差>3 判为"数据冲突"→ 返回 None，
+        # 榛蘑/木耳等常见干制食材全部 FOOD_NOT_FOUND。按状态优先级返回：
+        # 干 > 生/鲜 > 熟 > 水发（CKD 限钾磷场景以权威干品/生品值优先，水发值最低）。
+        distinct_names = {r["name"] for r in group}
+        if len(distinct_names) > 1:
+            def _state_rank(r: dict[str, Any]) -> int:
+                n = r["name"]
+                if "干" in n:
+                    return 0
+                if "生" in n or "鲜" in n:
+                    return 1
+                if "熟" in n:
+                    return 2
+                if "水发" in n:
+                    return 3
+                return 4
+            return min(group, key=_state_rank)
+        # 4) 精确重名（名称完全相同）才做真数据冲突判定——CSV 已修正无精确重名，
+        # 保留兜底防未来数据回归。
         _ELECTROLYTES = ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")
         complete = [r for r in group if any(r[k] > 0 for k in _ELECTROLYTES)]
         if len(complete) == 1:

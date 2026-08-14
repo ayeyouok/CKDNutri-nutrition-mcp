@@ -27,8 +27,15 @@ def test_ns2_food_match_common_foods():
         r = find_food(q)
         assert r is not None, f"{q} 仍 FOOD_NOT_FOUND"
         assert r["name"] == want, (q, r["name"], want)
-    # 真数据冲突仍拒绝（松蘑 93 vs 2402）
-    assert find_food("松蘑") is None, "松蘑数据源冲突应拒绝猜测"
+    # A 数据修正（2026-08-14）：11 组重名已按成分表第 6 版合并权威行——松蘑
+    # 现在命中"松蘑（干）"权威值（K 2402/P 390），不再拒绝。
+    r = find_food("松蘑")
+    assert r is not None and r["name"] == "松蘑（干）", r
+    assert abs(float(r["potassium_mg"]) - 2402.0) < 1, r["potassium_mg"]
+    # B 方案（2026-08-14）：加工状态差异（干 vs 水发）非冲突——榛蘑应命中干品权威值
+    r = find_food("榛蘑")
+    assert r is not None and r["name"] == "榛蘑（干）", r
+    assert abs(float(r["potassium_mg"]) - 4629.0) < 1, r["potassium_mg"]
     # 单字仍拒绝
     assert find_food("鱼") is None
 

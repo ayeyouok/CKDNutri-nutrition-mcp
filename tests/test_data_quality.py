@@ -21,20 +21,9 @@ CKD_JSON_PATH = DATA_DIR / "foods_ckd.json"
 
 # 生物变异上限：同基名多行间 K/P 最大倍差 > 此值判"数据冲突"（find_food 同口径 3 倍）
 CONFLICT_RATIO = 3.0
-# 已知冲突（2026-08-14 审查确认，待营养师核对修正；格式: (name, column)）
-DOCUMENTED_CONFLICTS = {
-    ("松蘑（干）", "potassium_mg"), ("松蘑（干）", "phosphorus_mg"), ("松蘑（干）", "protein_g"),
-    ("榛蘑（干）", "potassium_mg"), ("榛蘑（干）", "phosphorus_mg"), ("榛蘑（干）", "energy_kcal"), ("榛蘑（干）", "protein_g"),
-    ("球茎茴香", "energy_kcal"), ("球茎茴香", "potassium_mg"), ("球茎茴香", "phosphorus_mg"),
-    ("番杏", "energy_kcal"), ("番杏", "potassium_mg"), ("番杏", "phosphorus_mg"),
-    ("蒲桃", "potassium_mg"), ("蒲桃", "phosphorus_mg"),
-    ("平菇", "energy_kcal"), ("平菇", "phosphorus_mg"),
-    ("菠萝蜜", "energy_kcal"), ("菠萝蜜", "phosphorus_mg"), ("菠萝蜜", "protein_g"),
-    ("扁豆", "energy_kcal"),
-    ("腊肉（生）", "phosphorus_mg"),
-    # 双源偏差（foods_ckd.json vs food_data.csv 同食物名）
-    ("红薯", "energy_kcal"), ("红薯", "potassium_mg"), ("红薯", "protein_g"),
-}
+# 已知冲突登记（2026-08-14 已按中国食物成分表第 6 版修正 11 组重名行——登记清空，
+# 后续若有新数据冲突必须显式登记人工核对后才能放行）
+DOCUMENTED_CONFLICTS: set[tuple[str, str]] = set()
 # 双源允许偏差（近似值子集声明，mealplan 注释：与全量成分表可能不同）
 SRC_ALLOWED_DIFF = 0.25
 
@@ -44,8 +33,26 @@ def _load_csv() -> list[dict[str, str]]:
     return list(csv.DictReader(raw.decode("utf-8-sig").splitlines()))
 
 
+def test_csv_no_duplicate_rows():
+    """数据修正后强断言（A 项，2026-08-14）：**精确重名行为 0**。
+
+    此前 11 组精确重名（松蘑 K 93 vs 2402 等）已按中国食物成分表第 6 版
+    （CDC 官方平台 nlc.chinanutri.cn 核对）合并为权威行。新增任何精确重名
+    → fail（数据回归拦截）。注意：加工状态差异（榛蘑（干）vs 榛蘑（水发））
+    是不同行名，不算重名——由 find_food 状态优先级处理。
+    """
+    rows = _load_csv()
+    by_name: dict[str, list[dict[str, str]]] = {}
+    for r in rows:
+        by_name.setdefault(r["name"], []).append(r)
+    dups = {k: v for k, v in by_name.items() if len(v) > 1}
+    assert not dups, (
+        f"发现 {len(dups)} 组精确重名行（数据修正回归，需人工核对）: "
+        + "; ".join(f"{k}x{len(v)}" for k, v in list(dups.items())[:8]))
+
+
 def test_csv_no_new_duplicate_conflicts():
-    """重名行内同列数值倍差 >3 且不在已知清单 → fail（新增数据错误拦截）。"""
+    """（保留）重名行内同列数值倍差 >3 且不在已知清单 → fail。"""
     rows = _load_csv()
     by_name: dict[str, list[dict[str, str]]] = {}
     for r in rows:
@@ -152,6 +159,7 @@ def test_csv_duplicate_names_registry_complete():
 
 
 if __name__ == "__main__":
+    test_csv_no_duplicate_rows()
     test_csv_no_new_duplicate_conflicts()
     test_ckd_json_vs_csv_no_new_drift()
     test_csv_duplicate_names_registry_complete()
