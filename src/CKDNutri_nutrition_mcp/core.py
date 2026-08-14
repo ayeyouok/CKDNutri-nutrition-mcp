@@ -894,16 +894,32 @@ def upsert_food_diary(
         for e in entries:
             # BUG-60：写入前归一化日期（容忍 YYYY-M-D / YYYY/M/D 等变体，非法日期显式拒绝）
             raw_date = e.get("date") or datetime.now().strftime("%Y-%m-%d")
+            # N-S4 修复（2026-08-14）：写路径营养键有限性校验（fail-closed）——
+            # 此前 float() 直接转换，NaN/Inf 可静默落库（读路径比较恒 False →
+            # assess_intake_vs_target 误判 e_status="ok"），与 P0-7 读路径同口径。
+            numeric = {}
+            for key in ("energy_kcal", "protein_g", "potassium_mg",
+                        "phosphorus_mg", "sodium_mg"):
+                val = e.get(key, 0.0)
+                try:
+                    fv = float(val)
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "INVALID_INPUT",
+                            "detail": f"{key} 无法解析为数值：{val!r}"}
+                if not math.isfinite(fv):
+                    return {"ok": False, "error": "INVALID_INPUT",
+                            "detail": f"{key} 必须为有限数值（NaN/Inf 拒绝）：{val!r}"}
+                numeric[key] = fv
             stamped.append({
                 "patient_id": patient_id,
                 "date": _normalize_date(raw_date, "date"),
                 "meal": e.get("meal", ""),
                 "food": e.get("food", ""),
-                "energy_kcal": float(e.get("energy_kcal", 0.0)),
-                "protein_g": float(e.get("protein_g", 0.0)),
-                "potassium_mg": float(e.get("potassium_mg", 0.0)),
-                "phosphorus_mg": float(e.get("phosphorus_mg", 0.0)),
-                "sodium_mg": float(e.get("sodium_mg", 0.0)),
+                "energy_kcal": numeric["energy_kcal"],
+                "protein_g": numeric["protein_g"],
+                "potassium_mg": numeric["potassium_mg"],
+                "phosphorus_mg": numeric["phosphorus_mg"],
+                "sodium_mg": numeric["sodium_mg"],
             })
         all_entries = existing + stamped
     

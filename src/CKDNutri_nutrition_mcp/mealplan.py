@@ -102,8 +102,16 @@ def _split_meals(items: list[dict]) -> list[dict]:
     meals = [{ "meal": name, "items": [], "totals": None } for name in _MEAL_NAMES]
     for it in items:
         split = _MEAL_SPLIT.get(it["cat"], [0, 0, 0, 0])
+        # N-S6 修复（2026-08-14）：末餐补差——此前各餐独立 round(grams×ratio)，
+        # 25g 油脂分 0.3/0.3/0.4 得 8+8+10=26（+1g 漂移）。末餐取「总量-已分配」，
+        # 保证拆分后总和与原始分量一致（油脂上限/能量统计不失真）。
+        last_pos = max((i for i, r in enumerate(split) if r > 0), default=-1) if any(split) else -1
+        assigned = 0
         for mi, ratio in enumerate(split):
-            g = round(it["grams"] * ratio)
+            if ratio <= 0:
+                continue
+            g = (it["grams"] - assigned) if mi == last_pos else round(it["grams"] * ratio)
+            assigned += g
             if g <= 0:
                 continue
             f = g / 100.0
@@ -194,11 +202,45 @@ def generate_meal_plan(
     # BUG-63（2026-08-12）：收集能量负平衡警告——主食+蛋白+蔬果已超目标时脂肪按 0 仍
     # 超标，此前静默返回不平衡食谱，仅靠达成率>100% 提示不够明确。
     plan_warnings: list[str] = []
+
+    # N-S6 修复（2026-08-14）：选择策略改为「低钾低磷优先」+「蛋白补差」+「油脂上限」。
+    # 此前：① 主食/蛋白/蔬果按 d % len 盲目轮换；② 蛋白源按 0.7×目标蛋白直接折算，
+    #     主食蛋白未计入 → 实测 7/7 天蛋白超供 119-163%；③ K/P/Na 目标完全不参与选择，
+    #     仅事后标注 → 实测 2-3/7 天钾/磷超限（day5 K=5124mg）；④ 剩余能量全部折算烹调油
+    #     （rem≈486 kcal → 55g 油/天，油脂炸弹）。
+    # 现在：排序按营养效率（主食/蛋白源按每 100 kcal 或每克蛋白的 K+P 负担；蔬果按钾），
+    # 分量按「蛋白补差」（主食配额 40% + 蛋白源补足，精确不超）+「油脂上限 25g/天」，
+    # 能量缺口 / K/P 超限一律显式警告（34 项 CKD 子集能量密度有限，缺口交由医生加餐）。
+    staple_pool = sorted(staples, key=lambda f: (f["potassium_per_100g"] + f["phosphorus_per_100g"])
+                         / max(f["energy_per_100g"], 1))
+    prot_pool = sorted(prots, key=lambda f: (f["potassium_per_100g"] + f["phosphorus_per_100g"])
+                       / max(f["protein_per_100g"], 0.1))
+    veg_pool = sorted(vegs, key=lambda f: f["potassium_per_100g"])
+    fruit_pool = sorted(fruits, key=lambda f: f["potassium_per_100g"])
+    _FAT_MAX_G = 25.0  # 烹调油/黄油每日上限（油脂炸弹防护）
+
     for d in range(days):
-        staple = staples[d % len(staples)]
-        prot = prots[d % len(prots)]
-        veg = vegs[d % len(vegs)]
-        fr = fruits[d % len(fruits)]
+        # N-S6：主食/蛋白源按「预计 K+P 不超限」顺延选择——pool 已按低钾磷排序，
+        # 但 8 个主食含土豆/红薯/麦片等高钾品种，7 天轮换必碰上；从当前位置起
+        # 向后找第一个预计不超限的品种，找不到才用当前位置（兜底）。
+        prot_staple_quota = target_protein_g * 0.40
+        staple = None
+        for offset in range(len(staple_pool)):
+            cand = staple_pool[(d + offset) % len(staple_pool)]
+            sg = max(10, round(prot_staple_quota / max(cand["protein_per_100g"], 0.1) * 100))
+            est_kp = sg * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
+            if est_kp <= (target_k_mg + target_p_mg) * 0.45 or offset == len(staple_pool) - 1:
+                staple = cand
+                break
+        prot = None
+        for offset in range(len(prot_pool)):
+            cand = prot_pool[(d + offset) % len(prot_pool)]
+            est_kp = 100 * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
+            if est_kp <= (target_k_mg + target_p_mg) * 0.35 or offset == len(prot_pool) - 1:
+                prot = cand
+                break
+        veg = veg_pool[d % len(veg_pool)]
+        fr = fruit_pool[d % len(fruit_pool)]
         fat = fats[0]
 
         # BUG-61（2026-08-12）：防御 0 能量/0 蛋白数据——主食/蛋白源除数必须 >0，
@@ -208,24 +250,37 @@ def generate_meal_plan(
             raise ValueError(
                 f"食物库含 0 能量/0 蛋白条目（主食={staple['name']}, 蛋白源={prot['name']}），"
                 "无法按目标生成食谱，请检查数据")
-        staple_g = max(10, round(target_energy_kcal * 0.5 / staple["energy_per_100g"] * 100))
-        prot_g = max(10, round(target_protein_g * 0.7 / prot["protein_per_100g"] * 100))
+        # 1) 蔬果：固定 100g（低钾品种已由 pool 排序保证）
         veg_g = 100
         fruit_g = 100
-
+        e_veg = veg_g * veg["energy_per_100g"] / 100
+        e_fruit = fruit_g * fr["energy_per_100g"] / 100
+        # 2) 主食：按「目标蛋白 40% 配额」折算——主食蛋白计入预算，避免剩余能量全吸
+        #    收进主食导致克数/蛋白失控（N-S6）
+        staple_g = max(10, round(prot_staple_quota / staple["protein_per_100g"] * 100)) \
+            if staple["protein_per_100g"] > 0 else 0
         e_staple = staple_g * staple["energy_per_100g"] / 100
+        prot_staple = staple_g * staple["protein_per_100g"] / 100
+        # 3) 蛋白源：补差 = 目标蛋白 − 主食蛋白 − 蔬果蛋白（精确不超供）
+        prot_veg_fruit = (veg_g * veg["protein_per_100g"] + fruit_g * fr["protein_per_100g"]) / 100
+        rem_protein = max(0.0, target_protein_g - prot_staple - prot_veg_fruit)
+        prot_g = max(0, round(rem_protein / prot["protein_per_100g"] * 100)) \
+            if prot["protein_per_100g"] > 0 else 0
         # BUG-30 修复（2026-08-12）：蛋白能量统一用食物表总能量（energy_per_100g），
         # 此前用"蛋白g × 4 kcal/g"简化——对鸡蛋/瘦肉等含脂肪蛋白源会低估其能量贡献，
         # 导致 rem（脂肪额度）偏高、day_totals 实际能量系统性超 target。
         e_prot = prot_g * prot["energy_per_100g"] / 100
-        e_veg = veg_g * veg["energy_per_100g"] / 100
-        e_fruit = fruit_g * fr["energy_per_100g"] / 100
-        rem = target_energy_kcal - (e_staple + e_prot + e_veg + e_fruit)
-        if rem < 0:
+        # 4) 油脂：固定额度 ≤25g/天（N-S6 油脂炸弹防护），补足能量缺口
+        fat_g = int(_FAT_MAX_G) if fat["energy_per_100g"] > 0 else 0
+        e_fat = fat_g * fat["energy_per_100g"] / 100
+        # 5) 能量缺口显式警告（34 项子集能量密度有限，缺口交由临床加餐，不硬凑油脂）
+        e_total = e_staple + e_prot + e_veg + e_fruit + e_fat
+        gap = target_energy_kcal - e_total
+        if gap > 120:
             plan_warnings.append(
-                f"第 {d + 1} 天：主食+蛋白+蔬果能量已达 {round(e_staple + e_prot + e_veg + e_fruit, 0):.0f} kcal，"
-                f"超过目标 {target_energy_kcal:.0f} kcal，脂肪按 0 计仍超标——请削减主食/蛋白分量")
-        fat_g = max(0, round(rem / (fat["energy_per_100g"] / 100))) if fat["energy_per_100g"] > 0 else 0
+                f"第 {d + 1} 天：食谱能量 {round(e_total, 0):.0f} kcal，缺口 {round(gap, 0):.0f} kcal"
+                "（蛋白已按目标精确配比、油脂已封顶 25g/天）——建议经临床评估后增加主食/"
+                "加餐分量或营养补充剂补足能量，避免限磷限钾下纯油脂补能")
 
         items = [
             _item(staple, staple_g), _item(prot, prot_g),

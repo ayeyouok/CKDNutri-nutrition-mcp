@@ -149,37 +149,62 @@ def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
     if text.isdigit():
         return []
     scored = [(row, _match_score(row, text)) for row in load_foods()]
-    hits = sorted([item for item in scored if item[1] < 90.0], key=lambda x: (x[1], x[0]["name"]))
+    # N-S3 修复（2026-08-14）：同分排序 = 代表值优先 → 名称短优先 → 名称升序。
+    # 此前 (score, name) 按名称升序，全角括号码点（U+FF08）> 汉字码点，导致
+    # "苹果梨"排在"苹果（代表值）"前（苹果→苹果梨 K=180 误匹配）；代表值行
+    # 是中国食物成分表的通用主条目，必须优先于变体。
+    hits = sorted([item for item in scored if item[1] < 90.0],
+                  key=lambda x: (x[1], 0 if "代表值" in x[0]["name"] else 1,
+                                 len(x[0]["name"]), x[0]["name"]))
     return [row for row, _ in hits[:limit]]
 
 
 def find_food(query: str) -> dict[str, Any] | None:
     """单条精确检索：返回匹配度最高的一行。
 
-    P0-6 修复（2026-08-13）：**同基名多规格时优先营养值完整的行**——food_data.csv
-    存在 11 组重名行（如"鱼丸"两行 K=360/0、P=272/0，"松蘑（干）"K=93/2402）。
-    - 组内存在营养全零的脏行 → 排除后取首个非零行（鱼丸取 K=360/P=272）；
-    - 组内多行营养值**冲突且都非零**（数据源不一致，如松蘑 93 vs 2402）→ 返回 None
-      （调用方提示"名称有多个规格，请细化"，不猜——猜错营养值比报错更危险）；
-    - 单行正常返回。
+    N-S2 修复（2026-08-14）：此前同基名多规格一律进"冲突检查"，把**生物变异**
+    （红皮/白皮鸡蛋钾 98-244、香蕉/红皮 208-256）与**真数据冲突**（松蘑 93 vs 2402）
+    同等对待 → 常见食物（鸡蛋/香蕉/豆腐/猪肉（瘦））全部 FOOD_NOT_FOUND，
+    日记营养统计系统性低估。修复后按三级判定：
+      1. **精确命中短路**：别名精确匹配或主名 == 查询词 → 直接返回该行，
+         不参与基名分组（如"猪肉（瘦）"有精确行，此前被"猪肉"基名组拖入冲突拒绝）；
+      2. **代表值优先**：组内含"代表值"行 → 返回代表值（中国食物成分表通用主条目）；
+      3. **变异 vs 冲突**：组内关键电解质（K/P/Na）max/min ≤ 3 倍 → 生物变异，
+         返回营养最全行；任一 > 3 倍 → 真数据冲突（松蘑 93 vs 2402），返回 None
+         （调用方提示"名称有多个规格，请细化"，不猜——猜错营养值比报错更危险）。
     """
-    hits = search_food(query, limit=10)
+    text = (query or "").strip()
+    if not text:
+        return None
+    hits = search_food(text, limit=10)
     if not hits:
         return None
+    # 1) 精确命中短路（别名精确 0.0 或主名 == 查询）
+    for r in hits:
+        if _match_score(r, text) == 0.0:
+            return r
+    # 2) 组内代表值优先
+    for r in hits:
+        if "代表值" in r["name"]:
+            return r
+    # 3) 基名分组：生物变异 vs 真数据冲突
     group = [r for r in hits if base_name(r["name"]) == base_name(hits[0]["name"])]
     if len(group) > 1:
-        # P0-6：脏行判定 = **四大电解质键全零**（能量/蛋白可能有值但钾磷钠钙缺失，
-        # 实测"鱼丸"脏行 energy=107/protein=11.1 但 K/P/Na/Ca 全 0——对 CKD 患儿
-        # 限钾限磷才是关键，此类行视为数据不完整）。
         _ELECTROLYTES = ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")
         complete = [r for r in group if any(r[k] > 0 for k in _ELECTROLYTES)]
         if len(complete) == 1:
             return complete[0]  # 唯一完整行（其余为电解质缺失脏行）
         if len(complete) > 1:
-            profiles = {(r["potassium_mg"], r["phosphorus_mg"], r["protein_g"]) for r in complete}
-            if len(profiles) > 1:
-                return None  # 数据源冲突（如松蘑 93 vs 2402），拒绝猜测
-            return complete[0]
+            conflict = False
+            for key in ("potassium_mg", "phosphorus_mg"):
+                vals = [r[key] for r in complete if r[key] > 0]
+                if len(vals) >= 2 and max(vals) / min(vals) > 3.0:
+                    conflict = True  # 如松蘑 93 vs 2402（26 倍）
+                    break
+            if conflict:
+                return None  # 数据源冲突，拒绝猜测
+            # 生物变异（同量级）：返回电解质最全行（K/P/Na/Ca 非零键最多）
+            return max(complete, key=lambda r: sum(1 for k in _ELECTROLYTES if r[k] > 0))
     return hits[0]
 
 

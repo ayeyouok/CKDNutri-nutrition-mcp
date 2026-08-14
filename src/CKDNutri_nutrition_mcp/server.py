@@ -314,8 +314,8 @@ def get_pew_history_tool(patient_id: str) -> dict[str, Any]:
 
 
 # ---- DAG: 一键营养评估 (v2.3) ----
-
-_PEW_SCORE = {"low": 0.0, "medium": 1.0, "high": 2.0}
+# N-S5（2026-08-14）：删除 _PEW_SCORE（low=0/medium=1/high=2）——PEW score 唯一口径
+# 是 assess_pew_risk 的信号加权 0-100 分，双轨会被编排层误当同一标尺（历史分数污染）。
 
 
 @mcp.tool
@@ -470,8 +470,12 @@ def comprehensive_nutrition_assessment_tool(
             )
             if pew.get("ok"):
                 level = pew["data"]["pew_risk"]
-                d["pew"] = {**pew["data"], "score": _PEW_SCORE.get(level, 0.0),
-                            "hint": "如需留痕请调 record_pew_risk_tool(patient_id, date, score, level)"}
+                # N-S5 修复（2026-08-14）：PEW score 统一为 assess_pew_risk 的信号加权
+                # 0-100 分——此前用 _PEW_SCORE（low=0/medium=1/high=2）覆盖并把 0/1/2
+                # 语义经 hint 引导传给 record_pew_risk 落库，历史 PEW 分数全错。
+                d["pew"] = {**pew["data"],
+                            "score": pew["data"]["score"],
+                            "hint": "如需留痕请调 record_pew_risk_tool(patient_id, date, score, level)，score 取本结果 data.score（0-100）"}
             else:
                 d["pew"] = pew
         return result

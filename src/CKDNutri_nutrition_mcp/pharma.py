@@ -51,15 +51,24 @@ DRUGS: dict[str, dict[str, Any]] = {
                                 "monitor: 血磷", "high"),
                  "magnesium": ("长期用药需关注胃肠道反应与矿物质吸收变化。",
                                "monitor: 血镁、消化道症状", "low")}},
-    "聚苯乙烯磺酸钙": {"aliases": ["降钾树脂", "聚苯乙烯磺酸钠", "kayexalate", "钾结合剂"],
-                "drug_class": "阳离子交换降钾树脂",
+    "聚苯乙烯磺酸钙": {"aliases": ["降钾树脂", "kayexalate", "钙型降钾树脂", "钾结合剂"],
+                "drug_class": "阳离子交换降钾树脂（钙型）",
                 "effects": {
                     "potassium": ("在肠道交换钾离子，起效慢，不能替代急性高钾的急救处理。",
                                   "monitor: 血钾", "high"),
                     "calcium": ("钙型树脂释放钙离子，与活性维生素D合用注意高钙。",
-                                "monitor: 血钙", "medium"),
-                    "sodium": ("钠型树脂带来额外钠负荷，限钠与水肿患儿慎用。",
-                               "monitor: 血钠、血压、水肿", "high")}},
+                                "monitor: 血钙", "medium")}},
+    # N-B8 修复（2026-08-14）：聚苯乙烯磺酸钠与钙型是不同药物——钠型每克释放钠离子，
+    # 限钠/水肿/高血压患儿须计入全天钠（钙型无此负担）；此前被并入钙型条目导致
+    # 查询"聚苯乙烯磺酸钠"返回钙型文本、钠风险被隐藏。
+    "聚苯乙烯磺酸钠": {"aliases": ["钠型降钾树脂", "sodium polystyrene sulfonate"],
+                  "drug_class": "阳离子交换降钾树脂（钠型）",
+                  "effects": {
+                      "potassium": ("在肠道交换钾离子，起效慢，不能替代急性高钾的急救处理。",
+                                    "monitor: 血钾", "high"),
+                      "sodium": ("钠型树脂每克交换释放钠离子，带来额外钠负荷；"
+                                 "限钠、水肿、高血压患儿须把药源钠计入全天总钠。",
+                                 "monitor: 血钠、血压、水肿", "high")}},
     "环硅酸锆钠": {"aliases": ["szc", "锆硅酸钠", "新型钾结合剂"],
               "drug_class": "选择性钾结合剂",
               "effects": {
@@ -69,7 +78,7 @@ DRUGS: dict[str, dict[str, Any]] = {
                              "monitor: 血压、体重、水肿", "medium"),
                   "fluid": ("与其他口服药间隔至少 2 小时，避免影响吸收。",
                             "monitor: 合并用药清单", "medium")}},
-    "骨化三醇": {"aliases": ["calcitriol", "阿法骨化醇", "活性维生素d", "罗盖全"],
+    "骨化三醇": {"aliases": ["calcitriol", "活性维生素d", "罗盖全"],
              "drug_class": "活性维生素 D",
              "effects": {
                  "calcium": ("显著增加肠道钙吸收，与含钙磷结合剂叠加时易高钙。",
@@ -78,6 +87,17 @@ DRUGS: dict[str, dict[str, Any]] = {
                                 "monitor: 血磷", "high"),
                  "vitamin_d": ("与营养性维生素D补充是两回事，不可相互替代。",
                                "monitor: 25-OH-VD、1,25-(OH)2-VD", "medium")}},
+    # N-B8 修复（2026-08-14）：阿法骨化醇（alfacalcidol）是**前药**，需肝脏 25-羟化
+    # 后才具活性——与活性形式的骨化三醇不是同一药物（肝功能不全患儿疗效打折，
+    # 血钙监测意义相同）；此前被并入骨化三醇条目导致查询返回活性形式文本。
+    "阿法骨化醇": {"aliases": ["alfacalcidol", "阿尔法骨化醇", "1α-羟维生素d"],
+               "drug_class": "维生素 D 前药（肝脏羟化）",
+               "effects": {
+                   "calcium": ("为前药，需肝脏 25-羟化后起效；肝功能不全者疗效打折。"
+                               "起效后同样增加肠道钙吸收，防高钙。",
+                               "monitor: 血钙、肝功能、PTH", "high"),
+                   "phosphorus": ("羟化后增加磷吸收，血磷未控制前不宜加量。",
+                                  "monitor: 血磷", "medium")}},
     "呋塞米": {"aliases": ["速尿", "furosemide", "袢利尿剂", "托拉塞米"],
             "drug_class": "袢利尿剂",
             "effects": {
@@ -107,7 +127,7 @@ DRUGS: dict[str, dict[str, Any]] = {
                             "monitor: 白蛋白、BUN、生长速率", "high"),
                 "energy": ("食欲显著增加易致过量进食与肥胖，需主动管理能量与零食。",
                            "monitor: 体重、BMI、血糖", "high")}},
-    "他克莫司": {"aliases": ["tacrolimus", "fk506", "环孢素", "普乐可复"],
+    "他克莫司": {"aliases": ["tacrolimus", "fk506", "普乐可复"],
              "drug_class": "钙调磷酸酶抑制剂",
              "effects": {
                  "potassium": ("常见药物性高钾，限钾饮食须同步收紧。",
@@ -116,6 +136,21 @@ DRUGS: dict[str, dict[str, Any]] = {
                                "monitor: 血镁", "medium"),
                  "fluid": ("柚子/西柚及其果汁抑制代谢酶，会显著抬高血药浓度，务必禁食。",
                            "monitor: 药物浓度", "high")}},
+    # N-B8 修复（2026-08-14）：环孢素与他克莫司是**两种不同药物**（同为钙调磷酸酶
+    # 抑制剂但药代动力学、血药浓度管理与相互作用谱不同）；此前环孢素被列为他克莫司
+    # 别名，查询"环孢素"返回的是他克莫司文本。
+    "环孢素": {"aliases": ["cyclosporine", "环孢菌素", "新赛斯平", "ciclosporin"],
+            "drug_class": "钙调磷酸酶抑制剂（环孢素）",
+            "effects": {
+                "potassium": ("常见药物性高钾，与保钾利尿剂/ARB 联用时高钾风险叠加，"
+                              "限钾饮食须同步收紧。",
+                              "monitor: 血钾、药物浓度", "high"),
+                "magnesium": ("肾性失镁常见，低镁需膳食或药物补充。",
+                              "monitor: 血镁", "medium"),
+                "sodium": ("部分剂型（口服液/注射液）含溶剂，关注血压与钠负荷。",
+                           "monitor: 血压、血钠", "medium"),
+                "fluid": ("柚子/西柚及其果汁显著抬高环孢素血药浓度，务必禁食。",
+                          "monitor: 药物浓度", "high")}},
     "碳酸氢钠": {"aliases": ["小苏打", "sodium bicarbonate", "碱片"],
              "drug_class": "碱剂",
              "effects": {
