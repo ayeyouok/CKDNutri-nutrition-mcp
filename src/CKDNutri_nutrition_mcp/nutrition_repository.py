@@ -308,8 +308,14 @@ class TablestoreRepository:
             if isinstance(raw, str):
                 try:
                     data = json.loads(raw)
-                except json.JSONDecodeError:
-                    data = []
+                except json.JSONDecodeError as exc:
+                    # X1（2026-08-14）：损坏 JSON 一律抛错（fail-closed，与 JSON 端
+                    # _read_json_file 同口径）——此前 except 静默置 []，读到的空列表经
+                    # save_diary 全量覆盖写回 → 患儿饮食日记**永久丢失**且无任何告警。
+                    # 损坏即显式失败，交由上层定位（人工修复或降级），绝不静默。
+                    raise RuntimeError(
+                        f"饮食日记列 entries 损坏（非法 JSON）：{exc}——拒绝静默清空，"
+                        "请人工修复 Tablestore 该行数据") from exc
                 if isinstance(data, list):
                     entries.extend(data)
         return {"entries": entries}
@@ -342,8 +348,12 @@ class TablestoreRepository:
             if isinstance(raw, str):
                 try:
                     data = json.loads(raw)
-                except json.JSONDecodeError:
-                    data = []
+                except json.JSONDecodeError as exc:
+                    # X1（2026-08-14）：同 load_diary——损坏 JSON 抛错 fail-closed，
+                    # 防止空列表经 save 全量覆盖写回导致 PEW 历史永久丢失。
+                    raise RuntimeError(
+                        f"PEW 历史列 points 损坏（非法 JSON）：{exc}——拒绝静默清空，"
+                        "请人工修复 Tablestore 该行数据") from exc
                 if isinstance(data, list):
                     store[pid] = data
         return store

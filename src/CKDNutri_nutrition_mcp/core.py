@@ -23,6 +23,7 @@ from typing import Any
 
 from a207_policy import (
     enforce_nutrition_tool,
+    PARENT_ROLE,
     get_caller,
     validate_patient_id,
     verify_guardian_token,
@@ -98,7 +99,7 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
 
     校验走 a207_policy.verify_guardian_token（统一实现，含过期校验，BUG-30/36）。
     """
-    if caller != "parent_assistant":
+    if caller != PARENT_ROLE:
         return None
     if not guardian_token:
         return {"ok": False, "error": "GUARDIAN_UNVERIFIED",
