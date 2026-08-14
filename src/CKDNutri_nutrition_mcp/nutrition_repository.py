@@ -138,11 +138,30 @@ class NutritionRepository(Protocol):
 
     # ---- PEW 历史 ----
     def load_pew(self) -> dict[str, Any]:
-        """读取全部 PEW 历史，返回 {patient_id: [points]}；损坏 fail-closed。"""
+        """读取全部 PEW 历史，返回 {patient_id: [points]}；损坏 fail-closed。
+
+        N-MEM-3（2026-08-14）：仅限跨患者聚合/迁移场景；业务单患者主路径必须用
+        load_patient_pew（行级读，勿全表扫描）。
+        """
         ...
 
     def save_pew(self, store: dict[str, Any]) -> None:
-        """原子持久化全部 PEW 历史。"""
+        """原子持久化全部 PEW 历史（按患者分片覆盖写）。"""
+        ...
+
+    def load_patient_pew(self, patient_id: str) -> dict[str, Any]:
+        """读取**单个患者**的 PEW 历史，返回 {patient_id: [points]}（行级读，N-MEM-3）。
+
+        无记录 → {patient_id: []}；损坏 JSON fail-closed 抛 RuntimeError（同 load_pew）。
+        """
+        ...
+
+    def save_patient_pew(self, patient_id: str,
+                         points: list[dict[str, Any]]) -> None:
+        """原子持久化**单个患者**的 PEW 历史（行级写，N-MEM-3）。
+
+        覆盖写该患者行（行级 _rev 乐观锁防并发丢更新），不触碰其他患者。
+        """
         ...
 
 
@@ -210,6 +229,19 @@ class LocalJsonRepository:
 
     def save_pew(self, store: dict[str, Any]) -> None:
         atomic_write_json(_state_path(PEW_STORE_FILENAME), store)
+
+    def load_patient_pew(self, patient_id: str) -> dict[str, Any]:
+        # 本地 JSON 开发模式：文件即全量，过滤该患者（无分片需求）
+        store = self.load_pew()
+        pts = store.get(patient_id)
+        return {patient_id: list(pts) if isinstance(pts, list) else []}
+
+    def save_patient_pew(self, patient_id: str,
+                         points: list[dict[str, Any]]) -> None:
+        # 本地 JSON 开发模式：整文件原子写，仅替换该患者历史
+        store = self.load_pew()
+        store[patient_id] = list(points)
+        self.save_pew(store)
 
 
 class TablestoreRepository:
@@ -409,6 +441,8 @@ class TablestoreRepository:
     # ---- PEW 历史（{patient_id: [points]} ↔ 按患者分片）----
 
     def load_pew(self) -> dict[str, Any]:
+        """全量读取（N-MEM-3：仅跨患者聚合/迁移场景；业务单患者主路径用
+        load_patient_pew 行级读，勿全表扫描）。"""
         store: dict[str, Any] = {}
         for item in self._range_all(TABLE_PEW_HISTORY):
             pid = item["pk"].get("patient_id")
@@ -429,12 +463,44 @@ class TablestoreRepository:
         return store
 
     def save_pew(self, store: dict[str, Any]) -> None:
+        """全量按患者分片覆盖写（N-MEM-3：仅跨患者聚合/迁移场景）。"""
         for pid, points in store.items():
             if not isinstance(points, list):
                 continue
             self._save_row_locked(TABLE_PEW_HISTORY, self._pk_patient(pid),
                                   {"points": self._json_col(points),
                                    "updated_at": _now_iso()})
+
+    def load_patient_pew(self, patient_id: str) -> dict[str, Any]:
+        """行级读**单个患者** PEW 历史（N-MEM-3：GetRow(pk=patient_id)，不扫全表）。
+
+        无该患者行 → {patient_id: []}；损坏 JSON/类型错误 fail-closed 抛 RuntimeError
+        （X1 口径：拒绝静默清空后经 save 覆盖写回丢数据）。
+        """
+        row = self._get_row(TABLE_PEW_HISTORY, self._pk_patient(patient_id))
+        if row is None:
+            return {patient_id: []}
+        raw = row.get("points")
+        if not isinstance(raw, str):
+            return {patient_id: []}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"PEW 历史列 points 损坏（非法 JSON，patient_id={patient_id}）：{exc}"
+                "——拒绝静默清空，请人工修复 Tablestore 该行数据") from exc
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"PEW 历史列 points 类型错误（patient_id={patient_id}）："
+                f"期望 list，实际 {type(data).__name__}——拒绝静默清空")
+        return {patient_id: data}
+
+    def save_patient_pew(self, patient_id: str,
+                         points: list[dict[str, Any]]) -> None:
+        """行级写**单个患者** PEW 历史（N-MEM-3：只写该患者行，行级 _rev 乐观锁）。"""
+        self._save_row_locked(TABLE_PEW_HISTORY, self._pk_patient(patient_id),
+                              {"points": self._json_col(list(points)),
+                               "updated_at": _now_iso()})
 
 
 def _now_iso() -> str:

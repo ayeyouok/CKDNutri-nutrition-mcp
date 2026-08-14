@@ -826,18 +826,6 @@ def assess_pew_risk(
 # ---------------------------------------------------------------------------
 # 3. 3 日饮食日记：写入(store) + 聚合(diet_diary_3d) + 读取
 # ---------------------------------------------------------------------------
-def _load_store() -> dict[str, Any]:
-    # v0.5（2026-08-13）：存储经 DAO 访问（默认 Tablestore；json 开发模式 LocalJson）。
-    # fail-closed 语义（B1：损坏/类型错误禁止静默返回空库，防 RMW 覆盖清空）由
-    # nutrition_repository 实现层保证，本层透传。
-    # N-MEM-2（2026-08-14）：全量语义仅保留给跨患者聚合场景，业务主路径勿用。
-    return _repo().load_diary()
-
-
-def _save_store(store: dict[str, Any]) -> None:
-    _repo().save_diary(store)
-
-
 def _load_patient_store(patient_id: str) -> dict[str, Any]:
     """患者级读（N-MEM-2）：行级 GetRow(pk=patient_id)，不扫全表。
 
@@ -1334,14 +1322,18 @@ def calc_growth_zscore(age_years: float, sex: str,
 _PEW_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
-def _load_pew_store() -> dict:
-    # v0.5（2026-08-13）：经 DAO 访问；B1 fail-closed（损坏/类型错误禁止静默清空）
-    # 由 nutrition_repository 实现层保证。
-    return _repo().load_pew()
+def _load_patient_pew_store(patient_id: str) -> dict:
+    """患者级读 PEW 历史（N-MEM-3）：行级 GetRow(pk=patient_id)，不扫全表。
+
+    返回 {patient_id: [points]}；B1 fail-closed（损坏/类型错误禁止静默清空）
+    由 nutrition_repository 实现层保证。
+    """
+    return _repo().load_patient_pew(patient_id)
 
 
-def _save_pew_store(store: dict) -> None:
-    _repo().save_pew(store)
+def _save_patient_pew_store(patient_id: str, points: list[dict[str, Any]]) -> None:
+    """患者级写 PEW 历史（N-MEM-3）：只写该患者行（行级 _rev 乐观锁）。"""
+    _repo().save_patient_pew(patient_id, points)
 
 
 def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dict[str, Any]:
@@ -1368,7 +1360,10 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     # BUG-60：PEW 历史按日期排序去重，日期必须归一化，否则异形日期破坏时间线
     date = _normalize_date(date, "date")
     with _STORE_LOCK:
-        store = _load_pew_store()
+        # N-MEM-3（2026-08-14）：患者级读/写——此前 _load_pew_store() 全表 GetRange +
+        # _save_pew_store() 回写每个患者行（record_pew_risk 每次评估后必调，数千患儿
+        # 单次落库 = 全表扫描 + O(患者数) 写放大，与 N-MEM-2 修复前日记路径同构）。
+        store = _load_patient_pew_store(patient_id)
         pts = store.get(patient_id, [])
         pts.append({
             "date": date,
@@ -1384,8 +1379,7 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
         for p in pts:
             by_date[p["date"]] = p
         ordered = [by_date[k] for k in sorted(by_date.keys())]
-        store[patient_id] = ordered
-        _save_pew_store(store)
+        _save_patient_pew_store(patient_id, ordered)
     # N4 修复（2026-08-13）：返回信封与其余工具统一 {ok, data}——此前扁平
     # {ok, patient_id, points} 与 get_pew_history 等不一致，编排层无法统一解包。
     return {"ok": True, "data": {"patient_id": patient_id, "points": ordered}}
@@ -1407,7 +1401,9 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
         return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
-    store = _load_pew_store()
+    # N-MEM-3（2026-08-14）：患者级读（行级 GetRow）——此前 _load_pew_store() 全表
+    # 拉取后再取键，医院级全库扫描。
+    store = _load_patient_pew_store(patient_id)
     pts = store.get(patient_id, [])
     trend = "no_data"
     if len(pts) >= 2:

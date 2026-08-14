@@ -65,10 +65,14 @@ def test_calc_prnt_targets_validation():
 
 def test_corrupt_store_fail_closed():
     """B1（2026-08-12 五包审查）回归：损坏/类型错误的状态库必须抛 RuntimeError，
-    不得静默返回空库被 RMW 覆盖清空（对齐 care BUG-65/67）。"""
+    不得静默返回空库被 RMW 覆盖清空（对齐 care BUG-65/67）。
+
+    N-LOG-2（2026-08-14）：core 全表包装 _load_store/_load_pew_store 已删除
+    （业务主路径全部患者级化），本用例改为直测 DAO 层 fail-closed 语义。
+    """
     import tempfile
 
-    from CKDNutri_nutrition_mcp import core
+    from CKDNutri_nutrition_mcp import core, nutrition_repository as repo_mod
 
     tmp = tempfile.mkdtemp(prefix="a207-nutri-corrupt-")
     # 日记库：损坏 JSON
@@ -77,14 +81,15 @@ def test_corrupt_store_fail_closed():
     (Path(tmp) / core.PEW_STORE_FILENAME).write_text("[1,2]", encoding="utf-8")
     os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = tmp
     try:
+        repo = repo_mod.get_repository()
         try:
-            core._load_store()
+            repo.load_diary()
         except RuntimeError:
             pass
         else:
             raise AssertionError("损坏日记库应抛 RuntimeError（B1）")
         try:
-            core._load_pew_store()
+            repo.load_pew()
         except RuntimeError:
             pass
         else:
@@ -311,6 +316,82 @@ def test_n_mem2_patient_scoped():
             os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
 
 
+def test_n_mem3_pew_patient_scoped():
+    """N-MEM-3（2026-08-14）：PEW 患者级读写只触达该患者行（无全表扫描/写放大）；
+    record_pew_risk / get_pew_history 只读/写该患者。"""
+    from CKDNutri_nutrition_mcp import nutrition_repository as repo_mod
+
+    class _FakeOts:
+        """记录 get_row/put_row 触达的主键（与 N-MEM-2 测试同构）。"""
+
+        def __init__(self):
+            self.rows: dict = {}
+            self.get_row_calls = []
+            self.put_row_calls = []
+
+        def get_row(self, table, pk):
+            self.get_row_calls.append((table, tuple(pk)))
+            attrs = self.rows.get((table, tuple(pk)))
+            if attrs is None:
+                return (None, None, None)
+
+            class _R:
+                attribute_columns = [(n, v, 0) for n, v in attrs.items()]
+
+            return (None, _R(), None)
+
+        def put_row(self, table, row, condition):
+            self.put_row_calls.append((table, tuple(row.primary_key)))
+            attrs = {name: value for name, value, *_ in row.attribute_columns}
+            self.rows[(table, tuple(row.primary_key))] = attrs
+
+    fake = _FakeOts()
+    repo = repo_mod.TablestoreRepository(client=fake)
+    repo.save_patient_pew("P001", [{"date": "2026-08-14", "score": 1.0, "level": "low"}])
+    repo.save_patient_pew("P002", [{"date": "2026-08-14", "score": 5.0, "level": "high"}])
+    got = repo.load_patient_pew("P001")
+    assert len(got["P001"]) == 1 and got["P001"][0]["level"] == "low", got
+    # 只触达对应患者行（save 各 get+put 一次，load 一次 get）——无全表 get_range
+    expect_get = [("pew_history", (("patient_id", "P001"),)),
+                  ("pew_history", (("patient_id", "P002"),)),
+                  ("pew_history", (("patient_id", "P001"),))]
+    assert fake.get_row_calls == expect_get, fake.get_row_calls
+    assert fake.put_row_calls == [("pew_history", (("patient_id", "P001"),)),
+                                  ("pew_history", (("patient_id", "P002"),))], \
+        fake.put_row_calls
+
+    # core 层：record_pew_risk / get_pew_history 只触达该患者（LocalJson，独立临时目录）
+    import tempfile
+
+    from CKDNutri_nutrition_mcp import core
+
+    tmp = tempfile.mkdtemp(prefix="a207-nutri-nmem3-")
+    saved_dir = os.environ.get("A207_NUTRITION_ASSESSMENT_DATA_DIR")
+    os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = tmp
+    try:
+        from a207_policy import as_caller
+
+        with as_caller("doctor_assistant"):
+            r1 = core.record_pew_risk("P0001", "2026-08-14", 1.0, "low")
+            assert r1["ok"] and len(r1["data"]["points"]) == 1, r1
+            r2 = core.record_pew_risk("P0002", "2026-08-14", 5.0, "high")
+            assert r2["ok"], r2
+        hist1 = core.get_pew_history("P0001")
+        assert hist1["ok"] and hist1["data"]["count"] == 1, hist1
+        assert all(p["level"] == "low" for p in hist1["data"]["points"])
+        # 行级隔离：P0001 历史不包含 P0002 的点
+        repo = repo_mod.get_repository()
+        full = repo.load_pew()
+        assert set(full.keys()) == {"P0001", "P0002"}, full
+        p1 = repo.load_patient_pew("P0001")
+        assert len(p1["P0001"]) == 1 and p1["P0001"][0]["level"] == "low", p1
+    finally:
+        if saved_dir is not None:
+            os.environ["A207_NUTRITION_ASSESSMENT_DATA_DIR"] = saved_dir
+        else:
+            os.environ.pop("A207_NUTRITION_ASSESSMENT_DATA_DIR", None)
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_calc_prnt_targets()
@@ -320,4 +401,5 @@ if __name__ == "__main__":
     test_s4_unauthorized_nan_unit()
     test_repository_backend()
     test_n_mem2_patient_scoped()
+    test_n_mem3_pew_patient_scoped()
     print("P2 SMOKE OK")
