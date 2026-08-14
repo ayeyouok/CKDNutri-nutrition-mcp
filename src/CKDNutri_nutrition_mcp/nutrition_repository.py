@@ -368,9 +368,11 @@ class TablestoreRepository:
 
 
 def _now_iso() -> str:
-    from datetime import datetime
+    # C2 修复（2026-08-14）：aware UTC——此前 naive datetime.now() 与 care/P1 的
+    # UTC 口径混存（同进程多包 updated_at 两种口径，审计/时间线错位）。
+    from datetime import datetime, timezone
 
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def ensure_tablestore_tables() -> None:

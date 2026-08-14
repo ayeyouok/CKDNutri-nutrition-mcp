@@ -294,6 +294,18 @@ def generate_meal_plan(
         meals = _split_meals(items)
         day_tot = _sum_items(items)
         ach = _achievement(day_tot, target_energy_kcal, target_protein_g, target_k_mg, target_p_mg, target_na_mg)
+        # M2 修复（2026-08-14）：限钾/磷/钠目标**超限进入 plan_warnings**——此前超限
+        # 只标 *_exceeded 布尔（achievement 内），限钾磷患儿的食谱"静默超限"，医生
+        # 不逐日看 achievement 即无感知。逐日超限显式警告，提示需调整品种/分量。
+        _over = [n for n, flag in (("钾", ach["potassium_exceeded"]),
+                                   ("磷", ach["phosphorus_exceeded"]),
+                                   ("钠", ach["sodium_exceeded"])) if flag]
+        if _over:
+            plan_warnings.append(
+                f"第 {d + 1} 天：{('、'.join(_over))}超限——K={day_tot['potassium_mg']:.0f}mg"
+                f"(目标 {target_k_mg:.0f})、P={day_tot['phosphorus_mg']:.0f}mg(目标 {target_p_mg:.0f})、"
+                f"Na={day_tot['sodium_mg']:.0f}mg(目标 {target_na_mg:.0f})，建议调整品种/分量"
+                "或由医生评估后放宽目标")
         days_out.append({"day": d + 1, "meals": meals, "day_totals": day_tot, "achievement": ach})
 
     overall = _overall_achievement(days_out, target_energy_kcal, target_protein_g,

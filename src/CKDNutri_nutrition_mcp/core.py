@@ -17,7 +17,8 @@ import json
 import math
 import threading
 import os
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -135,11 +136,20 @@ _PD_LOSS_REF = {"infant_g_per_kg": 0.28, "adolescent_g_per_kg": 0.10}
 
 
 def _pal_for_age(age_years: float) -> float:
-    """按年龄取 PAL（1-3 岁 1.4 / 4-9 岁 1.6 / 10-17 岁 1.8；<1 岁按 1.4、≥18 按 1.8）。"""
-    for age_min, pal in _PAL_BY_AGE:
-        if age_years < age_min:
-            return pal
-    return _PAL_BY_AGE[-1][1]
+    """按年龄取 PAL（1-3 岁 1.4 / 4-9 岁 1.6 / 10-17 岁 1.8；<1 岁按 1.4、≥18 按 1.8）。
+
+    M1 修复（2026-08-14）：此前 `if age_years < age_min: return pal` 返回"下一个边界
+    的值"——(3.0, 1.4) 与 (9.0, 1.6) 两表项**永远不可达**，3.0-3.99 岁错得 1.6
+    （应 1.4）、9.0-9.99 岁错得 1.8（应 1.6）。改为区间查找：age 落在
+    [age_min_i, age_min_{i+1}) 返回该带值。
+    """
+    pal = _PAL_BY_AGE[0][1]
+    for age_min, p in _PAL_BY_AGE:
+        if age_years >= age_min:
+            pal = p
+        else:
+            break
+    return pal
 
 # --- Schofield / 水肿 / 腹透葡萄糖（从 M5 移植，使 M3 成为唯一 PRNT 权威引擎）---
 # 移植目的：去重后 M5 不再提供目标计算，但其 Schofield 交叉校验、水肿理想体重校正、
@@ -921,6 +931,11 @@ def upsert_food_diary(
                 numeric[key] = fv
             stamped.append({
                 "patient_id": patient_id,
+                # C1 修复（2026-08-14）：条目补服务端 entry_id——此前条目无唯一 id，
+                # _item_key 回退用 date 键 → 同日早/午/晚多餐 key 相同，并发合并时
+                # 一餐被另一餐覆盖（nutrition_repository._merge_lists）。服务端
+                # uuid 碰撞免疫（与 P1 sample_id 同模式），保证并发追加不互替。
+                "entry_id": f"{patient_id}-D{uuid.uuid4().hex[:8]}",
                 "date": _normalize_date(raw_date, "date"),
                 "meal": e.get("meal", ""),
                 "food": e.get("food", ""),
@@ -1340,7 +1355,9 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
             "date": date,
             "score": score,
             "level": level,
-            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            # C2 修复（2026-08-14）：aware UTC——此前 naive datetime.now() 与 care/P1
+            # 的 UTC 口径混存（同进程多包写入 recorded_at 两种口径，审计/时间线错位）。
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "caller": caller,
         })
         # 同日只保留最新一次（覆盖更新）
