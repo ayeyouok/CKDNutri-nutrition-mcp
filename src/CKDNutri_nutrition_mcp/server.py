@@ -225,6 +225,8 @@ def calc_prnt_targets_tool(
     growth_status: str = "normal",
     is_edema: bool = False,
     pd_glucose_kcal_per_day: Optional[float] = None,
+    height_age_years: Optional[float] = None,
+    high_urea_persistent: bool = False,
 ) -> dict[str, Any]:
     """计算 PRNT 2020 每日能量与蛋白目标。仅 CKD 临床助手。
 
@@ -233,6 +235,10 @@ def calc_prnt_targets_tool(
     dialysis_mode: none / peritoneal / hemodialysis（兼容 pd/腹透 等别名）；vegetarian_mode: mixed / lacto_ovo / vegan；
     growth_status: normal / failure / overweight（可取 calc_growth_zscore 的 growth_status_suggestion）；
     is_edema=True 时改用 BMI-P50 理想体重开处方（dry weight 原则）。
+    N-S1（2026-08-14）：height_age_years=身高年龄（严重生长迟缓按身高年龄查 SDI，如 8 表示
+    身高对应 8 岁）；high_urea_persistent=True=持续高尿素血症（排除脱水/分解代谢/激素后蛋白
+    目标降至 SDI 下限）。透析/生长不良/身高年龄/高尿素患者返回 regimens=[standard, adjusted]
+    双方案（data.energy/protein 为 adjusted 值），普通患者仅 1 个 standard 方案。
     """
     try:
         return calc_prnt_targets(
@@ -241,6 +247,9 @@ def calc_prnt_targets_tool(
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
             growth_status=growth_status, is_edema=bool(is_edema),
             pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
+            height_age_years=float(height_age_years) if height_age_years is not None else None,
+            # 原样传递，由 core 层做严格 bool 校验（bool("false")==True 陷阱；pydantic 已先行解析）
+            high_urea_persistent=high_urea_persistent,
         )
     except Exception as exc:
         return _invalid(exc)
@@ -331,6 +340,8 @@ def comprehensive_nutrition_assessment_tool(
     pd_glucose_conc_pct: Optional[float] = None,
     pd_exchanges_per_day: int = 1,
     pd_transport_type: str = "average",
+    height_age_years: Optional[float] = None,
+    high_urea_persistent: bool = False,
 ) -> dict[str, Any]:
     """一键营养评估：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定。仅 CKD 临床助手。
 
@@ -390,12 +401,15 @@ def comprehensive_nutrition_assessment_tool(
         growth_status = z["data"].get("growth_status_suggestion", "normal")
 
         # 2) PRNT 目标（回灌生长状态与水肿校正；BUG-08：透传 pd_glucose_kcal_per_day）
+        # N-S1（2026-08-14）：透传 height_age_years / high_urea_persistent 临床调整
         prnt = calc_prnt_targets(
             age_years=float(age_years), sex=sex, weight_kg=float(weight_kg),
             height_cm=float(height_cm or 0.0), ckd_stage=stage,
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
             growth_status=growth_status, is_edema=bool(is_edema),
             pd_glucose_kcal_per_day=pd_kcal,
+            height_age_years=float(height_age_years) if height_age_years is not None else None,
+            high_urea_persistent=high_urea_persistent,
         )
         if not prnt.get("ok"):
             return prnt
