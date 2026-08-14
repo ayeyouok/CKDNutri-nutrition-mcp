@@ -121,6 +121,25 @@ _DIALYSIS_EXTRA = {
     "peritoneal": (0.15, 0.30),
 }
 
+# --- N-S1 临床要点（2026-08-14，权威：PRNT 2020 Shaw et al. / 2025 综述重印 Table 1）---
+# PAL（体力活动水平）：SDI 能量基于较低 PAL——1-3 岁 1.4、4-9 岁 1.6、10-17 岁 1.8
+# （CKD 儿童体力活动普遍偏低，取各指南 PAL 下限）。
+_PAL_BY_AGE: tuple[tuple[float, float], ...] = (
+    (0.0, 1.4), (3.0, 1.4), (4.0, 1.6), (9.0, 1.6), (10.0, 1.8), (18.0, 1.8),
+)
+
+# PD 透析液蛋白丢失参考（Quan & Baum 1996；婴儿高、青少年低）——信息性提示，
+# 不改变默认补充量（KDOQI 2009：PD 0.15-0.30 / HD 0.10 g/kg/day 仍为权威）。
+_PD_LOSS_REF = {"infant_g_per_kg": 0.28, "adolescent_g_per_kg": 0.10}
+
+
+def _pal_for_age(age_years: float) -> float:
+    """按年龄取 PAL（1-3 岁 1.4 / 4-9 岁 1.6 / 10-17 岁 1.8；<1 岁按 1.4、≥18 按 1.8）。"""
+    for age_min, pal in _PAL_BY_AGE:
+        if age_years < age_min:
+            return pal
+    return _PAL_BY_AGE[-1][1]
+
 # --- Schofield / 水肿 / 腹透葡萄糖（从 M5 移植，使 M3 成为唯一 PRNT 权威引擎）---
 # 移植目的：去重后 M5 不再提供目标计算，但其 Schofield 交叉校验、水肿理想体重校正、
 # 腹透葡萄糖吸收扣减等临床特性有价值，故并入 M3，保证单一权威引擎不丢能力。
@@ -275,19 +294,31 @@ def calc_prnt_targets(
     growth_status: str = "normal",
     is_edema: bool = False,
     pd_glucose_kcal_per_day: float | None = None,
+    height_age_years: float | None = None,        # N-S1（2026-08-14）：身高年龄（严重生长迟缓按身高年龄查 SDI）
+    high_urea_persistent: bool = False,           # N-S1：持续高尿素血症（排除可纠正因素后蛋白降至 SDI 下限）
 ) -> dict[str, Any]:
     """计算儿童 CKD 每日能量与蛋白质目标（PRNT 2020 权威口径，M3 唯一权威引擎）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
 
     能量：初始=SDI 100%；growth_status=failure 取 SDI 上限，overweight 取下限，normal 取中点。
-    蛋白质：目标=SDI 上限；绝对下限=SDI 下限（绝不可低于）；透析额外补充叠加于上限与下限之上
-            （补偿透析丢失，避免负氮平衡）；素食按倍数上调。
+    蛋白质：目标=SDI 上限；绝对下限=SDI 下限（绝不可低于，防 PEW/生长迟缓）；透析额外补充
+            叠加于上限与下限之上（补偿透析丢失，避免负氮平衡）；素食按倍数上调。
+
+    N-S1 临床要点（2026-08-14，权威：PRNT 2020 Shaw et al. / theipna 2024 重印）：
+      - 透析患者或生长不良/超重/身高年龄/高尿素血症患者，**同时输出两种方案**：
+        data.regimens = [standard（标准推荐：正常生长、未透析、SDI 中点/蛋白上限）
+                        , adjusted（当前临床调整）]——医生可对照处方。
+      - height_age_years：严重生长迟缓者按身高年龄（身高在第 50 百分位对应的年龄）
+        查 SDI 段（小年龄 per-kg 需求更高，促进追赶生长）。
+      - high_urea_persistent：持续高尿素血症（已排除脱水/高分解代谢/激素治疗等）时，
+        蛋白质目标降至 SDI 下限，同时保持能量摄入。
+      - data.clinical_notes：权威要点提示（PD/HD 蛋白丢失、PAL 分龄、PEW 保护等）。
 
     移植自 M5 的临床特性（去重后 M3 成为唯一标尺，能力不丢）：
       - is_edema=True：以 BMI-P50 理想体重（干体重）替代实际体重开处方，避免以"水重"高估需求。
       - pd_glucose_kcal_per_day：腹透患者从透析液吸收葡萄糖供能，等量减少膳食能量目标，避免超额。
-      - Schofield 交叉校验：独立估算 BMR，信息性对照 SDI 目标，不覆盖权威数。
+      - Schofield 交叉校验：独立估算 BMR（按分龄 PAL），信息性对照 SDI 目标，不覆盖权威数。
     """
     caller = get_caller()
     # BUG-01 修复：临床组工具必须工具级 ACL 收口（仅 doctor），矩阵读权不足以表达
@@ -318,122 +349,163 @@ def calc_prnt_targets(
         raise ValueError(
             f"vegetarian_mode 必须是 mixed / ovo_lacto / vegan 之一（lacto_ovo 与 ovo_lacto "
             f"同义），收到：{vegetarian_mode!r}")
+    # N-S1（2026-08-14）：新参数校验——high_urea_persistent 严格 bool（防 "false" 字符串陷阱）；
+    # height_age_years 有限性 + 适用域（0-18 岁）。
+    if not isinstance(high_urea_persistent, bool):
+        raise ValueError(f"high_urea_persistent 必须是 bool，收到：{high_urea_persistent!r}")
+    if height_age_years is not None:
+        if not math.isfinite(height_age_years) or height_age_years < 0:
+            raise ValueError("height_age_years 必须为不小于 0 的有限数值")
+        if height_age_years > 18:
+            raise ValueError("height_age_years 超出 PRNT 2020 适用域（0-18 岁）")
     # F7：用 DIALYSIS_ALIAS 单一事实源归一化（兼容 pd/腹透/hemodialysis 等别名），
     # 避免裸 _DIALYSIS_EXTRA 成员判断把 "pd" 等别名静默降级为 "none"。
     dialysis_mode = DIALYSIS_ALIAS.get(dialysis_mode, "none") if dialysis_mode else "none"
 
-    band = _band_for_age(age_years, sex)
-    e_lo, e_hi = band["energy_sdi"]
-    p_lo, p_hi = band["protein_sdi"]
-    veg = _VEG_MULT[vegetarian_mode]
-    d_lo, d_hi = _DIALYSIS_EXTRA[dialysis_mode]
-    d_mid = (d_lo + d_hi) / 2.0 if d_hi > d_lo else d_lo
+    # 是否存在临床调整 → 需要双方案（standard + adjusted）
+    need_adjusted = (dialysis_mode != "none" or growth_status != "normal"
+                     or height_age_years is not None or high_urea_persistent)
 
-    # 能量取点
-    if growth_status == "failure":
-        e_pt = e_hi
-        e_basis = "生长不良：向 SDI 上限调整"
-    elif growth_status == "overweight":
-        e_pt = e_lo
-        e_basis = "超重/肥胖：向下调整以实现适宜体重增长（不损害营养状况）"
-    else:
-        e_pt = (e_lo + e_hi) / 2.0
-        e_basis = "生长正常：取 SDI 中点（约 100% SDI）"
+    def _plan(gs: str, dm: str, ha_years: float | None, hup: bool,
+              label: str, name: str) -> dict[str, Any]:
+        """单方案计算核心：standard（正常生长/未透析/实际年龄/蛋白上限）与 adjusted 共用。
 
-    energy_per_kg = e_pt
+        gs=growth_status；dm=dialysis_mode；ha_years=身高年龄（None=实际年龄）；
+        hup=持续高尿素血症。水肿/素食/PD 葡萄糖扣减为患者属性，两方案一致保留。
+        """
+        band_age = ha_years if ha_years is not None else age_years
+        band = _band_for_age(band_age, sex)
+        e_lo, e_hi = band["energy_sdi"]
+        p_lo, p_hi = band["protein_sdi"]
+        veg = _VEG_MULT[vegetarian_mode]
+        d_lo, d_hi = _DIALYSIS_EXTRA[dm]
+        d_mid = (d_lo + d_hi) / 2.0 if d_hi > d_lo else d_lo
 
-    # 水肿校正：用 BMI-P50 理想体重替代实际体重开处方（dry weight 原则）
-    eff_weight = weight_kg
-    weight_basis = "实际体重"
-    if is_edema:
-        ibw = ideal_body_weight_kg(age_years, sex, height_cm)
-        if ibw and ibw > 0:
-            eff_weight = ibw
-            weight_basis = "水肿校正理想体重(BMI-P50)"
-            e_basis += "；水肿：采用理想体重开处方（dry weight 原则）"
+        # 能量取点
+        if gs == "failure":
+            e_pt = e_hi
+            e_basis = "生长不良：向 SDI 上限调整"
+        elif gs == "overweight":
+            e_pt = e_lo
+            e_basis = "超重/肥胖：向下调整以实现适宜体重增长（不损害营养状况）"
         else:
-            # P1-7 修复（2026-08-13）：is_edema=True 但身高缺失 → ideal_body_weight_kg
-            # 返回 None，此前**静默跳过校正**按水肿体重开处方（能量/蛋白系统性高估）且
-            # warnings 为空。现在显式告警，提示补身高以启用 dry weight 校正。
-            weight_basis = "实际体重（⚠ 水肿未校正：缺身高无法算理想体重）"
-            e_basis += "；水肿但缺身高，未能按理想体重校正（dry weight 未生效），请补身高后复算"
+            e_pt = (e_lo + e_hi) / 2.0
+            e_basis = "生长正常：取 SDI 中点（约 100% SDI）"
+        if ha_years is not None:
+            e_basis += f"；按身高年龄 {ha_years} 岁查 SDI（实际年龄 {age_years} 岁）"
 
-    energy_day = energy_per_kg * eff_weight
+        # 水肿校正：用 BMI-P50 理想体重替代实际体重开处方（dry weight 原则，理想体重用实际年龄）
+        eff_weight = weight_kg
+        weight_basis = "实际体重"
+        if is_edema:
+            ibw = ideal_body_weight_kg(age_years, sex, height_cm)
+            if ibw and ibw > 0:
+                eff_weight = ibw
+                weight_basis = "水肿校正理想体重(BMI-P50)"
+                e_basis += "；水肿：采用理想体重开处方（dry weight 原则）"
+            else:
+                # P1-7 修复（2026-08-13）：is_edema=True 但身高缺失 → ideal_body_weight_kg
+                # 返回 None，此前**静默跳过校正**按水肿体重开处方（能量/蛋白系统性高估）且
+                # warnings 为空。现在显式告警，提示补身高以启用 dry weight 校正。
+                weight_basis = "实际体重（⚠ 水肿未校正：缺身高无法算理想体重）"
+                e_basis += "；水肿但缺身高，未能按理想体重校正（dry weight 未生效），请补身高后复算"
 
-    # 腹透葡萄糖供能扣减：PD 患者从腹透液吸收葡萄糖，等量减少膳食能量目标
-    pd_deduction = 0.0
-    if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
-        pd_deduction = float(pd_glucose_kcal_per_day)
-        energy_day = max(energy_day - pd_deduction, 0.0)
-        e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
+        energy_day = e_pt * eff_weight
 
-    # 蛋白质：上限为目标，下限为安全底；透析额外补充叠加（补偿丢失）
-    protein_target_per_kg = p_hi * veg + d_mid
-    protein_floor_per_kg = p_lo * veg + d_mid
-    protein_target_g = protein_target_per_kg * eff_weight
-    protein_floor_g = protein_floor_per_kg * eff_weight
+        # 腹透葡萄糖供能扣减：PD 患者从腹透液吸收葡萄糖，等量减少膳食能量目标
+        pd_deduction = 0.0
+        if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
+            pd_deduction = float(pd_glucose_kcal_per_day)
+            energy_day = max(energy_day - pd_deduction, 0.0)
+            e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
 
-    # Schofield 交叉校验（信息性，不改变 SDI 权威数）：PAL×BMR 与 SDI 目标对照
-    # BUG-49（2026-08-12）：用 eff_weight（水肿校正后理想体重）而非原始 weight_kg——
-    # 水肿患儿的"水重"会让 BMR 虚高、deviation 偏负，误触发 divergent 提示。
-    schofield_bmr = schofield_bmr_kcal(sex, age_years, eff_weight, height_cm)
-    schofield_cross = None
-    if schofield_bmr:
-        pal_adjusted = round(schofield_bmr * PAL_DEFAULT, 1)
-        deviation = (energy_day - pal_adjusted) / pal_adjusted * 100.0 if pal_adjusted > 0 else 0.0
-        schofield_cross = {
-            "bmr_kcal_per_day": schofield_bmr,
-            "pal_adjusted_kcal_per_day": pal_adjusted,
-            "deviation_pct_vs_sdi_target": _round(deviation, 1),
-            "flag": "divergent" if abs(deviation) > 25 else "consistent",
-            "note": "Schofield 为独立估算，SDI 目标为权威；偏差>25% 提示复核身高/体重/年龄。",
-        }
+        # 蛋白质：默认目标=SDI 上限（促生长）；高尿素血症 → 目标降至 SDI 下限（保能量）；
+        # 下限为最低安全量（防 PEW）；透析额外补充叠加（补偿丢失）
+        p_hi_eff = p_lo if hup else p_hi
+        protein_target_per_kg = p_hi_eff * veg + d_mid
+        protein_floor_per_kg = p_lo * veg + d_mid
+        protein_target_g = protein_target_per_kg * eff_weight
+        protein_floor_g = protein_floor_per_kg * eff_weight
+        protein_note = ("目标取 SDI 下限（持续高尿素血症，已排除脱水/分解代谢/激素等可纠正因素）；"
+                        "下限即最低安全摄入量，切勿再低以免 PEW/生长迟缓；透析叠加额外补充。"
+                        if hup else
+                        "目标取 SDI 上限（促生长）；绝对不可低于 SDI 下限(floor)以免 PEW/生长迟缓，"
+                        "透析叠加额外补充。")
 
-    warnings: list[str] = []
-    # 六审（2026-08-13）：超龄显式提示（对齐 assessment adult_caveat）——age>18 会
-    # 静默套用 15-17 岁段参数，临床可能误当儿童处方执行。
-    if age_years > 18:
-        warnings.append(
-            f"age_years={age_years} 超出 PRNT 2020 儿童适用域（0-18 岁），目标按 15-17 岁段"
-            "参数计算，仅供参考，请改用成人营养指南。")
-    if ckd_stage == 1:
-        warnings.append("PRNT 2020 覆盖 CKD 2-5D；stage 1 暂沿用同表，请结合临床判断。")
-    if dialysis_mode != "none":
-        warnings.append(
-            f"透析额外补充蛋白 {_round(d_mid,2)} g/kg/day（PD 0.15-0.30 / HD 0.10），已叠加于目标与下限。"
-        )
-    if vegetarian_mode != "mixed":
-        warnings.append(
-            f"素食模式蛋白需求×{veg}（蛋奶素 1.2 / 纯素 1.3，因植物蛋白生物利用度低）。"
-        )
-    if is_edema:
-        warnings.append(
-            f"已启用水肿校正：以理想体重 {_round(eff_weight,1)}kg（BMI-P50）替代实际体重 "
-            f"{_round(weight_kg,1)}kg 开处方。"
-        )
-    if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
-        warnings.append(
-            f"已扣减腹透葡萄糖供能 {_round(pd_deduction,1)} kcal/day，避免能量超额。"
-        )
-        if dialysis_mode != "peritoneal":
-            warnings.append("提供了腹透葡萄糖供能，但当前非腹膜透析模式，请确认处方场景。")
+        # Schofield 交叉校验（信息性，不改变 SDI 权威数）：分龄 PAL×BMR 与 SDI 目标对照
+        # BUG-49（2026-08-12）：用 eff_weight（水肿校正后理想体重）而非原始 weight_kg——
+        # 水肿患儿的"水重"会让 BMR 虚高、deviation 偏负，误触发 divergent 提示。
+        schofield_bmr = schofield_bmr_kcal(sex, age_years, eff_weight, height_cm)
+        schofield_cross = None
+        if schofield_bmr:
+            pal = _pal_for_age(age_years)
+            pal_adjusted = round(schofield_bmr * pal, 1)
+            deviation = (energy_day - pal_adjusted) / pal_adjusted * 100.0 if pal_adjusted > 0 else 0.0
+            schofield_cross = {
+                "bmr_kcal_per_day": schofield_bmr,
+                "pal": pal,
+                "pal_adjusted_kcal_per_day": pal_adjusted,
+                "deviation_pct_vs_sdi_target": _round(deviation, 1),
+                "flag": "divergent" if abs(deviation) > 25 else "consistent",
+                "note": "Schofield 为独立估算，SDI 目标为权威；偏差>25% 提示复核身高/体重/年龄。",
+            }
 
-    return {
-        "ok": True,
-        "data": {
-            "guideline": GUIDELINE,
+        warnings: list[str] = []
+        # 六审（2026-08-13）：超龄显式提示（对齐 assessment adult_caveat）——age>18 会
+        # 静默套用 15-17 岁段参数，临床可能误当儿童处方执行。
+        if age_years > 18:
+            warnings.append(
+                f"age_years={age_years} 超出 PRNT 2020 儿童适用域（0-18 岁），目标按 15-17 岁段"
+                "参数计算，仅供参考，请改用成人营养指南。")
+        if ckd_stage == 1:
+            warnings.append("PRNT 2020 覆盖 CKD 2-5D；stage 1 暂沿用同表，请结合临床判断。")
+        if dm != "none":
+            warnings.append(
+                f"透析额外补充蛋白 {_round(d_mid,2)} g/kg/day（PD 0.15-0.30 / HD 0.10），已叠加于目标与下限。"
+            )
+            if dm == "peritoneal":
+                warnings.append(
+                    f"PD 透析液蛋白丢失参考：婴儿约 {_PD_LOSS_REF['infant_g_per_kg']}、"
+                    f"青少年约 {_PD_LOSS_REF['adolescent_g_per_kg']} g/kg/day（Quan & Baum 1996）。")
+        if vegetarian_mode != "mixed":
+            warnings.append(
+                f"素食模式蛋白需求×{veg}（蛋奶素 1.2 / 纯素 1.3，因植物蛋白生物利用度低）。"
+            )
+        if is_edema:
+            warnings.append(
+                f"已启用水肿校正：以理想体重 {_round(eff_weight,1)}kg（BMI-P50）替代实际体重 "
+                f"{_round(weight_kg,1)}kg 开处方。"
+            )
+        if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
+            warnings.append(
+                f"已扣减腹透葡萄糖供能 {_round(pd_deduction,1)} kcal/day，避免能量超额。"
+            )
+            if dm != "peritoneal":
+                warnings.append("提供了腹透葡萄糖供能，但当前非腹膜透析模式，请确认处方场景。")
+        if hup:
+            warnings.append(
+                "持续高尿素血症：蛋白质目标已降至 SDI 下限（需先排除脱水/高分解代谢/激素治疗"
+                "等可纠正因素，并保持能量摄入）。")
+        if ha_years is not None:
+            warnings.append(
+                f"严重生长迟缓：按身高年龄（Height Age）{ha_years} 岁查 SDI，"
+                f"而非实际年龄 {age_years} 岁——小年龄 per-kg 需求更高，促进追赶生长。")
+
+        return {
+            "label": label,
+            "name": name,
             "age_band": band["label"],
+            "age_band_basis": ("height_age" if ha_years is not None else "chronological"),
             "sex": sex,
             "ckd_stage": ckd_stage,
-            "dialysis_mode": dialysis_mode,
-            "vegetarian_mode": vegetarian_mode,
-            "growth_status": growth_status,
+            "dialysis_mode": dm,
+            "growth_status": gs,
             "is_edema": is_edema,
             "weight_used_kg": _round(eff_weight, 2),
             "weight_basis": weight_basis,
             "energy": {
                 "sdi_kcal_per_kg": [e_lo, e_hi],
-                "target_kcal_per_kg": _round(energy_per_kg, 2),
+                "target_kcal_per_kg": _round(e_pt, 2),
                 "target_kcal_per_day": _round(energy_day, 1),
                 "pd_glucose_deduction_kcal": _round(pd_deduction, 1),
                 "basis": e_basis,
@@ -441,8 +513,7 @@ def calc_prnt_targets(
             "protein": {
                 "sdi_g_per_kg": [p_lo, p_hi],
                 # N-S1 三审（2026-08-14）：输出权威「每日蛋白总量」SDI 区间——
-                # 此前仅存于 _PRNT_BANDS 未透出，医生看不到 15-17 岁按性别
-                # （M 52-65 / F 45-49）等参考值。_band_for_age 已按性别解析。
+                # 15-17 岁按性别（M 52-65 / F 45-49）。_band_for_age 已按性别解析。
                 "sdi_total_g_per_day": band["protein_total_daily"],
                 "vegetarian_multiplier": veg,
                 "dialysis_extra_g_per_kg": [d_lo, d_hi],
@@ -450,7 +521,7 @@ def calc_prnt_targets(
                 "floor_g_per_kg": _round(protein_floor_per_kg, 3),
                 "target_g_per_day": _round(protein_target_g, 1),
                 "floor_g_per_day": _round(protein_floor_g, 1),
-                "note": "目标取 SDI 上限；绝对不可低于 SDI 下限(floor)，透析叠加额外补充。",
+                "note": protein_note,
             },
             "pe_ratio": {
                 "ideal_pct": [7, 12],
@@ -459,13 +530,73 @@ def calc_prnt_targets(
             },
             "schofield_cross_check": schofield_cross,
             "warnings": warnings,
+        }
+
+    adjusted = _plan(growth_status, dialysis_mode, height_age_years,
+                     high_urea_persistent, "adjusted", "调整推荐（当前临床参数）")
+    if need_adjusted:
+        standard = _plan("normal", "none", None, False, "standard", "标准推荐（正常生长、未透析）")
+        plans = [standard, adjusted]
+    else:
+        # 无临床调整：唯一方案即标准推荐（label 语义对齐）
+        adjusted["label"] = "standard"
+        adjusted["name"] = "标准推荐（正常生长、未透析）"
+        plans = [adjusted]
+
+    # 临床要点提示（权威依据，PRNT 2020 / KDOQI 2009 / theipna 2024 重印）
+    clinical_notes: list[str] = []
+    if need_adjusted:
+        clinical_notes.append(
+            "本患者存在临床调整（生长/透析/身高年龄/高尿素血症），已同时输出两种方案："
+            "regimens.standard=标准推荐（正常生长、未透析、SDI 中点、蛋白上限）；"
+            "regimens.adjusted=当前调整推荐——可对照处方。")
+    clinical_notes.append(
+        "蛋白质目标建议取 SDI 上限以促进生长；SDI 下限为最低安全摄入量，切勿低于，"
+        "以免蛋白质-能量消耗（PEW）与生长迟缓。")
+    if dialysis_mode == "peritoneal":
+        clinical_notes.append(
+            f"PD 透析液蛋白丢失参考：婴儿约 {_PD_LOSS_REF['infant_g_per_kg']}、"
+            f"青少年约 {_PD_LOSS_REF['adolescent_g_per_kg']} g/kg/day（Quan & Baum 1996）；"
+            "KDOQI 建议额外补充 0.15-0.30 g/kg/day。")
+    elif dialysis_mode == "hemodialysis":
+        clinical_notes.append("HD 蛋白丢失补充：0.10 g/kg/day（KDOQI 2009）。")
+    clinical_notes.append(
+        "SDI 能量基于较低体力活动水平（PAL：1-3 岁 1.4 / 4-9 岁 1.6 / 10-17 岁 1.8），"
+        "契合 CKD 儿童体力活动普遍偏低的实际情况。")
+    if growth_status == "failure" or height_age_years is not None:
+        clinical_notes.append(
+            "生长不良：能量摄入应调整至 SDI 上限；严重生长迟缓者可参考身高年龄"
+            "（Height Age=身高在生长曲线第 50 百分位对应的年龄）的 SDI 进行评估和补充。")
+    if high_urea_persistent:
+        clinical_notes.append(
+            "高尿素血症：已将蛋白质目标调至 SDI 下限——务必先排除脱水/高分解代谢/激素治疗"
+            "等可纠正因素，且不降低能量摄入。")
+
+    return {
+        "ok": True,
+        "data": {
+            # 顶层字段 = adjusted 方案（向后兼容既有调用方/编排层）
+            "guideline": GUIDELINE,
+            "age_band": adjusted["age_band"],
+            "sex": sex,
+            "ckd_stage": ckd_stage,
+            "dialysis_mode": dialysis_mode,
+            "vegetarian_mode": vegetarian_mode,
+            "growth_status": growth_status,
+            "is_edema": is_edema,
+            "weight_used_kg": adjusted["weight_used_kg"],
+            "weight_basis": adjusted["weight_basis"],
+            "energy": adjusted["energy"],
+            "protein": adjusted["protein"],
+            "pe_ratio": adjusted["pe_ratio"],
+            "schofield_cross_check": adjusted["schofield_cross_check"],
+            "warnings": adjusted["warnings"],
+            # N-S1（2026-08-14）：双方案 + 临床要点
+            "regimens": plans,
+            "clinical_notes": clinical_notes,
         },
     }
 
-
-# ---------------------------------------------------------------------------
-# 2. 摄入 vs 目标 + PEW 筛查
-# ---------------------------------------------------------------------------
 def assess_intake_vs_target(
     diet: dict[str, Any],
     age_years: float,

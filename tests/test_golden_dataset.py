@@ -251,6 +251,10 @@ def test_prnt_golden_invalid():
         dict(age_years=-1, sex="F", weight_kg=20, height_cm=130),
         dict(age_years=6, sex="F", weight_kg=20, height_cm=130, growth_status="bogus"),
         dict(age_years=6, sex="F", weight_kg=20, height_cm=130, vegetarian_mode="bogus"),
+        # N-S1（2026-08-14）新增参数 fail-closed
+        dict(age_years=6, sex="F", weight_kg=20, height_cm=130, high_urea_persistent="false"),
+        dict(age_years=6, sex="F", weight_kg=20, height_cm=130, height_age_years=20),
+        dict(age_years=6, sex="F", weight_kg=20, height_cm=130, height_age_years=float("nan")),
     ):
         try:
             core.calc_prnt_targets(**kwargs)
@@ -258,6 +262,53 @@ def test_prnt_golden_invalid():
             pass
         else:
             raise AssertionError(f"{kwargs} 应抛 ValueError")
+
+
+def test_prnt_golden_regimens():
+    """N-S1（2026-08-14）：透析/生长不良/身高年龄/高尿素血症 → 双方案输出（standard + adjusted）。"""
+    from CKDNutri_nutrition_mcp import core
+
+    # 普通患者：唯一方案 = standard
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150, ckd_stage=1)
+    regs = r["data"]["regimens"]
+    assert len(regs) == 1 and regs[0]["label"] == "standard", regs
+
+    # PD 透析：standard（无叠加）vs adjusted（蛋白叠加 0.15-0.30 中点 0.225）
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150,
+                               ckd_stage=3, dialysis_mode="peritoneal")
+    std, adj = r["data"]["regimens"]
+    assert std["label"] == "standard" and adj["label"] == "adjusted"
+    assert std["protein"]["dialysis_extra_g_per_kg"] == [0.0, 0.0]
+    assert adj["protein"]["dialysis_extra_g_per_kg"] == [0.15, 0.30]
+    assert adj["protein"]["target_g_per_kg"] - std["protein"]["target_g_per_kg"] > 0.2, \
+        (std["protein"], adj["protein"])  # PD 叠加中点 0.225
+
+    # 生长不良：adjusted 能量取 SDI 上限（12 岁 F 11-12 段上限 57）
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150,
+                               ckd_stage=3, growth_status="failure")
+    std, adj = r["data"]["regimens"]
+    assert std["energy"]["target_kcal_per_kg"] == 50.0
+    assert adj["energy"]["target_kcal_per_kg"] == 57.0, adj["energy"]
+
+    # 身高年龄：adjusted 用身高年龄查段（实际 12 岁 / 身高年龄 8 岁 → 7-8 岁段）
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150,
+                               ckd_stage=3, growth_status="failure", height_age_years=8)
+    std, adj = r["data"]["regimens"]
+    assert adj["age_band"] == "7-8岁" and adj["age_band_basis"] == "height_age"
+    assert std["age_band_basis"] == "chronological"
+
+    # 高尿素血症：adjusted 蛋白目标降至 SDI 下限（=floor）
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150,
+                               ckd_stage=3, high_urea_persistent=True)
+    std, adj = r["data"]["regimens"]
+    assert adj["protein"]["target_g_per_kg"] < std["protein"]["target_g_per_kg"]
+    assert abs(adj["protein"]["target_g_per_kg"] - adj["protein"]["floor_g_per_kg"]) < 1e-6
+
+    # 临床要点（PEW 保护 / PD 丢失 / PAL 分龄）
+    r = core.calc_prnt_targets(age_years=12, sex="F", weight_kg=40, height_cm=150,
+                               ckd_stage=3, dialysis_mode="peritoneal")
+    joined = " ".join(r["data"]["clinical_notes"])
+    assert "PEW" in joined and "0.28" in joined and "PAL" in joined, joined
 
 
 # ---------------------------------------------------------------- 生长 Z（nutrition）
