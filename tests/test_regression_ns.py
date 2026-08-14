@@ -33,9 +33,10 @@ def test_ns2_food_match_common_foods():
     assert r is not None and r["name"] == "松蘑（干）", r
     assert abs(float(r["potassium_mg"]) - 2402.0) < 1, r["potassium_mg"]
     # B 方案（2026-08-14）：加工状态差异（干 vs 水发）非冲突——榛蘑应命中干品权威值
+    # （2026-08-14 用户决策：K 取 2492，fail-safe 高值原则——高钾患者宁可标高避吃）
     r = find_food("榛蘑")
     assert r is not None and r["name"] == "榛蘑（干）", r
-    assert abs(float(r["potassium_mg"]) - 4629.0) < 1, r["potassium_mg"]
+    assert abs(float(r["potassium_mg"]) - 2492.0) < 1, r["potassium_mg"]
     # 单字仍拒绝
     assert find_food("鱼") is None
 

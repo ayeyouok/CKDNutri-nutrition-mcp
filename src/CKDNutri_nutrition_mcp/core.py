@@ -882,6 +882,14 @@ def upsert_food_diary(
     """
     caller = get_caller()
     enforce_nutrition_tool(caller, "upsert_food_diary")
+    # 一般 1（2026-08-14）：统一 patient_id 契约校验（对齐 P1/P3 各入口）——此前
+    # 缺此校验，医生身份可写入畸形/脏 id（如 "P123" 或空格）污染 diary_store.json；
+    # 家长路径虽经 _guard_guardian fail-closed 拒绝（畸形 id 无令牌条目），但医生侧
+    # 数据污染与读侧不匹配。畸形 id 显式 INVALID_ARGUMENT，不静默落库。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
     denied = _guard_guardian(caller, patient_id, guardian_token, "upsert_food_diary")
     if denied:
         return denied
@@ -1375,11 +1383,17 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
             trend = "improving"
         else:
             trend = "stable"
+    # 一般 2（2026-08-14）：信封统一 {ok, data}——此前扁平 {ok, patient_id, count,
+    # points, trend} 与 record_pew_risk 的 {ok, data} 不一致（core.py:1346 注释自称
+    # "统一"但并未统一），编排层需双形态兼容。消费方（care get_pew_timeline /
+    # content 报告）均为参数注入不解析返回，改信封无破坏。
     return {
         "ok": True,
-        "patient_id": patient_id,
-        "count": len(pts),
-        "points": pts,
-        "trend": trend,
+        "data": {
+            "patient_id": patient_id,
+            "count": len(pts),
+            "points": pts,
+            "trend": trend,
+        },
     }
 

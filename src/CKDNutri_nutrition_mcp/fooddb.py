@@ -66,7 +66,10 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                     continue
                 row: dict[str, Any] = {
                     "name": raw["name"].strip(),
-                    "aliases": [a for a in (raw.get("aliases") or "").split(";") if a],
+                    # 潜在 4（2026-08-14）：别名 strip 防御——此前 split(";") 未 strip，
+                    # 含前导/尾随空格/全角空格的别名无法匹配（实测当前 CSV 无此脏数据，
+                    # 属防未来数据回归的低成本防御）。
+                    "aliases": [a.strip() for a in (raw.get("aliases") or "").split(";") if a.strip()],
                     "category": (raw.get("category") or "").strip(),
                     "subcategory": (raw.get("subcategory") or "").strip(),
                     "edible_pct": _to_float(raw.get("edible_pct"), 100.0),
