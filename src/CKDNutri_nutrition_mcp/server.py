@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from a207_policy import CallerError, enforce_nutrition_tool, get_caller
+from a207_policy import translate_error, enforce_nutrition_tool, get_caller
 
 from .core import (
     assess_intake_vs_target,
@@ -49,32 +49,8 @@ logger = logging.getLogger("CKDNutri-nutrition-mcp")
 
 
 def _invalid(exc):
-    if isinstance(exc, CallerError):
-        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封，不再向上抛 500。
-        # 2026-08-12（七审，care 同口径）：caller/action/reason 三重 or 保底——
-        # getattr 默认值在属性显式置 None/空串时不生效。
-        logger.warning("营养服务鉴权拒绝: exc=%s", exc)
-        caller = getattr(exc, "caller", None) or "?"
-        action = getattr(exc, "action", None) or "access"
-        reason = getattr(exc, "reason", None) or str(exc) or "无明确原因"
-        return {"ok": False, "error": "FORBIDDEN",
-                "detail": f"caller={caller} 无权 {action}（{reason}）"}
-    # BUG-52 + B2（2026-08-12）：内部数据错误（含 B1 损坏文件 RuntimeError）归
-    # INTERNAL_ERROR；detail **脱敏**——OSError/FileNotFoundError 的 str 含服务端
-    # 绝对路径，原样返回泄露文件系统结构；完整异常仅留服务端日志。
-    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError)):
-        logger.warning("营养服务内部数据错误: %s", exc)
-        return {"ok": False, "error": "INTERNAL_ERROR",
-                "detail": "内部数据错误（error_code=NUTR_DATA），详情见服务端日志"}
-    if isinstance(exc, ValueError):
-        # core 层业务/参数校验异常——detail 对调用方有明确语义，保留
-        logger.info("营养服务参数校验拦截: %s", exc)
-        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
-    # 未知系统异常 = 内部 Code Bug——归 INTERNAL_ERROR（编排层不应重试/误判入参），
-    # detail 脱敏，完整堆栈仅服务端日志。
-    logger.error("营养服务未预期异常（内部 bug，error_code=NUTR_UNKNOWN）", exc_info=exc)
-    return {"ok": False, "error": "INTERNAL_ERROR",
-            "detail": "营养服务内部错误（error_code=NUTR_UNKNOWN），请查服务端日志"}
+    # B2 中心化（2026-08-15）：异常翻译收敛到 a207_policy.translate_error 单实现
+    return translate_error(exc, domain="P2", logger=logger)
 
 
 def _stage_int(value: Any, default: int = 1) -> int:

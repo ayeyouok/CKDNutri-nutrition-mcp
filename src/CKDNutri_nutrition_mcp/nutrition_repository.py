@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from a207_policy import atomic_write_json, resolve_state_path
+from a207_policy.storage import TablestoreBase, ensure_json_backend_allowed  # 2026-08-15：共享 Tablestore 基础设施
 
 logger = logging.getLogger("CKDNutri-nutrition-mcp.repository")
 
@@ -58,50 +59,6 @@ _DATA_DIR_ENV = "A207_NUTRITION_ASSESSMENT_DATA_DIR"
 # S5 修复（2026-08-13）：乐观锁冲突重试时**合并业务字段**而非整行覆盖——
 # 并发 upsert 日记/PEW 时，后写者不得覆盖先写者追加的 entries/points。
 # 合并规则：JSON 数组列按元素 id 去重合并，标量 new 优先。
-
-
-def _item_key(item: Any) -> tuple:
-    """列表元素去重键：dict 优先取业务 id 键，否则按 JSON 序列化全等。"""
-    if isinstance(item, dict):
-        for k in ("record_id", "plan_id", "notification_id", "id", "entry_id", "date"):
-            if item.get(k) is not None:
-                return ("id", k, item[k])
-    return ("json", json.dumps(item, ensure_ascii=False, sort_keys=True))
-
-
-def _merge_lists(cur: list, new: list) -> list:
-    """列表按元素 id 去重合并（new 优先覆盖同 id，追加新元素）。"""
-    result = list(cur)
-    for item in new:
-        key = _item_key(item)
-        replaced = False
-        for index, existing in enumerate(result):
-            if _item_key(existing) == key:
-                result[index] = item
-                replaced = True
-                break
-        if not replaced:
-            result.append(item)
-    return result
-
-
-def _merge_row(current: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
-    """冲突重试合并：以**最新行**为底，new 非 None 字段覆盖；JSON 数组列去重合并。"""
-    merged = dict(current)
-    for key, value in new.items():
-        cur_value = merged.get(key)
-        if isinstance(cur_value, str) and isinstance(value, str):
-            try:
-                cur_list = json.loads(cur_value)
-                new_list = json.loads(value)
-                if isinstance(cur_list, list) and isinstance(new_list, list):
-                    merged[key] = json.dumps(_merge_lists(cur_list, new_list),
-                                             ensure_ascii=False)
-                    continue
-            except (json.JSONDecodeError, TypeError):
-                pass
-        merged[key] = value
-    return merged
 
 
 @runtime_checkable
@@ -244,129 +201,17 @@ class LocalJsonRepository:
         self.save_pew(store)
 
 
-class TablestoreRepository:
-    """阿里云表格存储后端（生产默认，缺 OTS 参数 fail-fast）。"""
+class TablestoreRepository(TablestoreBase):
+    """阿里云表格存储后端（生产默认，缺 OTS 参数 fail-fast）。
 
-    def __init__(self, client: Any | None = None) -> None:
-        """client 仅供测试注入内存 Fake（生产不传，走 A207_OTS_* 环境变量）。"""
-        if client is not None:
-            self._client = client
-            return
-        self.endpoint = os.environ.get(OTS_ENDPOINT_ENV)
-        self.instance = os.environ.get(OTS_INSTANCE_ENV)
-        self.ak_id = os.environ.get(OTS_AK_ID_ENV)
-        self.ak_secret = os.environ.get(OTS_AK_SECRET_ENV)
-        missing = [name for name, val in (
-            (OTS_ENDPOINT_ENV, self.endpoint),
-            (OTS_INSTANCE_ENV, self.instance),
-            (OTS_AK_ID_ENV, self.ak_id),
-            (OTS_AK_SECRET_ENV, self.ak_secret),
-        ) if not val]
-        if missing:
-            raise RuntimeError(
-                f"Tablestore 后端缺少连接参数：{', '.join(missing)}。"
-                f"请注入 A207_OTS_* 环境变量（生产默认后端，勿静默回退 JSON）。")
-        self._client = None  # 惰性建连
-
-    def _get_client(self):
-        if self._client is None:
-            import tablestore  # 延迟导入：LocalJson 后端无需 SDK
-
-            self._client = tablestore.OTSClient(
-                self.endpoint, self.ak_id, self.ak_secret, self.instance)
-        return self._client
-
-    # ---- 基础读写 ----
+    2026-08-15：连接/乐观锁/GetRange/建表等基础设施收敛到
+    a207_policy.storage.TablestoreBase（消除三包 ~750 行复制），本类仅留业务方法。
+    """
 
     @staticmethod
     def _pk_patient(patient_id: str) -> list[tuple[str, str]]:
         return [("patient_id", patient_id)]
 
-    def _get_row(self, table: str, pk: list[tuple[str, str]]) -> dict[str, Any] | None:
-        try:
-            _, row, _ = self._get_client().get_row(table, pk)
-        except Exception as exc:
-            # fail-closed（对齐 P1 五审）：存储故障抛 RuntimeError（→ INTERNAL_ERROR），
-            # 不得静默当"行不存在"处理——否则网络抖动时日记被误判为空。
-            logger.error("Tablestore get_row 失败: table=%s pk=%s exc=%s", table, pk, exc)
-            raise RuntimeError(
-                f"Tablestore 读取失败（table={table}），详情见服务端日志") from exc
-        if row is None:
-            return None
-        return {name: value for name, value, _ in row.attribute_columns}
-
-    def _put_row_conditioned(self, table: str, pk: list[tuple[str, str]],
-                             attrs: dict[str, Any], rev: int,
-                             expect_exists: bool) -> None:
-        """条件写：_rev 必须等于 rev（乐观锁）。条件不满足抛 OTSClientError。"""
-        from tablestore import (ComparatorType, Condition, Row,
-                                RowExistenceExpectation, SingleColumnCondition)
-
-        expectation = (RowExistenceExpectation.EXPECT_EXIST if expect_exists
-                       else RowExistenceExpectation.EXPECT_NOT_EXIST)
-        col_cond = None
-        if expect_exists:
-            col_cond = SingleColumnCondition(
-                _REV_COL, ComparatorType.EQUAL, rev)
-        condition = Condition(expectation, col_cond)
-        clean = {k: v for k, v in attrs.items() if v is not None}
-        row = Row(pk, list(clean.items()))
-        self._get_client().put_row(table, row, condition)
-
-    def _save_row_locked(self, table: str, pk: list[tuple[str, str]],
-                         attrs: dict[str, Any]) -> None:
-        """乐观锁写入：读 _rev → 条件写 _rev+1 → 冲突重试（对齐 care）。
-
-        五审（2026-08-13）：此前 save_diary/save_pew 无条件 PutRow 覆盖——多 worker
-        并发 upsert 时后写者覆盖先写者（丢更新）。行级 _rev 条件写 + 重试，
-        冲突仍失败抛 RuntimeError（fail-closed，不静默丢数据）。
-
-        S5 修复（2026-08-13）：冲突重试时用 _merge_row **重新读取并合并**最新行与
-        本次 attrs——此前整行覆盖旧 attrs，高并发下后写覆盖先写的部分字段
-        （lost update）。列表字段（entries/points）按元素 id 去重合并。
-        """
-        from tablestore import OTSClientError
-
-        last_err: Exception | None = None
-        for _ in range(_MAX_RETRY):
-            current = self._get_row(table, pk)
-            rev = int(current.get(_REV_COL, 0)) if current else 0
-            next_attrs = dict(attrs)
-            if current:
-                next_attrs = _merge_row(current, next_attrs)  # S5：合并并发修改
-            next_attrs[_REV_COL] = rev + 1
-            try:
-                self._put_row_conditioned(
-                    table, pk, next_attrs, rev, expect_exists=current is not None)
-                return
-            except OTSClientError as exc:
-                last_err = exc  # 条件不满足 → 并发写冲突，重试
-        raise RuntimeError(
-            f"存储并发写冲突（{table} pk={pk}），重试 {_MAX_RETRY} 次仍失败，"
-            f"拒绝静默覆盖: {last_err}")
-
-    def _range_all(self, table: str) -> list[dict[str, Any]]:
-        """全表 GetRange（主键升序）。返回 [{pk_dict, attrs_dict}]。"""
-        from tablestore import INF_MAX, INF_MIN
-
-        start = [("patient_id", INF_MIN)]
-        end = [("patient_id", INF_MAX)]
-        rows: list[dict[str, Any]] = []
-        next_start = start
-        while next_start is not None:
-            consumed, next_start, row_list, _ = self._get_client().get_range(
-                table, "FORWARD", next_start, end, limit=200)
-            for row in row_list:
-                pk_dict = {}
-                for k, v in row.primary_key:
-                    pk_dict[k] = v.decode() if isinstance(v, bytes) else v
-                attrs_dict = {name: value for name, value, _ in row.attribute_columns}
-                rows.append({"pk": pk_dict, "attrs": attrs_dict})
-        return rows
-
-    @staticmethod
-    def _json_col(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False)
 
     # ---- 饮食日记（全量 entries ↔ 按患者分片）----
 
@@ -374,7 +219,7 @@ class TablestoreRepository:
         """全量读取全部患者日记（N-MEM-2：仅跨患者聚合场景；业务单患者主路径
         必须用 load_patient_diary 行级读，勿全表扫描）。"""
         entries: list[dict[str, Any]] = []
-        for item in self._range_all(TABLE_FOOD_DIARY):
+        for item in self._range_all(TABLE_FOOD_DIARY, ["patient_id"]):
             raw = item["attrs"].get("entries")
             if isinstance(raw, str):
                 try:
@@ -444,7 +289,7 @@ class TablestoreRepository:
         """全量读取（N-MEM-3：仅跨患者聚合/迁移场景；业务单患者主路径用
         load_patient_pew 行级读，勿全表扫描）。"""
         store: dict[str, Any] = {}
-        for item in self._range_all(TABLE_PEW_HISTORY):
+        for item in self._range_all(TABLE_PEW_HISTORY, ["patient_id"]):
             pid = item["pk"].get("patient_id")
             raw = item["attrs"].get("points")
             if pid is None:
@@ -512,36 +357,15 @@ def _now_iso() -> str:
 
 
 def ensure_tablestore_tables() -> None:
-    """创建/校验 Tablestore 表（幂等，仅建缺失表）。"""
-    from tablestore import (CapacityUnit, Condition, OTSClient,
-                            ReservedThroughput, RowExistenceExpectation,
-                            TableMeta, TableOptions)
-
-    endpoint = os.environ[OTS_ENDPOINT_ENV]
-    instance = os.environ[OTS_INSTANCE_ENV]
-    ak = os.environ[OTS_AK_ID_ENV]
-    sk = os.environ[OTS_AK_SECRET_ENV]
-    client = OTSClient(endpoint, ak, sk, instance)
-    existing = set(client.list_table())
-
-    def _create(table_name: str, pk_schema: list[tuple[str, str]]) -> None:
-        if table_name in existing:
-            return
-        meta = TableMeta(table_name, pk_schema)
-        options = TableOptions(time_to_live=-1, max_version=1)
-        throughput = ReservedThroughput(capacity_unit=CapacityUnit(0, 0))
-        client.create_table(meta, options, throughput)
-        logger.info("[ensure] 已创建表 %s", table_name)
-
-    _create(TABLE_FOOD_DIARY, [("patient_id", "STRING")])
-    _create(TABLE_PEW_HISTORY, [("patient_id", "STRING")])
-    logger.info("[ensure] Tablestore 表就绪：%s",
-                sorted(existing | {TABLE_FOOD_DIARY, TABLE_PEW_HISTORY}))
+    """创建/校验 Tablestore 表（幂等，仅建缺失表；2026-08-15 收敛到 storage.ensure_tables）。"""
+    TablestoreBase().ensure_tables({
+        TABLE_FOOD_DIARY: [("patient_id", "STRING")],
+        TABLE_PEW_HISTORY: [("patient_id", "STRING")],
+    })
 
 
-# P2 修复（2026-08-13）：repository 实例按 backend 缓存——此前每请求 new
-# TablestoreRepository（各自 _client=None 惰性建连 → 每请求新建 OTSClient 连接，
-# 与注释自称"单例"不符）。缓存后首请求建连、后续复用（align care _REPO_CACHE）。
+# 后端实例缓存（C3 修复，2026-08-14）：按 backend 缓存 Repository 实例——此前每请求
+# 新建 OTSClient 连接池（与注释自称"单例"不符）。缓存后首请求建连、后续复用。
 _REPO_CACHE: dict[str, Any] = {}
 _REPO_CACHE_LOCK = threading.Lock()
 
@@ -550,6 +374,9 @@ def get_repository() -> NutritionRepository:
     """按环境变量选择后端：缺省 tablestore（生产）；显式 json（本地开发/测试）。
     实例按 backend 缓存（P2：防每请求重复建 OTSClient）。"""
     backend = os.environ.get(STORAGE_BACKEND_ENV, "tablestore").strip().lower()
+    if backend == "json":
+        # 生产护栏（2026-08-15）：json 后端仅限显式确认（A207_ACCEPT_DEV_STORAGE=1）
+        ensure_json_backend_allowed()  # 未确认即抛 RuntimeError（fail-closed）
     repo = _REPO_CACHE.get(backend)
     if repo is None:
         with _REPO_CACHE_LOCK:  # double-check 防并发首调重复构建
