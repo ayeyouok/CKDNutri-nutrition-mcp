@@ -286,10 +286,48 @@ def test_low5_negative_grams_rejected():
     assert fooddb.scale_nutrients(row, 100)["potassium_mg"] >= 0
 
 
+
+
+
+def test_s3_food_diary_content_idempotent():
+    """S-3（2026-08-15）：upsert_food_diary (date+meal+food) **内容幂等**。
+
+    此前无条件 `existing + stamped` 追加（每次新 uuid4 entry_id），家长弱网重试
+    同一顿饭 → 两行，day_count/均值失真。现按内容键合并：同 date+meal+food
+    已存在 → 本次值替换该条目（保留原 entry_id），否则新增。
+    """
+    from CKDNutri_nutrition_mcp import core
+
+    pid = "P0999"  # 专用测试患者，避免污染既有数据
+    meal = {"date": "2026-08-01", "meal": "午餐", "food": "米饭",
+            "energy_kcal": 200, "protein_g": 4.0, "potassium_mg": 30,
+            "phosphorus_mg": 20, "sodium_mg": 1}
+    r1 = core.upsert_food_diary(pid, entries=[dict(meal)])
+    assert r1["ok"] is True, r1
+    # 弱网重试：同 (date+meal+food)，值微调（能量 200→250）
+    retry = dict(meal)
+    retry["energy_kcal"] = 250
+    r2 = core.upsert_food_diary(pid, entries=[retry])
+    assert r2["ok"] is True, r2
+    # 存储仅 1 条、值取最后一次（幂等更新非追加）
+    store = core._load_patient_store(pid)
+    entries = store.get("entries", [])
+    same = [e for e in entries
+            if e.get("date") == "2026-08-01" and e.get("meal") == "午餐"
+            and e.get("food") == "米饭"]
+    assert len(same) == 1, f"同餐重试应幂等（只 1 条），实际 {len(same)} 条: {same}"
+    assert same[0]["energy_kcal"] == 250, same
+    # 不同日期/餐次 → 正常新增
+    r3 = core.upsert_food_diary(pid, entries=[dict(meal, date="2026-08-02")])
+    assert r3["ok"] is True and len(core._load_patient_store(pid).get("entries", [])) == 2
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn()
     print(f"NS2-NS6/NB8 REGRESSION OK（{len(fns)} 个用例）")
+
+
 
 

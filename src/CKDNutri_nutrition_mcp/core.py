@@ -937,7 +937,7 @@ def upsert_food_diary(
         stamped = []
         for e in entries:
             # BUG-60：写入前归一化日期（容忍 YYYY-M-D / YYYY/M/D 等变体，非法日期显式拒绝）
-            raw_date = e.get("date") or datetime.now().strftime("%Y-%m-%d")
+            raw_date = e.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")  # C1（2026-08-15）：日记业务日期统一 UTC——此前 datetime.now() 本地 naive，与同库 recorded_at(UTC) 不一致，跨时区部署（UTC+8 等）行为漂移
             # N-S4 修复（2026-08-14）：写路径营养键有限性校验（fail-closed）——
             # 此前 float() 直接转换，NaN/Inf 可静默落库（读路径比较恒 False →
             # assess_intake_vs_target 误判 e_status="ok"），与 P0-7 读路径同口径。
@@ -970,7 +970,31 @@ def upsert_food_diary(
                 "phosphorus_mg": numeric["phosphorus_mg"],
                 "sodium_mg": numeric["sodium_mg"],
             })
-        all_entries = existing + stamped
+        # S-3（2026-08-15）：(date+meal+food) 内容幂等——此前无条件 `existing + stamped`
+        # 追加（每次新 uuid4 entry_id），家长弱网重试同一顿饭 → 两行，day_count/均值
+        # 失真。现按内容键合并：同 date+meal+food 已存在 → 用本次值**替换**该条目
+        # （幂等更新，保留原 entry_id），否则新增。多条目同键取最后一条（后写者意图）。
+        content_key = lambda e: (e.get("date"), e.get("meal") or "", e.get("food") or "")
+        newest = {}
+        for e in stamped:
+            newest[content_key(e)] = e
+        merged: list[dict] = []
+        seen: set = set()
+        for e in existing:
+            k = content_key(e)
+            if k in newest:
+                if k not in seen:           # 同键旧条目被本次值替换（保留原 entry_id）
+                    repl = dict(newest[k])
+                    repl["entry_id"] = e.get("entry_id") or newest[k]["entry_id"]
+                    merged.append(repl)
+                    seen.add(k)
+            else:
+                merged.append(e)
+        for k, e in newest.items():         # 新键条目追加
+            if k not in seen:
+                merged.append(e)
+                seen.add(k)
+        all_entries = merged
 
         if write_mode:
             # N-MEM-2：患者级写（只写该患者行，行级 _rev 乐观锁）
