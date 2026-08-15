@@ -38,12 +38,45 @@ _FOODS_LOCK = threading.Lock()
 
 
 def _load_foods() -> list[dict]:
+    """加载食谱食物集——**数值单一权威源 = food_data.csv**（H2/H3 修复，2026-08-15）。
+
+    foods_ckd.json 只保留名单/分类/素食标记/加工状态（csv_name 指向 CSV 精确行）；
+    能量/蛋白/钾/磷/钠全部经 find_food(csv_name) 取自 food_data.csv——与日记侧
+    （diary.py 同样经 find_food）**同一数据源**，食谱与日记数值天然一致，杜绝
+    "食谱 864 kcal vs 日记 649 kcal"式双源漂移。
+
+    csv_name 解析失败即 fail-fast（数据配置错误，不静默跳过——食谱会少一种食物）。
+    """
     global _FOODS
     if _FOODS is None:
         with _FOODS_LOCK:
             if _FOODS is None:  # S3：防多线程首调重复 I/O
+                from .fooddb import find_food
+
                 with open(_FOODS_PATH, "r", encoding="utf-8") as fh:
-                    _FOODS = json.load(fh)["foods"]
+                    spec = json.load(fh)["foods"]
+                merged: list[dict] = []
+                for f in spec:
+                    csv_name = f.get("csv_name") or f["name"]
+                    row = find_food(csv_name)
+                    if row is None:
+                        raise ValueError(
+                            f"foods_ckd.json 食物 {f['name']!r}（csv_name={csv_name!r}）"
+                            "无法在 food_data.csv 解析——H2 修复要求每项必须映射到"
+                            "CSV 精确行，请修正 csv_name")
+                    merged.append({
+                        "name": f["name"],
+                        "cat": f["cat"],
+                        "veg": bool(f.get("veg")),
+                        "state": f.get("state", "raw"),
+                        # 数值全部取自 CSV 权威行（per-100g 口径，与日记侧一致）
+                        "energy_per_100g": row["energy_kcal"],
+                        "protein_per_100g": row["protein_g"],
+                        "potassium_per_100g": row["potassium_mg"],
+                        "phosphorus_per_100g": row["phosphorus_mg"],
+                        "sodium_per_100g": row["sodium_mg"],
+                    })
+                _FOODS = merged
     return _FOODS
 
 

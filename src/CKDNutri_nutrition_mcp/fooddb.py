@@ -84,8 +84,21 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                 # 误当"无钾"会低估全天钾摄入。缺失格仍按 0 参与数值计算（保持下游
                 # 契约不变），但记录 missing_nutrients 标记，由 food_warnings /
                 # sum_diet_intake 显式提示"数据缺失按 0 计，请谨慎"。
-                row["missing_nutrients"] = [k for k in NUTRIENT_KEYS
-                                             if not (raw.get(k) or "").strip()]
+                # H1（2026-08-15）：缺失判定升级——字面 0.0 也是缺失信号（真实食物
+                # 钾/磷/钠/钙不可能同时为 0，68 行四电解质全 0 是 CSV 数据缺失而非
+                # 真实零值）。仅"四电解质全 0/空"判缺失；单列钠=0 不判（谷物/天然
+                # 食材低钠是成分表正常标注，51% 钠 0 属正常分布）。
+                _raw_k = (raw.get("potassium_mg") or "").strip()
+                _raw_p = (raw.get("phosphorus_mg") or "").strip()
+                _raw_na = (raw.get("sodium_mg") or "").strip()
+                _raw_ca = (raw.get("calcium_mg") or "").strip()
+                if all(v in ("", "0", "0.0")
+                       for v in (_raw_k, _raw_p, _raw_na, _raw_ca)):
+                    row["missing_nutrients"] = ["potassium_mg", "phosphorus_mg",
+                                                "sodium_mg", "calcium_mg"]
+                else:
+                    row["missing_nutrients"] = [k for k in NUTRIENT_KEYS
+                                                 if not (raw.get(k) or "").strip()]
                 row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
                 row["phosphorus_level"], row["phosphorus_label"] = classify(row["phosphorus_mg"], P_LEVELS)
                 row["sodium_high"] = row["sodium_mg"] >= NA_HIGH_MG_PER_100G

@@ -80,7 +80,7 @@ def main():
 
 @mcp.tool
 def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = True,
-                           guardian_token: str = "") -> dict[str, Any]:
+                           guardian_token: Optional[str] = None) -> dict[str, Any]:
     """写入每日饮食日记。家长/医生可写，家长须携带 guardian_token 完成患儿绑定。
 
     entries 每项：{date, meal, food, energy_kcal, protein_g, potassium_mg, phosphorus_mg, sodium_mg}
@@ -92,7 +92,7 @@ def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = Tr
 
 
 @mcp.tool
-def get_food_diary_summary_tool(patient_id: str, guardian_token: str = "") -> dict[str, Any]:
+def get_food_diary_summary_tool(patient_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
     """查最近饮食日记脱敏摘要（含最近 3 日均值 diet_diary_3d）。家长须携带 guardian_token。"""
     try:
         return get_food_diary_summary(patient_id, guardian_token)

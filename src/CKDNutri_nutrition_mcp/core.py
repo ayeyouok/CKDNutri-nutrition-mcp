@@ -1257,12 +1257,25 @@ def calc_growth_zscore(age_years: float, sex: str,
     # BUG-60：负年龄显式拒绝——此前会按 0 月边界钳位算出无临床意义的 Z 分
     if age_years < 0:
         raise ValueError("age_years 不能为负")
+    # #4（2026-08-15，G-6 残留）：可选参数 NaN/Inf 有限性校验——此前仅
+    # `<=0`/`>250` 比较，NaN 不满足任何比较直接穿透（height_cm=nan → z=nan
+    # 静默返回"normal"生长判定，且 NaN 随信封输出非法 JSON）。P4 有 _require_finite
+    # 全拦，P2 是唯一 fail-open 点，此处补齐（对齐 calc_prnt_targets 的 _require）。
+    for _name, _val in (("height_cm", height_cm), ("weight_kg", weight_kg),
+                        ("bmi", bmi)):
+        if _val is not None and (isinstance(_val, bool)
+                                 or not isinstance(_val, (int, float))):
+            raise ValueError(f"{_name} 必须为数值，收到 {_val!r}")
+        if isinstance(_val, float) and (_val != _val or _val in (float("inf"), float("-inf"))):
+            raise ValueError(f"{_name} 必须为有效的有限数值，收到 {_val!r}")
     # Code Smells-15（2026-08-12）：身高/体重必须为正——此前 height_cm=0 会算出
     # (0-中位数)/SD 的 -26 级荒谬 Z 分，静默返回"生长迟缓"误导临床。
     if height_cm is not None and height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
     if weight_kg is not None and weight_kg <= 0:
         raise ValueError("weight_kg 必须 > 0")
+    if bmi is not None and bmi <= 0:
+        raise ValueError("bmi 必须 > 0")
     # BUG-63（2026-08-12）：生理学合理上界——过高/过重（录入错误）会算出荒谬 Z 分
     # （如 300cm → Z≈+26 判"上"）；**不做下限收紧**（早产儿 40-45cm 合法，下限保持 >0）。
     if height_cm is not None and height_cm > 250:

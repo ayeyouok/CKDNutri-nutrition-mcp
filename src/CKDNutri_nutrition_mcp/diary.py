@@ -116,6 +116,15 @@ def sum_diet_intake(diary: list[dict[str, Any]],
             unmatched.append({"index": index, "food": name, "reason": reason})
             continue
         grams = entry.get("grams") or entry.get("weight_g")
+        # #3（2026-08-15）：数值字符串（如 "150"）不得静默按 1 份计——此前仅
+        # isinstance(int/float) 走克重，str 数字掉进 parse_portion(None) 按"1 份"
+        # 折算（如 150g 苹果算成 1 份≈100g，摄入量低估 33% 且无告警）。
+        if isinstance(grams, str):
+            grams = grams.strip()
+            try:
+                grams = float(grams)
+            except ValueError:
+                grams = None
         if isinstance(grams, (int, float)) and grams > 0:
             grams = float(grams)
             basis = f"按输入克重 {grams:.0f} g"

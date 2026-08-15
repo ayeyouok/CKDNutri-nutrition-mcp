@@ -248,8 +248,13 @@ def test_med1_missing_nutrients_flag():
 
     rows = fooddb.load_foods()
     assert rows, "食物表为空"
-    assert all(row.get("missing_nutrients") == [] for row in rows), \
-        "当前 CSV 应无缺失格（全部有值），若有请先修数据"
+    # H1（2026-08-15）：四电解质全 0 行（68 行）现被正确标记缺失——断言放宽为
+    # "标记的行确实四电解质全 0/空"，而非"全部无缺失"
+    missing_rows = [r for r in rows if r.get("missing_nutrients")]
+    assert missing_rows, "应存在被标记的缺失行（H1 四电解质全 0 检测）"
+    for r in missing_rows:
+        for k in ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg"):
+            assert r[k] in (0, 0.0), (r["name"], k, r[k])
 
     # 构造缺失行验证提示路径
     fake = dict(rows[0])
