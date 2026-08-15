@@ -231,7 +231,7 @@
    "phosphorus_per_100g": 250,
    "sodium_per_100g": 200,
    "state": "raw",
-   "csv_name": "豆腐丝（干）"
+   "csv_name": "乳清蛋白粉"
   },
   {
    "name": "白菜",
@@ -387,7 +387,7 @@
    "phosphorus_per_100g": 12,
    "sodium_per_100g": 1,
    "state": "raw",
-   "csv_name": "草莓"
+   "csv_name": "蓝莓"
   },
   {
    "name": "植物油",

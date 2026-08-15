@@ -277,9 +277,22 @@ def generate_meal_plan(
             # sg 估算 K+P（sg*(K+P)/100），蛋白源却用 100g 绝对含量（100*(K+P)/100），
             # 阈值口径不一致（蛋白源只吃 50g 却按 100g 含量比），选品会系统性
             # 偏向高钾磷品种。现统一按「目标蛋白 40% 配额折算的实际克重」估算。
-            pg = max(10, round(prot_staple_quota / max(cand["protein_per_100g"], 0.1) * 100))
+            # P2-2（2026-08-15）：闸门与实际执行口径再统一——实际分配是「剩余补差」
+            # （目标蛋白 − 主食蛋白 ≈40% 配额 − 蔬果蛋白 ≈2g → 剩余 ≈60% 目标蛋白），
+            # 此前闸门按 40% 配额估克重，K+P 闸门系统性偏松 ~1.5 倍（选中品种实际
+            # 贡献 ≈ 估计的 1.5 倍）。改用实际补差口径估计。
+            prot_est_protein = max(1.0, target_protein_g * 0.60 - 2.0)
+            pg = max(10, round(prot_est_protein / max(cand["protein_per_100g"], 0.1) * 100))
             est_kp = pg * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
-            if est_kp <= (target_k_mg + target_p_mg) * 0.35 or offset == len(prot_pool) - 1:
+            # P2-3（2026-08-15）：蛋白源选品加钠考量——此前只按 K+P 选品，高钠蛋白源
+            # （如虾仁 Na=429/100g）被选中，单日钠可达 900mg+ 且钠无任何约束。
+            # 按同口径克重估钠，目标钠的 35% 闸门（target_na_mg<=0 时跳过，无钠目标不约束）。
+            na_ok = True
+            if target_na_mg > 0:
+                est_na = pg * cand["sodium_per_100g"] / 100
+                na_ok = est_na <= target_na_mg * 0.35
+            if (est_kp <= (target_k_mg + target_p_mg) * 0.35 and na_ok) \
+                    or offset == len(prot_pool) - 1:
                 prot = cand
                 break
         veg = veg_pool[d % len(veg_pool)]

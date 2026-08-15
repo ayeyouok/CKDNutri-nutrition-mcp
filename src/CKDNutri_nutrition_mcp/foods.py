@@ -219,13 +219,17 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
         # BUG-60（2026-08-12）：钾/磷约束改为"每千卡密度"口径。原按每 100g 静态含量过滤，
         # 低能量密度替代品等能量缩放后克数放大，总钾/总磷会反超原食物（实测 豆腐→鹅蛋
         # 等能量 104g 时 K 74→77）。按密度折算后，"等能量替换且钾、磷不更高"才真正成立。
+        # P2 其余（2026-08-15）：钠同口径加入——限钠患儿等能量平替若钠密度反升
+        # （如换成加工品）会静默升高全天钠摄入，与钾磷同规则约束。
         k_density_row = row["potassium_mg"] / base
         p_density_row = row["phosphorus_mg"] / base
+        na_density_row = row["sodium_mg"] / base
         candidates = [item for item in pool
                       if item["energy_kcal"] > 0   # BUG-59：显式排除零能量项
                       and abs(item["energy_kcal"] - base) / base <= 0.30
                       and item["potassium_mg"] / item["energy_kcal"] <= k_density_row
-                      and item["phosphorus_mg"] / item["energy_kcal"] <= p_density_row]
+                      and item["phosphorus_mg"] / item["energy_kcal"] <= p_density_row
+                      and item["sodium_mg"] / item["energy_kcal"] <= na_density_row]
         candidates.sort(key=lambda item: (abs(item["energy_kcal"] - base), -item["protein_g"]))
         rationale = "同食物角色内能量接近（±30%）且按能量密度折算后钾、磷总量不更高的食物，便于等能量平替"
     else:

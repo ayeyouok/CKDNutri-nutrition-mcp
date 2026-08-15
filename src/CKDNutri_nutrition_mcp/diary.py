@@ -194,6 +194,12 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     if unmatched:
         data["warnings"] = [f"有 {len(unmatched)} 条未匹配，汇总值偏低，"
                             f"请补录后重算再做临床判断。"]
+    # P2 其余（2026-08-15）：不足 3 日日记显式警告——1-2 天样本的日均值/磷蛋白比
+    # 代表性弱，此前静默输出误导临床判断（评估类工具可能直接消费日均值）。
+    if day_count < 3:
+        data["warnings"] = (data.get("warnings") or []) + [
+            f"日记仅 {day_count} 天（不足 3 天），日均值与磷蛋白比参考性有限，"
+            "建议补足 3 天以上再作临床判断。"]
     # v2.4 工具收敛：磷蛋白比（PNPR）作为汇总派生字段输出（原 calc_pnpr 独立工具下沉）。
     avg_protein = average.get("protein_g", 0.0)
     avg_phosphorus = average.get("phosphorus_mg", 0.0)

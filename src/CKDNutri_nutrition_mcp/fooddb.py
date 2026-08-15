@@ -283,11 +283,19 @@ def scale_nutrients(row: dict[str, Any], grams: float,
         raise ValueError(f"grams 不能为负（收到 {grams}）——负克重通常是录入错误")
     ratio = grams / 100.0
     method = COOKING_ALIAS.get((cooking or "").strip(), (cooking or "raw").strip())
+    cooking_note: str | None = None
     if method not in COOKING_LOSS:
+        # P2 其余（2026-08-15）：未知 cooking 静默回落 raw（系数 1.0，如"蒸"被当生食
+        # 算）会高估钾磷实际摄入——回落保留（数值契约）但显式标记，供日记层提示。
+        cooking_note = (f"烹调方式「{cooking}」不在受支持集合"
+                        f"（{'/'.join(COOKING_LOSS)}），已按生食（raw，保留系数 1.0）计算，"
+                        "请核实输入")
         method = "raw"
     factors = COOKING_LOSS[method]["factor"]
     out: dict[str, Any] = {"grams": round(grams, 1), "cooking": method,
                            "cooking_label": COOKING_LOSS[method]["label"]}
+    if cooking_note:
+        out["cooking_warning"] = cooking_note
     for key in NUTRIENT_KEYS:
         out[key] = round(row[key] * ratio * factors.get(key, 1.0), 2)
     return out

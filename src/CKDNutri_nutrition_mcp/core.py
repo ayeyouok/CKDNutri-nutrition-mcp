@@ -370,6 +370,11 @@ def calc_prnt_targets(
     if growth_status not in ("normal", "failure", "overweight"):
         raise ValueError(
             f"growth_status 必须是 normal / failure / overweight 之一，收到：{growth_status!r}")
+    # P2 其余（2026-08-15）：ckd_stage 零校验（fail-open）——此前传 0/6/99 任意整数
+    # 都静默计算（stage 1 警告兜底），超出 1-5 的录入错误被当作有效分期。补范围校验
+    # （PRNT 2020 覆盖 CKD 2-5D；1 为沿用，<1/>5 拒绝）。
+    if not isinstance(ckd_stage, int) or isinstance(ckd_stage, bool) or not (1 <= ckd_stage <= 5):
+        raise ValueError(f"ckd_stage 必须是 1-5 的整数（PRNT 2020 覆盖 1-5），收到：{ckd_stage!r}")
     if vegetarian_mode not in _VEG_MULT:
         raise ValueError(
             f"vegetarian_mode 必须是 mixed / ovo_lacto / vegan 之一（lacto_ovo 与 ovo_lacto "
