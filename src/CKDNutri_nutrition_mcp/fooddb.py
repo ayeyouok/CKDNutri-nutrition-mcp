@@ -80,6 +80,12 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                 }
                 for key in NUTRIENT_KEYS:
                     row[key] = _to_float(raw.get(key))
+                # MED-1（2026-08-15）：缺失营养素不得静默当 0——CKD 患者把"未知钾"
+                # 误当"无钾"会低估全天钾摄入。缺失格仍按 0 参与数值计算（保持下游
+                # 契约不变），但记录 missing_nutrients 标记，由 food_warnings /
+                # sum_diet_intake 显式提示"数据缺失按 0 计，请谨慎"。
+                row["missing_nutrients"] = [k for k in NUTRIENT_KEYS
+                                             if not (raw.get(k) or "").strip()]
                 row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
                 row["phosphorus_level"], row["phosphorus_label"] = classify(row["phosphorus_mg"], P_LEVELS)
                 row["sodium_high"] = row["sodium_mg"] >= NA_HIGH_MG_PER_100G
@@ -255,7 +261,14 @@ def scale_nutrients(row: dict[str, Any], grams: float,
     供展示/参考，不参与缩放——**调用方传入的 grams 一律按可食部克重理解**（家长量具
     换算 unit_grams 亦按可食部定义）。带皮带骨/带壳重量需调用方自行换算，避免高估。
     """
-    ratio = max(grams, 0.0) / 100.0
+    # LOW-5（2026-08-15）：负克重不得静默归 0——此前 max(grams, 0.0) 把录入错误
+    # （如 -50g）当 0 克处理，产出"本次 0 营养"的假安全结果。显式拒绝（INVALID_INPUT
+    # 语义），调用方（diary/foods）在入口已有克重校验，此处为第二道防线。
+    if not isinstance(grams, (int, float)):
+        raise ValueError(f"grams 必须为数值，收到 {grams!r}")
+    if grams < 0:
+        raise ValueError(f"grams 不能为负（收到 {grams}）——负克重通常是录入错误")
+    ratio = grams / 100.0
     method = COOKING_ALIAS.get((cooking or "").strip(), (cooking or "raw").strip())
     if method not in COOKING_LOSS:
         method = "raw"
@@ -292,6 +305,16 @@ def food_card(row: dict[str, Any]) -> dict[str, Any]:
 def food_warnings(row: dict[str, Any], scaled: dict[str, Any] | None = None) -> list[str]:
     """生成钾/磷/钠/磷蛋白比的可解释警示文案。"""
     notes: list[str] = []
+    # MED-1（2026-08-15）：缺失营养素显式提示——CKD 患者把"未知钾"误当"无钾"
+    # 会低估全天摄入，警示不触发。缺失格数值按 0 计，但必须告诉使用者谨慎。
+    missing = row.get("missing_nutrients") or []
+    if missing:
+        labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
+                  "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
+                  "fat_g": "脂肪", "carb_g": "碳水"}
+        names = "、".join(labels[k] for k in missing if k in labels)
+        notes.append(f"{row['name']} 的 {names} 数据缺失（当前按 0 计），"
+                     "该食物此项摄入可能被低估，请谨慎使用/人工补充数据。")
     if row["potassium_level"] in ("high", "very_high"):
         text = (f"高钾食物：{row['name']} 每 100 g 含钾 {row['potassium_mg']:.0f} mg"
                 f"（分级 {row['potassium_level']}）。")

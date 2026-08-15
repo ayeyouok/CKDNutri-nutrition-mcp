@@ -96,6 +96,8 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     # 否则与写入路径（_normalize_date fail-closed 拒绝）行为割裂，用户算出一版
     # "能算但存不进"的结果，跨天统计被静默拆散。
     bad_dates: list[str] = []
+    # MED-1（2026-08-15）：缺失营养素食物汇总提示（按 0 计会低估全天摄入）
+    missing_foods: list[str] = []
 
     for index, entry in enumerate(diary):
         if not isinstance(entry, dict):
@@ -139,6 +141,14 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                               "basis": basis,
                               **{key: scaled[key] for key in
                                  ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg")}})
+        # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
+        # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
+        if row.get("missing_nutrients"):
+            _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
+                       "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
+                       "fat_g": "脂肪", "carb_g": "碳水"}
+            missing_foods.append(
+                f"「{row['name']}」（缺 {'、'.join(_labels.get(k, k) for k in row['missing_nutrients'])}）")
 
     if not contributions:
         return {"ok": False, "error": "NO_MATCHED_ITEM",
@@ -191,6 +201,14 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         data["warnings"] = (data.get("warnings") or []) + [
             f"{len(bad_dates)} 条记录日期无法归一化为 YYYY-MM-DD（如 {bad_dates[0]!r}），"
             "已按原样分桶，跨天统计可能被拆散；请使用 YYYY-MM-DD 格式。"]
+    # MED-1（2026-08-15）：缺失营养素食物汇总提示——缺项按 0 计会低估全天钾/磷，
+    # CKD 患儿限钾限磷场景下该低估直接影响临床判断，必须显式警示。
+    if missing_foods:
+        data["warnings"] = (data.get("warnings") or []) + [
+            f"{len(missing_foods)} 种食物存在营养数据缺失（按 0 计，可能低估贡献）："
+            + "；".join(missing_foods[:5])
+            + ("；等" if len(missing_foods) > 5 else "")
+            + "。请谨慎解读汇总，或人工补充数据后重算。"]
     if target:
         # 五审（2026-08-13）：先归一化 PRNT 信封（{ok,data} 嵌套）——此前直接透传
         # 导致目标对照静默为空（achievement.items=[]）。兼容扁平简表不受影响。

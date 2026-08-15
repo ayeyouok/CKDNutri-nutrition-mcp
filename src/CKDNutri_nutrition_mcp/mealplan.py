@@ -240,7 +240,12 @@ def generate_meal_plan(
         prot = None
         for offset in range(len(prot_pool)):
             cand = prot_pool[(d + offset) % len(prot_pool)]
-            est_kp = 100 * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
+            # LOW-8（2026-08-15）：蛋白源预计克重与主食同基准——此前主食按实际克重
+            # sg 估算 K+P（sg*(K+P)/100），蛋白源却用 100g 绝对含量（100*(K+P)/100），
+            # 阈值口径不一致（蛋白源只吃 50g 却按 100g 含量比），选品会系统性
+            # 偏向高钾磷品种。现统一按「目标蛋白 40% 配额折算的实际克重」估算。
+            pg = max(10, round(prot_staple_quota / max(cand["protein_per_100g"], 0.1) * 100))
+            est_kp = pg * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
             if est_kp <= (target_k_mg + target_p_mg) * 0.35 or offset == len(prot_pool) - 1:
                 prot = cand
                 break

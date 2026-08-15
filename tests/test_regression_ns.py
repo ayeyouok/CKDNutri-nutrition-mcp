@@ -238,8 +238,53 @@ def test_med_gr1_piecewise_z():
     print("MED-GR-1 PIECEWISE Z OK")
 
 
+def test_med1_missing_nutrients_flag():
+    """MED-1（2026-08-15）：缺失营养素不得静默当 0——打 missing_nutrients 标记，
+    food_warnings 与 sum_diet_intake 显式提示（CKD 患儿钾/磷低估风险）。"""
+    from unittest import mock
+
+    from CKDNutri_nutrition_mcp import diary, fooddb
+    from CKDNutri_nutrition_mcp.foods import food_warnings
+
+    rows = fooddb.load_foods()
+    assert rows, "食物表为空"
+    assert all(row.get("missing_nutrients") == [] for row in rows), \
+        "当前 CSV 应无缺失格（全部有值），若有请先修数据"
+
+    # 构造缺失行验证提示路径
+    fake = dict(rows[0])
+    fake["missing_nutrients"] = ["potassium_mg", "sodium_mg"]
+    fake["name"] = "测试食物X"
+    w = food_warnings(fake)
+    assert any("数据缺失" in x and "钾" in x for x in w), w
+
+    with mock.patch.object(diary, "find_food", return_value=fake):
+        res = diary.sum_diet_intake([{"food": "测试食物X", "grams": 100}])
+    assert res["ok"] is True, res
+    warns = res["data"].get("warnings") or []
+    assert any("缺失" in x and "钾" in x for x in warns), warns
+
+
+def test_low5_negative_grams_rejected():
+    """LOW-5（2026-08-15）：scale_nutrients 负克重拒绝（此前 max(grams,0) 静默归 0
+    产出假安全结果）；0 克合法。"""
+    from CKDNutri_nutrition_mcp import fooddb
+
+    row = fooddb.load_foods()[0]
+    try:
+        fooddb.scale_nutrients(row, -50)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("负克重应抛 ValueError（INVALID_INPUT 语义）")
+    assert fooddb.scale_nutrients(row, 0)["grams"] == 0.0
+    assert fooddb.scale_nutrients(row, 100)["potassium_mg"] >= 0
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn()
     print(f"NS2-NS6/NB8 REGRESSION OK（{len(fns)} 个用例）")
+
+
