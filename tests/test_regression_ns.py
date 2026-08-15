@@ -189,6 +189,55 @@ def test_low3_pew_score_finite():
         assert math.isfinite(r["data"]["points"][0]["score"]), r
 
 
+def test_med_gr1_piecewise_z():
+    """MED-GR-1（2026-08-15）：国标附录 B 非均匀 SD——7 界值分段插值。
+
+    旧实现 z=(x-m)/s 用单一 SD 外推，在 ±2SD/±3SD 系统性偏差可致营养等级错判：
+    - 81 月男童 BMI 权威界值 12.1/-2=13.0/-1=14.1/中=15.4/+1=17.2/+2=19.7/+3=23.3，
+      +2SD→+3SD 间距 3.6 vs −3SD→−2SD 间距 0.9（差 4 倍）；旧算法 BMI=19.7 会算
+      z=(19.7-15.4)/1.55≈2.77 判"肥胖"，而 19.7 恰是 +2SD 应判"超重"。
+    - 6 月男童体重 6.1/-2=6.8/-1=7.6/中=8.4/+1=9.4/+2=10.5/+3=11.7。
+    修复后：界值点精确对应整数 Z，区间内线性插值。
+    """
+    from CKDNutri_nutrition_mcp import core
+
+    def _near(a, b, tol=0.01):
+        assert abs(a - b) <= tol, f"{a} vs {b}"
+
+    # 81 月男童 BMI：7 界值点 → z 精确整数
+    for bmi_val, exp_z in ((12.1, -3), (13.0, -2), (14.1, -1), (15.4, 0),
+                           (17.2, 1), (19.7, 2), (23.3, 3)):
+        r = core.calc_growth_zscore(age_years=81 / 12, sex="M", bmi=bmi_val)
+        _near(r["data"]["baz"]["z"], exp_z, tol=0.005)
+
+    # 关键错判场景：BMI=19.0（<+2SD=19.7 → 超重，旧算法 z≈2.32 误判肥胖）
+    r = core.calc_growth_zscore(age_years=81 / 12, sex="M", bmi=19.0)
+    assert r["data"]["baz"]["nutrition"] == "超重", r["data"]["baz"]
+    # BMI=23.0（<+3SD=23.3 → 肥胖，旧算法 z≈4.9 误判重度肥胖）
+    r = core.calc_growth_zscore(age_years=81 / 12, sex="M", bmi=23.0)
+    assert r["data"]["baz"]["nutrition"] == "肥胖", r["data"]["baz"]
+
+    # 6 月男童体重：-3SD=6.1 → z=-3.0 恰在界值 → "低体重"（国标表3：<−3SD 才重度）
+    r = core.calc_growth_zscore(age_years=0.5, sex="M", weight_kg=6.1)
+    _near(r["data"]["waz"]["z"], -3.0, tol=0.005)
+    assert r["data"]["waz"]["nutrition"] == "低体重", r["data"]["waz"]
+    # 6.0（<-3SD=6.1）→ 重度低体重（旧算法 z=(6.0-8.4)/0.9=-2.67 误判低体重）
+    r = core.calc_growth_zscore(age_years=0.5, sex="M", weight_kg=6.0)
+    assert r["data"]["waz"]["nutrition"] == "重度低体重", r["data"]["waz"]
+
+    # 区间内线性：81 月 BMI 16.3（15.4↔17.2 中点）→ z≈0.5
+    r = core.calc_growth_zscore(age_years=81 / 12, sex="M", bmi=16.3)
+    _near(r["data"]["baz"]["z"], 0.5, tol=0.005)
+
+    # 7-18 身高：WS/T 612 表 A.1 男 7 岁五界值 → z 精确整数（等距 s=5.99 构造）
+    for h_cm, exp_z in ((113.51, -2), (119.49, -1), (125.48, 0),
+                        (131.47, 1), (137.46, 2)):
+        r = core.calc_growth_zscore(age_years=7, sex="M", height_cm=h_cm)
+        _near(r["data"]["haz"]["z"], exp_z, tol=0.01)
+
+    print("MED-GR-1 PIECEWISE Z OK")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

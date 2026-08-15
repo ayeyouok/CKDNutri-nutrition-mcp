@@ -1061,22 +1061,86 @@ def _load_growth_ref() -> dict:
 
 
 def _interp_sd(table: list, age_key: float):
-    """table: 按 age_key 升序的 [age_key, m, s]；线性插值返回 (m, s)。越界则取端点。"""
-    if not table:
+    """兼容包装：按 age_key 线性插值返回 (中位数 m, ±1SD 平均 s)。越界取端点。
+
+    table 行支持两种格式：
+    - 旧 3 列 [age, m, s]（height_7_18 沿用，WS/T 612 5 界值等距）
+    - 新 8 列 [age, n3, n2, n1, m, p1, p2, p3]（WS/T 423 附录 B 7 界值，
+      MED-GR-1（2026-08-15）：国标 SD 分布非均匀，单一 s 外推 ±2SD/±3SD 会
+      系统性错判营养等级，必须存全 7 界值）
+    s 取 ±1SD 平均（=(p1−n1)/2），仅用于展示字段，判定一律走 _z_from_bands。
+    """
+    bands = _interp_bands(table, age_key)
+    if bands is None:
         return None, None
+    n1, m, p1 = bands[2], bands[3], bands[4]
+    return m, round((p1 - n1) / 2, 2)
+
+
+def _interp_bands(table: list, age_key: float):
+    """按 age_key 线性插值返回 (n3, n2, n1, m, p1, p2, p3) 七界值；越界取端点。
+
+    - 8 列行：各界值列分别插值（保留非均匀分布信息）；
+    - 3 列行（7-18 身高，WS/T 612 等距 5 界值）：用 s 构造 ±3SD（m∓3s），
+      保持原有外推口径。
+    返回 None 表示数据缺失（调用方应 fail-closed 或告警）。
+    """
+    if not table:
+        return None
+    is_8 = len(table[0]) >= 8
     if age_key <= table[0][0]:
-        return table[0][1], table[0][2]
-    if age_key >= table[-1][0]:
-        return table[-1][1], table[-1][2]
-    for i in range(len(table) - 1):
-        a0, m0, s0 = table[i]
-        a1, m1, s1 = table[i + 1]
-        if a0 <= age_key <= a1:
-            if a1 == a0:
-                return m1, s1
-            t = (age_key - a0) / (a1 - a0)
-            return m0 + (m1 - m0) * t, s0 + (s1 - s0) * t
-    return table[-1][1], table[-1][2]
+        row = table[0]
+    elif age_key >= table[-1][0]:
+        row = table[-1]
+    else:
+        row = None
+        for i in range(len(table) - 1):
+            a0 = table[i][0]
+            a1 = table[i + 1][0]
+            if a0 <= age_key <= a1:
+                if a1 == a0:
+                    row = table[i + 1]
+                else:
+                    t = (age_key - a0) / (a1 - a0)
+                    r0, r1 = table[i], table[i + 1]
+                    row = [r0[0] + (r1[0] - r0[0]) * t] + [
+                        r0[j] + (r1[j] - r0[j]) * t for j in range(1, len(r0))]
+                break
+        if row is None:
+            row = table[-1]
+    if is_8:
+        return (row[1], row[2], row[3], row[4], row[5], row[6], row[7])
+    # 3 列行：m=s=row[1], row[2]；构造等距 7 界值
+    m, s = row[1], row[2]
+    return (m - 3 * s, m - 2 * s, m - s, m, m + s, m + 2 * s, m + 3 * s)
+
+
+def _z_from_bands(x: float, bands: tuple) -> float:
+    """按国标 7 界值分段线性插值计算 Z 分（MED-GR-1，2026-08-15）。
+
+    国标 WS/T 423 附录 B 的 SD 分布非均匀（BMI 高尾最甚：81 月男童 −3→−2SD 间距
+    0.9、+2→+3SD 间距 3.6，差 4 倍）——旧实现 z=(x−m)/s 用单一 s 线性外推，
+    在 ±2SD/±3SD 处系统性偏差（如 81 月男童 BMI 19.7=+2SD 界值却算 z≈2.77），
+    可致超重/肥胖/重度肥胖、低体重/重度低体重相邻等级错判。
+    分段插值保证：x 恰为任一 SD 界值时 z 精确等于对应整数，区间内线性。
+    超出 ±3SD 用最外侧斜率外推（与原口径一致，仅 7-18 身高等距表触达）。
+    """
+    n3, n2, n1, m, p1, p2, p3 = bands
+    if x <= n3:
+        return -3.0 + (x - n3) / (n2 - n3)          # 低于 -3SD：最外侧斜率外推
+    if x <= n2:
+        return -3.0 + (x - n3) / (n2 - n3)
+    if x <= n1:
+        return -2.0 + (x - n2) / (n1 - n2)
+    if x <= m:
+        return -1.0 + (x - n1) / (m - n1)
+    if x <= p1:
+        return (x - m) / (p1 - m)
+    if x <= p2:
+        return 1.0 + (x - p1) / (p2 - p1)
+    if x <= p3:
+        return 2.0 + (x - p2) / (p3 - p2)
+    return 3.0 + (x - p3) / (p3 - p2)               # 高于 +3SD：最外侧斜率外推
 
 
 def _valid_sd(s: Any) -> bool:
@@ -1094,14 +1158,24 @@ _HEIGHT_TABLE_CACHE: dict[str, list] = {}
 
 
 def _height_table(sex: str) -> list:
-    """合并 height_under7(月) 与 height_7_18(岁→月)，返回按月升序的 [age_months, m, s]。"""
+    """合并 height_under7(月) 与 height_7_18(岁→月)，统一 8 列 [age, n3..p3]。
+
+    MED-GR-1（2026-08-15）：WS/T 423 附录 B 与 WS/T 612 表 A 均已存 8 列全界值
+    （7-18 的 ±3SD 用外侧斜率外推），保证 _interp_bands 插值时行宽一致。
+    """
     cached = _HEIGHT_TABLE_CACHE.get(sex)
     if cached is not None:
         return cached
     ref = _load_growth_ref()
-    merged = [list(r) for r in ref["height_under7"][sex]]
-    for age_years, m, s in ref["height_7_18"][sex]:
-        merged.append([age_years * 12, m, s])
+    merged = [list(r) for r in ref["height_under7"][sex]]  # 8 列
+    for row in ref["height_7_18"][sex]:
+        if len(row) >= 8:
+            merged.append([row[0] * 12] + list(row[1:8]))  # 岁→月，8 列
+        else:
+            # 旧 3 列兼容（不应触达）：用 s 构造 ±3SD
+            age_years, m, s = row
+            merged.append([age_years * 12, m - 3 * s, m - 2 * s, m - s, m,
+                           m + s, m + 2 * s, m + 3 * s])
     merged.sort(key=lambda r: r[0])
     _HEIGHT_TABLE_CACHE[sex] = merged
     return merged
@@ -1225,7 +1299,9 @@ def calc_growth_zscore(age_years: float, sex: str,
         if m is None or not _valid_sd(s):
             warnings.append("身高参考数据缺失，无法计算 HAZ。")
         else:
-            haz = (height_cm - m) / s
+            # MED-GR-1（2026-08-15）：Z 用 7 界值分段插值（国标附录 B 非均匀 SD），
+            # 不再 (x-m)/s 单 s 外推（±2SD/±3SD 系统性偏差 → 营养等级错判）。
+            haz = _z_from_bands(height_cm, _interp_bands(_height_table(sex), age_months))
             haz_z = haz  # BUG-63：原始值用于判定
             d["haz"] = {
                 "z": _round(haz, 2),
@@ -1254,7 +1330,8 @@ def calc_growth_zscore(age_years: float, sex: str,
             if m is None or not _valid_sd(s):
                 warnings.append("体重参考数据缺失，无法计算 WAZ。")
             else:
-                waz = (weight_kg - m) / s
+                # MED-GR-1：7 界值分段插值（非均匀 SD），界值点精确对应整数 Z
+                waz = _z_from_bands(weight_kg, _interp_bands(ref["weight"][sex], age_months))
                 waz_z = waz  # BUG-63：原始值用于判定
                 d["waz"] = {
                     "z": _round(waz, 2),
@@ -1271,7 +1348,9 @@ def calc_growth_zscore(age_years: float, sex: str,
             if m is None or not _valid_sd(s):
                 warnings.append("BMI 参考数据缺失，无法计算 BAZ。")
             else:
-                baz = (bmi - m) / s
+                # MED-GR-1：BMI 高尾非均匀最严重（81 月男童 +2SD→+3SD 间距 3.6 vs
+                # −3SD→−2SD 0.9），单 s 外推可致超重/肥胖/重度肥胖错判，必须分段插值。
+                baz = _z_from_bands(bmi, _interp_bands(ref["bmi"][sex], age_months))
                 baz_z = baz  # BUG-63：原始值用于判定
                 d["baz"] = {
                     "z": _round(baz, 2),
