@@ -338,6 +338,39 @@ def test_growth_golden_age_bands():
     assert any("7 岁以下" in (w or "") for w in d7.get("warnings", [])), d7["warnings"]
 
 
+def test_growth_golden_cn_boundaries():
+    """国标界值点行为（2026-08-15 以 WS/T 612-2018 表 A.1 男 7 岁为准核对）。
+
+    7 岁男：-2SD=113.51 / -1SD=119.49 / 中位=125.48 / +1SD=131.47 / +2SD=137.46；
+    JSON sd=5.99（-1SD 侧）。5 级语义：<−2SD 下；≥−2SD 且<−1SD 中下；≥−1SD 且
+    ≤+1SD 中；>+1SD 且≤+2SD 中上；>+2SD 上（WS/T 612 与 WS/T 423 表 2 同口径）。
+    断言用**界值邻近值**（精确界值点因浮点 ε 会跨边界抖动，只做 z 近似断言）。
+    """
+    from CKDNutri_nutrition_mcp import core
+
+    def z(h):
+        return core.calc_growth_zscore(age_years=7, sex="M", height_cm=h)["data"]["haz"]
+
+    # -2SD 界值 → z≈-2.0（浮点容忍）
+    _near(z(113.51)["z"], (113.51 - 125.48) / 5.99, tol=0.01)
+    # 低于 -2SD（113.50）→ 下等；恰在 -2SD 上（113.51，浮点→中下）→ 中下等
+    assert z(113.50)["grade"] == "下", z(113.50)
+    assert z(113.51)["grade"] in ("中下", "下"), z(113.51)
+    # -1SD 附近：低于（119.48）→ 中下；高于（119.50）→ 中等
+    assert z(119.48)["grade"] == "中下", z(119.48)
+    assert z(119.50)["grade"] == "中", z(119.50)
+    # 中位数 → z≈0 → 中等
+    _near(z(125.48)["z"], 0.0, tol=0.01)
+    assert z(125.48)["grade"] == "中", z(125.48)
+    # +1SD 附近：低于（131.46）→ 中等；高于（131.48）→ 中上
+    assert z(131.46)["grade"] == "中", z(131.46)
+    assert z(131.48)["grade"] == "中上", z(131.48)
+    # +2SD 附近：低于（137.45）→ 中上；高于（137.47）→ 上等
+    _near(z(137.46)["z"], 2.0, tol=0.01)
+    assert z(137.45)["grade"] == "中上", z(137.45)
+    assert z(137.47)["grade"] == "上", z(137.47)
+
+
 # ---------------------------------------------------------------- PEW 筛查（nutrition）
 def test_pew_golden_levels():
     """PEW 三档 + score 契约（S2）：蛋白低+能量低=high(80)；单信号=medium；达标=low(0)。"""
