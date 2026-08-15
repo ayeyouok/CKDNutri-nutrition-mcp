@@ -154,10 +154,24 @@ def _pal_for_age(age_years: float) -> float:
 # --- Schofield / 水肿 / 腹透葡萄糖（从 M5 移植，使 M3 成为唯一 PRNT 权威引擎）---
 # 移植目的：去重后 M5 不再提供目标计算，但其 Schofield 交叉校验、水肿理想体重校正、
 # 腹透葡萄糖吸收扣减等临床特性有价值，故并入 M3，保证单一权威引擎不丢能力。
+# 权威来源：Schofield WN. Predicting basal metabolic rate: new standards and review of
+# previous work. Hum Nutr Clin Nutr 1985; 39C Suppl 1: 5-41（FAO/WHO/UNU 1985 采用）。
+# 系数为 kcal/day 版（W kg、H cm）换算到 MJ/day（H 米，÷239.0064，×100 对 H）：
+#   男 0-3:  0.167W + 15.174H - 617.6   → (0.0007, 6.349, -2.584)
+#   男 3-10: 19.59W +  1.303H + 414.9   → (0.082, 0.545, 1.736)
+#   男 10-18:16.25W +  1.372H + 515.5   → (0.068, 0.574, 2.157)
+#   女 0-3: 16.252W + 10.232H - 413.5   → (0.068, 4.281, -1.730)
+#   女 3-10:16.969W +  1.618H + 371.2   → (0.071, 0.677, 1.553)
+#   女 10-18:8.365W +  4.65H  + 200.0   → (0.035, 1.948, 0.837)
+# MED-1 修正（2026-08-15）：男 10-18 段此前 (0.071, 2.132, -1.184) 换算错误（反推 kcal
+# 版 ≈ 17.0W + 5.1H - 283，非权威 16.25W + 1.372H + 515.5）→ 10-18 岁男孩 BMR 低估
+# 10-25%（35kg/140cm 十岁男孩 1024 vs 权威 1276 kcal/d），schofield_cross_check 偏差
+# 偏正系统性误报 divergent。已按权威修正。0-3 男段经权威验证正确（0.167/15.174/-617.6
+# 的精确 MJ 换算），未改动。
 SCHOFIELD = {
     ("M", 3): (0.0007, 6.349, -2.584),
     ("M", 10): (0.082, 0.545, 1.736),
-    ("M", 18): (0.071, 2.132, -1.184),
+    ("M", 18): (0.068, 0.574, 2.157),
     ("F", 3): (0.068, 4.281, -1.730),
     ("F", 10): (0.071, 0.677, 1.553),
     ("F", 18): (0.035, 1.948, 0.837),
@@ -1357,6 +1371,17 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
+    # LOW-3 修复（2026-08-15）：score 有限性校验（对齐 N-S4 写路径口径）——此前
+    # score 直接落库，NaN/Inf 可静默入库（读路径比较恒 False → 趋势判定失真、无告警），
+    # 与 diary 写路径同口径 fail-closed。
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"score 无法解析为数值：{score!r}"}
+    if not math.isfinite(score):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"score 必须为有限数值（NaN/Inf 拒绝）：{score!r}"}
     # BUG-60：PEW 历史按日期排序去重，日期必须归一化，否则异形日期破坏时间线
     date = _normalize_date(date, "date")
     with _STORE_LOCK:

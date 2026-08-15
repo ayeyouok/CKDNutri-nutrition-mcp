@@ -143,6 +143,52 @@ def test_nb8_pharma_alias_split():
             assert "环孢素" in cls, (q, cls)
 
 
+def test_med1_schofield_authoritative():
+    """MED-1（2026-08-15）：Schofield 各段与权威 kcal 版换算一致（误差<1%）。
+
+    权威：Schofield 1985（W kg、H cm，kcal/day）——
+    男 0-3: 0.167W+15.174H-617.6；3-10: 19.59W+1.303H+414.9；
+    10-18: 16.25W+1.372H+515.5；女 0-3: 16.252W+10.232H-413.5；
+    3-10: 16.969W+1.618H+371.2；10-18: 8.365W+4.65H+200。
+    代码以 MJ/米 存储（÷239.0064），逐段换算核对（10-18 男此前 (M,18) 段写错，
+    BMR 低估 10-25%，已修正为 (0.068, 0.574, 2.157)）。
+    """
+    from CKDNutri_nutrition_mcp.core import schofield_bmr_kcal
+
+    cases = [
+        # (sex, age, W, H, kcal_权威)
+        ("M", 1, 10, 80, 0.167 * 10 + 15.174 * 80 - 617.6),      # 598.0
+        ("M", 5, 18, 110, 19.59 * 18 + 1.303 * 110 + 414.9),      # 910.9
+        ("M", 10, 35, 140, 16.25 * 35 + 1.372 * 140 + 515.5),     # 1276.3
+        ("M", 15, 50, 165, 16.25 * 50 + 1.372 * 165 + 515.5),     # 1554.4
+        ("F", 1, 9, 75, 16.252 * 9 + 10.232 * 75 - 413.5),        # 508.9
+        ("F", 5, 17, 108, 16.969 * 17 + 1.618 * 108 + 371.2),     # 843.7
+        ("F", 12, 40, 150, 8.365 * 40 + 4.65 * 150 + 200.0),      # 1232.1
+    ]
+    for sex, age, w, h, expect in cases:
+        got = schofield_bmr_kcal(sex, age, w, h)
+        assert got is not None, (sex, age)
+        rel = abs(got - expect) / expect
+        assert rel < 0.01, f"Schofield {sex} {age}岁 {w}kg/{h}cm：got={got} 权威={expect}（偏差 {rel:.1%}）"
+
+
+def test_low3_pew_score_finite():
+    """LOW-3（2026-08-15）：record_pew_risk 的 score 有限性校验（NaN/Inf/非数值拒绝）。"""
+    import math
+
+    from a207_policy import as_caller
+    from CKDNutri_nutrition_mcp import core
+
+    with as_caller("doctor_assistant"):
+        for bad in (float("nan"), float("inf"), float("-inf"), "abc", None):
+            r = core.record_pew_risk("P0001", "2026-08-15", bad, "low")
+            assert r["ok"] is False and r["error"] == "INVALID_INPUT", (bad, r)
+        # 合法值放行
+        r = core.record_pew_risk("P0001", "2026-08-15", 12.5, "low")
+        assert r["ok"] is True, r
+        assert math.isfinite(r["data"]["points"][0]["score"]), r
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
