@@ -193,6 +193,40 @@ PD_TRANSPORT_FACTOR = {"high": 1.15, "high_average": 1.05, "average": 1.0,
 PD_GLUCOSE_KCAL_PER_KG_REF = (7.5, 9.08)  # PRNT 引用的日吸收参考区间
 
 # ---------------------------------------------------------------------------
+# ---- WS/T 586-2018 学龄儿童青少年 BMI 超重界值（M-3，2026-08-15）-------------
+# 表 1：6 岁~18 岁性别年龄别 BMI 筛查超重/肥胖界值（kg/m²），实足年龄半岁档。
+# 此前代码用 BMI>24 统一粗判——7 岁男超重界值仅 17.0、12 岁男 20.7，BMI 17-24
+# 区间大量漏判（7 岁男 BMI 18 已超重却不判）。现按官方年龄×性别别界值。
+_WS586_OVERWEIGHT: dict[tuple[float, str], float] = {
+    (6.0, "M"): 16.4, (6.5, "M"): 16.7, (7.0, "M"): 17.0, (7.5, "M"): 17.4,
+    (8.0, "M"): 17.8, (8.5, "M"): 18.1, (9.0, "M"): 18.5, (9.5, "M"): 18.9,
+    (10.0, "M"): 19.2, (10.5, "M"): 19.6, (11.0, "M"): 19.9, (11.5, "M"): 20.3,
+    (12.0, "M"): 20.7, (12.5, "M"): 21.0, (13.0, "M"): 21.4, (13.5, "M"): 21.9,
+    (14.0, "M"): 22.3, (14.5, "M"): 22.6, (15.0, "M"): 22.9, (15.5, "M"): 23.1,
+    (16.0, "M"): 23.3, (16.5, "M"): 23.5, (17.0, "M"): 23.7, (17.5, "M"): 23.8,
+    (18.0, "M"): 24.0,
+    (6.0, "F"): 16.2, (6.5, "F"): 16.5, (7.0, "F"): 16.8, (7.5, "F"): 17.2,
+    (8.0, "F"): 17.6, (8.5, "F"): 18.1, (9.0, "F"): 18.5, (9.5, "F"): 19.0,
+    (10.0, "F"): 19.5, (10.5, "F"): 20.0, (11.0, "F"): 20.5, (11.5, "F"): 21.1,
+    (12.0, "F"): 21.5, (12.5, "F"): 21.9, (13.0, "F"): 22.2, (13.5, "F"): 22.6,
+    (14.0, "F"): 22.8, (14.5, "F"): 23.0, (15.0, "F"): 23.2, (15.5, "F"): 23.4,
+    (16.0, "F"): 23.6, (16.5, "F"): 23.7, (17.0, "F"): 23.8, (17.5, "F"): 23.9,
+    (18.0, "F"): 24.0,
+}
+
+
+def _ws586_overweight_threshold(age_years: float, sex: str) -> float | None:
+    """WS/T 586-2018 表 1 BMI 超重界值（半岁档取档，6.0-18.0 岁；超出返回 None）。"""
+    if age_years < 6.0 or age_years > 18.0:
+        return None
+    band = int(age_years * 2) / 2.0          # 实足年龄向下取半岁档
+    if band < 6.0:
+        band = 6.0
+    if band > 18.0:
+        band = 18.0
+    return _WS586_OVERWEIGHT.get((band, sex))
+
+
 # PRNT 2020 SDI 表
 # 每条：(age_min, age_max, 标签, 能量_M(lo,hi), 能量_F(lo,hi), 蛋白(lo,hi), 每日蛋白总量)
 #   婴儿段无性别拆分 → M/F 同值；蛋白总量对 15-17 岁按性别拆分（dict）。
@@ -390,7 +424,18 @@ def calc_prnt_targets(
             raise ValueError("height_age_years 超出 PRNT 2020 适用域（0-18 岁）")
     # F7：用 DIALYSIS_ALIAS 单一事实源归一化（兼容 pd/腹透/hemodialysis 等别名），
     # 避免裸 _DIALYSIS_EXTRA 成员判断把 "pd" 等别名静默降级为 "none"。
-    dialysis_mode = DIALYSIS_ALIAS.get(dialysis_mode, "none") if dialysis_mode else "none"
+    # 边界（2026-08-15）：**未知非空值拒绝**——此前 DIALYSIS_ALIAS.get(未知)="none"
+    # 静默降级：PD 患儿传错值按非透析目标（蛋白/能量低估），与 P4-3 _egfr_to_g
+    # 白名单同口径（core 可被编排层直调绕过 server Literal）。
+    if dialysis_mode:
+        _dm = DIALYSIS_ALIAS.get(str(dialysis_mode).strip().lower())
+        if _dm is None:
+            raise ValueError(
+                f"dialysis_mode 未知：{dialysis_mode!r}（合法值：none / hemodialysis"
+                "（血透/hd）/ peritoneal（腹透/pd/capd/apd）），拒绝按非透析静默降级")
+        dialysis_mode = _dm
+    else:
+        dialysis_mode = "none"
 
     # 是否存在临床调整 → 需要双方案（standard + adjusted）
     need_adjusted = (dialysis_mode != "none" or growth_status != "normal"
@@ -647,7 +692,7 @@ def assess_intake_vs_target(
     diet 需含：avg_energy_kcal / avg_protein_g / avg_potassium_mg / avg_phosphorus_mg /
               avg_sodium_mg（与 PCP nutrition_assessment.diet_diary_3d 对齐）。
     albumin_g_L（BUG-61，2026-08-12）：血清白蛋白 g/L，参与 PEW 筛查
-    （<35 记低白蛋白预警）；此前硬编码 None，白蛋白始终不参与本路径评估。
+    （<38 记低白蛋白预警——M-6 2026-08-15：CKiD 儿科 PEW 标准 <3.8 g/dL）；此前硬编码 None，白蛋白始终不参与本路径评估。
     """
     caller = get_caller()
     # BUG-01：临床判读工具级 ACL（仅 doctor）
@@ -761,7 +806,7 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     """
     protein_deficit = avg_p < floor_p
     energy_deficit = (avg_e / target_e) < 0.8 if target_e > 0 else False
-    low_albumin = (albumin_g_L is not None and albumin_g_L < 35)
+    low_albumin = (albumin_g_L is not None and albumin_g_L < 38)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
 
     # S2：信号加权分（透明、可解释；与等级判定共用信号，不另立口径）
     score = sum((
@@ -785,14 +830,14 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
         if energy_deficit:
             parts.append("能量 <80% 目标")
         if low_albumin:
-            parts.append(f"白蛋白 {albumin_g_L} g/L <35")
+            parts.append(f"白蛋白 {albumin_g_L} g/L <38")
         rationale = "存在以下 PEW 预警信号：" + "；".join(parts) + "。"
     else:
         risk = "low"
         rationale = "蛋白质与能量摄入均达 PRNT 安全范围，PEW 风险低。"
 
     if albumin_g_L is None:
-        rationale += "（未提供白蛋白，建议结合血清白蛋白 <35 g/L 与人体测量综合判定）"
+        rationale += "（未提供白蛋白，建议结合血清白蛋白 <38 g/L（CKiD 儿科 PEW 标准）与人体测量综合判定）"
     return {"risk": risk, "rationale": rationale, "score": score}
 
 
@@ -927,6 +972,12 @@ def upsert_food_diary(
         return denied
     if not entries:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "entries 不能为空"}
+    # F-4（2026-08-15）：entries 元素类型校验——此前非 dict 元素直接 e.get 抛
+    # AttributeError 冒泡成 500；显式 INVALID_INPUT（与 P3 通知 payload 同模式）。
+    for _i, _e in enumerate(entries):
+        if not isinstance(_e, dict):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"entries[{_i}] 必须为对象（dict），收到 {type(_e).__name__}"}
 
     with _STORE_LOCK:
         # N-MEM-2（2026-08-14）：患者级读——此前 _load_store() 全表 GetRange +
@@ -938,6 +989,13 @@ def upsert_food_diary(
         for e in entries:
             # BUG-60：写入前归一化日期（容忍 YYYY-M-D / YYYY/M/D 等变体，非法日期显式拒绝）
             raw_date = e.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")  # C1（2026-08-15）：日记业务日期统一 UTC——此前 datetime.now() 本地 naive，与同库 recorded_at(UTC) 不一致，跨时区部署（UTC+8 等）行为漂移
+            # F-4（2026-08-15）：未来日期拒绝——未来条目会成为 3 日锚点污染摄入评估
+            # （sum_diet_intake 取最近 3 日窗口，未来条目把窗口拉向未来导致今日摄入
+            # 缺失）。与 P1 report_date 未来拒绝同口径（UTC 业务日）。
+            _norm_date = _normalize_date(raw_date, "date")
+            if _norm_date > datetime.now(timezone.utc).date().isoformat():
+                return {"ok": False, "error": "INVALID_INPUT",
+                        "detail": f"条目日期 {_norm_date} 晚于今天（未来日期），拒绝写入"}
             # N-S4 修复（2026-08-14）：写路径营养键有限性校验（fail-closed）——
             # 此前 float() 直接转换，NaN/Inf 可静默落库（读路径比较恒 False →
             # assess_intake_vs_target 误判 e_status="ok"），与 P0-7 读路径同口径。
@@ -953,6 +1011,11 @@ def upsert_food_diary(
                 if not math.isfinite(fv):
                     return {"ok": False, "error": "INVALID_INPUT",
                             "detail": f"{key} 必须为有限数值（NaN/Inf 拒绝）：{val!r}"}
+                # F-4（2026-08-15）：负营养值拒绝——负能量/负钾等物理不可能，静默落库
+                # 会拉低均值并制造假"达标"；0 合法（该餐未检出）。
+                if fv < 0:
+                    return {"ok": False, "error": "INVALID_INPUT",
+                            "detail": f"{key} 不能为负（收到 {fv}），请核查录入"}
                 numeric[key] = fv
             stamped.append({
                 "patient_id": patient_id,
@@ -961,7 +1024,7 @@ def upsert_food_diary(
                 # 一餐被另一餐覆盖（nutrition_repository._merge_lists）。服务端
                 # uuid 碰撞免疫（与 P1 sample_id 同模式），保证并发追加不互替。
                 "entry_id": f"{patient_id}-D{uuid.uuid4().hex[:8]}",
-                "date": _normalize_date(raw_date, "date"),
+                "date": _norm_date,
                 "meal": e.get("meal", ""),
                 "food": e.get("food", ""),
                 "energy_kcal": numeric["energy_kcal"],
@@ -1337,24 +1400,66 @@ def calc_growth_zscore(age_years: float, sex: str,
 
     # HAZ（身高别年龄）—— 合并 0-18
     if height_cm is not None:
-        m, s = _interp_sd(_height_table(sex), age_months)
-        if m is None or not _valid_sd(s):
-            warnings.append("身高参考数据缺失，无法计算 HAZ。")
+        # M-9（2026-08-15）：82-83 月龄（6岁10-11月）显式跳过——WS/T 423 表止于
+        # 81 月（6岁9月）、WS/T 612 起于 7 岁整（84 月），两表均不覆盖该窗口。此前
+        # 用 81↔84 月线性插值（跨两套标准衔接混用），而 WAZ/BAZ 在同一窗口显式跳过
+        # ——不对称。统一为显式跳过 + 告警（与 WAZ/BAZ 同口径）。
+        if 81 < age_months < 84:
+            warnings.append(
+                "年龄处于 6岁10-11月（82-83 月龄）：WS/T 423 生长表止于 81 月（6岁9月）、"
+                "WS/T 612 起于 7 岁整（84 月），两标准均不覆盖该窗口，HAZ 跳过"
+                "（与 WAZ/BAZ 一致）；请按相邻标准表人工评估。")
         else:
-            # MED-GR-1（2026-08-15）：Z 用 7 界值分段插值（国标附录 B 非均匀 SD），
-            # 不再 (x-m)/s 单 s 外推（±2SD/±3SD 系统性偏差 → 营养等级错判）。
-            haz = _z_from_bands(height_cm, _interp_bands(_height_table(sex), age_months))
-            haz_z = haz  # BUG-63：原始值用于判定
-            d["haz"] = {
-                "z": _round(haz, 2),
-                "median_cm": _round(m, 1),
-                "sd_cm": _round(s, 2),
-                "height_cm": _round(height_cm, 1),
-                "grade": _grade_5(haz),
-                "nutrition": _haz_nutrition(haz),
-            }
+            m, s = _interp_sd(_height_table(sex), age_months)
+            if m is None or not _valid_sd(s):
+                warnings.append("身高参考数据缺失，无法计算 HAZ。")
+            else:
+                # MED-GR-1（2026-08-15）：Z 用 7 界值分段插值（国标附录 B 非均匀 SD），
+                # 不再 (x-m)/s 单 s 外推（±2SD/±3SD 系统性偏差 → 营养等级错判）。
+                haz = _z_from_bands(height_cm, _interp_bands(_height_table(sex), age_months))
+                haz_z = haz  # BUG-63：原始值用于判定
+                d["haz"] = {
+                    "z": _round(haz, 2),
+                    "median_cm": _round(m, 1),
+                    "sd_cm": _round(s, 2),
+                    "height_cm": _round(height_cm, 1),
+                    "grade": _grade_5(haz),
+                    "nutrition": _haz_nutrition(haz),
+                }
     else:
         warnings.append("未提供 height_cm，跳过 HAZ。")
+
+    # WHZ（身长/身高别体重）—— M-8（2026-08-15）：此前 <2 岁关键指标（身长别体重）
+    # 缺失。0-2 岁用身长别体重（WS/T 423 表 B.5/B.6，行键=身长 cm 45-100）；2-7 岁
+    # 用身高别体重（表 B.7/B.8，行键=身高 cm 75-130）。Z 同用 7 界值分段插值。
+    if height_cm is not None and weight_kg is not None and age_months < 84:
+        if age_months < 24:
+            _wf = ref["weight_for_length"][sex]
+            _basis = "身长别体重（WS/T 423-2022 表 B.5/B.6，0-2 岁）"
+            _wf_dom = (45.0, 100.0)
+        else:
+            _wf = ref["weight_for_height"][sex]
+            _basis = "身高别体重（WS/T 423-2022 表 B.7/B.8，2-7 岁）"
+            _wf_dom = (75.0, 130.0)
+        if _wf_dom[0] <= height_cm <= _wf_dom[1]:
+            _bands = _interp_bands(_wf, height_cm)
+            if _bands is not None:
+                whz = _z_from_bands(weight_kg, _bands)
+                d["whz"] = {
+                    "z": _round(whz, 2),
+                    "median_kg": _round(_bands[3], 2),
+                    "sd_kg": round((_bands[3] - _bands[2] + _bands[4] - _bands[3]) / 2, 2),
+                    "weight_kg": _round(weight_kg, 2),
+                    "length_cm": _round(height_cm, 1),
+                    "grade": _grade_5(whz),
+                    "wasting": "消瘦" if whz < -2 else ("超重" if whz > 2 else "正常"),
+                    "basis": _basis,
+                }
+        else:
+            warnings.append(
+                f"WHZ：身高 {height_cm:.0f} cm 超出"
+                f"{'身长别体重' if age_months < 24 else '身高别体重'}表覆盖域"
+                f"（{_wf_dom[0]:.0f}-{_wf_dom[1]:.0f} cm），跳过。")
 
     # BUG-61（2026-08-12）：BMI 自动推算提前——原写在 <84 月分块内，≥7 岁（age_months>=84）
     # 且未显式传 bmi 时恒为 None，下方"BMI>24 学龄超重粗判"分支永不触发，超重漏诊并误判 normal。
@@ -1424,23 +1529,35 @@ def calc_growth_zscore(age_years: float, sex: str,
         growth_status = "failure"          # 低体重/消瘦 → 能量取 SDI 上限
     elif baz_z is not None and baz_z >= 1:
         growth_status = "overweight"        # BAZ≥1 → 超重/肥胖，能量向下调整
-    elif baz_z is None and bmi is not None and bmi > 24:
-        # ≥7 岁无 BAZ 标准时，用 BMI>24 粗判超重趋势（中国学龄儿童超重界值）
-        growth_status = "overweight"
-        warnings.append("≥7 岁 BAZ 标准不可用，基于 BMI>24 粗判超重，建议结合腰围/体脂综合评估。")
     elif baz_z is None and bmi is not None and age_months >= 84:
-        # BUG-63（2026-08-12）：≥7 岁 BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI 粗筛
-        # 提示，杜绝"严重消瘦被判 normal 且无警告"的漏诊。**不改 growth_status**
-        # （7-8 岁 BMI 14 属正常范围，扁平阈值直接调能量会误伤；仅提示人工评估）。
-        if bmi < 14:
+        # M-3（2026-08-15）：≥7 岁无 BAZ 标准时用 WS/T 586-2018 年龄×性别别 BMI 超重
+        # 界值判超重——此前 BMI>24 统一粗判漏判大量患儿（7 岁男超重界值 17.0、12 岁男
+        # 20.7，BMI 17-24 区间本应超重却不判）。
+        _ov_thr = _ws586_overweight_threshold(age_years, sex)
+        if _ov_thr is not None and bmi >= _ov_thr:
+            growth_status = "overweight"
             warnings.append(
-                f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
-                "请立即结合中臂肌围等人体测量人工评估。")
+                f"≥7 岁 BAZ 标准不可用，BMI {bmi:.1f} ≥ WS/T 586-2018 {age_years:.0f} 岁"
+                f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}，判超重；"
+                "建议结合腰围/体脂综合评估。")
+        elif _ov_thr is not None:
+            # BUG-63（2026-08-12）：≥7 岁 BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI
+            # 粗筛提示，杜绝"严重消瘦被判 normal 且无警告"的漏诊。**不改 growth_status**
+            # （7-8 岁 BMI 14 属正常范围，扁平阈值直接调能量会误伤；仅提示人工评估）。
+            if bmi < 14:
+                warnings.append(
+                    f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
+                    "请立即结合中臂肌围等人体测量人工评估。")
+            else:
+                _thr_txt = (f"（WS/T 586-2018 {age_years:.0f} 岁"
+                            f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}）"
+                            if _ov_thr is not None else "（≥7 岁无界值）")
+                warnings.append(
+                    f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 未达超重界值{_thr_txt}；"
+                    "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
+            growth_status = "normal"
         else:
-            warnings.append(
-                f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 未达超重界值（≤24）；"
-                "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
-        growth_status = "normal"
+            growth_status = "normal"
     else:
         growth_status = "normal"
     d["growth_status_suggestion"] = growth_status
@@ -1505,6 +1622,11 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
                 "detail": f"score 必须为有限数值（NaN/Inf 拒绝）：{score!r}"}
     # BUG-60：PEW 历史按日期排序去重，日期必须归一化，否则异形日期破坏时间线
     date = _normalize_date(date, "date")
+    # 边界（2026-08-15）：未来日期拒绝——未来 PEW 点会成为趋势窗口的"未来锚点"
+    # 导致趋势反转（record_pew_risk 写入未来 → 最新点在未来 → 趋势误判恶化/好转）。
+    if date > datetime.now(timezone.utc).date().isoformat():
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"PEW 记录日期 {date} 晚于今天（未来日期），拒绝写入"}
     with _STORE_LOCK:
         # N-MEM-3（2026-08-14）：患者级读/写——此前 _load_pew_store() 全表 GetRange +
         # _save_pew_store() 回写每个患者行（record_pew_risk 每次评估后必调，数千患儿

@@ -322,11 +322,80 @@ def test_s3_food_diary_content_idempotent():
     assert r3["ok"] is True and len(core._load_patient_store(pid).get("entries", [])) == 2
 
 
+def test_m3_ws586_bmi_overweight():
+    """M-3（2026-08-15）：≥7 岁无 BAZ 时按 WS/T 586-2018 年龄×性别别 BMI 超重界值
+    判超重——此前 BMI>24 统一粗判漏判（7 岁男超重界值 17.0、12 岁男 20.7）。"""
+    from CKDNutri_nutrition_mcp import core
+
+    # 7 岁男 BMI 18（≥17.0 超重，旧 BMI>24 漏判）→ overweight + WS/T 586 提示
+    r = core.calc_growth_zscore(age_years=7, sex="M", height_cm=125, weight_kg=28.1)
+    assert r["data"]["growth_status_suggestion"] == "overweight", r["data"]["growth_status_suggestion"]
+    assert any("WS/T 586" in w for w in r["data"]["warnings"])
+    # 12 岁男 BMI 21（≥20.7 超重）
+    r = core.calc_growth_zscore(age_years=12, sex="M", height_cm=150, weight_kg=47.25)
+    assert r["data"]["growth_status_suggestion"] == "overweight"
+    # 7 岁男 BMI 16（<17.0）→ normal
+    r = core.calc_growth_zscore(age_years=7, sex="M", height_cm=125, weight_kg=25.0)
+    assert r["data"]["growth_status_suggestion"] == "normal"
+
+def test_m8_whz_weight_for_length():
+    """M-8（2026-08-15）：身长/身高别体重 WHZ——0-2 岁身长别体重（表 B.5/B.6）、
+    2-7 岁身高别体重（表 B.7/B.8）。此前 <2 岁关键指标缺失。"""
+    from CKDNutri_nutrition_mcp import core
+
+    # 1 岁男 身长 75 体重 9.9（中位）→ z≈0
+    r = core.calc_growth_zscore(age_years=1, sex="M", height_cm=75, weight_kg=9.9)
+    assert "whz" in r["data"] and abs(r["data"]["whz"]["z"]) < 0.5, r["data"].get("whz")
+    # 3 岁女 → 身高别体重表
+    r = core.calc_growth_zscore(age_years=3, sex="F", height_cm=95, weight_kg=15.5)
+    assert "身高别" in r["data"]["whz"]["basis"]
+    # 域外（2 岁男 74cm <75）→ 跳过 + 告警
+    r = core.calc_growth_zscore(age_years=2, sex="M", height_cm=74, weight_kg=11)
+    assert "whz" not in r["data"] and any("WHZ" in w for w in r["data"]["warnings"])
+
+def test_m9_haz_82_83_skip():
+    """M-9（2026-08-15）：82-83 月龄 HAZ 显式跳过（与 WAZ/BAZ 一致）——此前 HAZ
+    在 81↔84 月插值（跨 WS/T 423/612 衔接），不对称。"""
+    from CKDNutri_nutrition_mcp import core
+
+    r = core.calc_growth_zscore(age_years=82 / 12, sex="M", height_cm=120)
+    assert "haz" not in r["data"], r["data"].get("haz")
+    assert any("82-83" in w for w in r["data"]["warnings"])
+    # 边界：81 月（6岁9月）仍正常产出、84 月（7岁整）正常
+    r = core.calc_growth_zscore(age_years=81 / 12, sex="M", height_cm=120)
+    assert "haz" in r["data"]
+    r = core.calc_growth_zscore(age_years=7, sex="M", height_cm=120)
+    assert "haz" in r["data"]
+
+def test_f4_diary_write_guards():
+    """F-4（2026-08-15）：upsert_food_diary 未来日期/负营养值/非 dict 元素拒绝。"""
+    import datetime
+
+    from CKDNutri_nutrition_mcp import core
+
+    tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+    base = {"meal": "午餐", "food": "米饭", "energy_kcal": 100, "protein_g": 2,
+            "potassium_mg": 10, "phosphorus_mg": 5, "sodium_mg": 1}
+    r = core.upsert_food_diary("P0001", entries=[dict(base, date=tomorrow)])
+    assert r["ok"] is False and "未来" in r["detail"], r
+    r = core.upsert_food_diary("P0001", entries=[dict(base, date="2026-08-01", energy_kcal=-50)])
+    assert r["ok"] is False and "不能为负" in r["detail"], r
+    r = core.upsert_food_diary("P0001", entries=["米饭"])
+    assert r["ok"] is False and "必须为对象" in r["detail"], r
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn()
     print(f"NS2-NS6/NB8 REGRESSION OK（{len(fns)} 个用例）")
+
+
+
+
+
+
+
+
 
 
 

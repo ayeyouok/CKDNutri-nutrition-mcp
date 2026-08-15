@@ -207,8 +207,22 @@ def generate_meal_plan(
             raise ValueError(f"{_name} 必须为有效的有限数值，收到 {_val!r}")
     if target_energy_kcal <= 0 or target_protein_g <= 0:
         raise ValueError("target_energy_kcal 与 target_protein_g 必须 > 0")
+    # 边界（2026-08-15）：K/P/Na 目标允许 0（=不设限/忽略），但**负值拒绝**——负目标
+    # 此前静默通过：钠约束跳过、钾磷闸门按负基准失真（选品无意义）。
+    for _name, _val in (("target_k_mg", target_k_mg), ("target_p_mg", target_p_mg),
+                        ("target_na_mg", target_na_mg)):
+        if _val < 0:
+            raise ValueError(f"{_name} 不能为负（收到 {_val}），0 表示不设限")
     if days <= 0:
         raise ValueError("days 必须 > 0")
+    # 边界（2026-08-15）：exclude_foods 传 str 会被 set(str) 拆成单字符静默失效——
+    # 显式校验列表类型；str 转 [str] 宽容（编排层常见传法）。
+    if exclude_foods is not None:
+        if isinstance(exclude_foods, str):
+            exclude_foods = [exclude_foods]
+        if not isinstance(exclude_foods, list) or \
+                not all(isinstance(x, str) for x in exclude_foods):
+            raise ValueError("exclude_foods 必须为字符串列表（或单个字符串）")
     # P2 修复（2026-08-13）：vegetarian 显式 bool 校验——编排层直调 core 时若传
     # 字符串 "false"，bool("false")==True 会静默开素食（蛋白源减半）。FastMCP 层有
     # pydantic 拦截，但 core 是纯函数库可被绕过，入口显式拒绝非 bool。
