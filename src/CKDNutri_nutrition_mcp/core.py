@@ -978,11 +978,11 @@ def upsert_food_diary(
     # 一般 1（2026-08-14）：统一 patient_id 契约校验（对齐 P1/P3 各入口）——此前
     # 缺此校验，医生身份可写入畸形/脏 id（如 "P123" 或空格）污染 diary_store.json；
     # 家长路径虽经 _guard_guardian fail-closed 拒绝（畸形 id 无令牌条目），但医生侧
-    # 数据污染与读侧不匹配。畸形 id 显式 INVALID_ARGUMENT，不静默落库。
+    # 数据污染与读侧不匹配。畸形 id 显式 INVALID_INPUT，不静默落库。
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     denied = _guard_guardian(caller, patient_id, guardian_token, "upsert_food_diary")
     if denied:
         return denied
@@ -1114,7 +1114,7 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_food_diary_summary")
     if denied:
         return denied
@@ -1621,7 +1621,7 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     if level not in _PEW_LEVEL_ORDER:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "level 必须是 low / medium / high"}
@@ -1684,7 +1684,7 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     # N-MEM-3（2026-08-14）：患者级读（行级 GetRow）——此前 _load_pew_store() 全表
     # 拉取后再取键，医院级全库扫描。
     store = _load_patient_pew_store(patient_id)

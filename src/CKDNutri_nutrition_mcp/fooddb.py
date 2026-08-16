@@ -162,7 +162,7 @@ def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
     P0-6 修复（2026-08-13）：**单字符查询拒绝**——中文 1 字（"鱼"/"蛋"/"肉"）在
     1752 行表里必然子串命中多个不相关食物（实测"鱼"→鱼腥草叶、"蛋"→蛋清肠、
     "肉"→肉桂），张冠李戴到错误营养值比报错更危险。要求 ≥2 字符；数字查询（如
-    "100g"）同理拒绝。返回空列表由调用方转 INVALID_ARGUMENT / 提示细化关键词。
+    "100g"）同理拒绝。返回空列表由调用方转 INVALID_INPUT / 提示细化关键词。
     """
     text = (query or "").strip()
     if not text or len(text) < 2:
