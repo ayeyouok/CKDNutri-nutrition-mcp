@@ -383,6 +383,30 @@ def test_f4_diary_write_guards():
     r = core.upsert_food_diary("P0001", entries=["米饭"])
     assert r["ok"] is False and "必须为对象" in r["detail"], r
 
+
+def test_m2_intake_threshold_shared():
+    """M2（2026-08-16，第七轮审查）：能量达成率分级 core/diary 共用 _intake_pct_status
+    单一阈值（此前 core <80=deficit/>120=excess vs diary 90-110=达标分裂，80-90 与
+    110-120 区间同一份日记结论不同）。"""
+    from CKDNutri_nutrition_mcp import core, diary
+
+    assert core._intake_pct_status(79) == "deficit"
+    assert core._intake_pct_status(85) == "low"
+    assert core._intake_pct_status(95) == "ok"
+    assert core._intake_pct_status(110) == "ok"
+    assert core._intake_pct_status(115) == "high"
+    assert core._intake_pct_status(131) == "excess"
+    # diary 与 core 同口径
+    avg = {"energy_kcal": 850, "protein_g": 20, "potassium_mg": 1000,
+           "phosphorus_mg": 500, "sodium_mg": 1000}
+    tgt = {"energy_kcal": 1000, "protein_g": 22, "potassium_mg": 2000,
+           "phosphorus_mg": 1000, "sodium_mg": 1500}
+    r = diary._achievement(avg, tgt)
+    e = next(i for i in r["items"] if i["field"] == "energy_kcal")
+    assert e["verdict"] == "不足", e["verdict"]  # 85% → 不足（与 core low 同源）
+
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

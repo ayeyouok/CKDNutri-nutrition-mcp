@@ -250,7 +250,11 @@ def _achievement(average: dict[str, float], target: dict[str, Any]) -> dict[str,
             verdict = "在限值内" if percent <= 100 else "超出限值"
             kind = "upper_limit"
         else:
-            verdict = "达标" if 90 <= percent <= 110 else ("不足" if percent < 90 else "超出")
+            # M2（2026-08-16）：统一走 core._intake_pct_status 单一阈值——此前
+            # diary 90-110 达标 vs core <80 deficit 分裂，80-90/110-120 区间结论不同。
+            from .core import _intake_pct_status as _st
+            _s = _st(percent)
+            verdict = "达标" if _s == "ok" else ("不足" if _s in ("deficit", "low") else "超出")
             kind = "target"
         result["items"].append({"field": field, "label": FIELD_LABEL[field], "kind": kind,
                                 "target": round(goal, 1), "actual": actual,

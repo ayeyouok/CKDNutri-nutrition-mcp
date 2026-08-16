@@ -685,6 +685,8 @@ def assess_intake_vs_target(
     is_edema: bool = False,
     pd_glucose_kcal_per_day: float | None = None,
     albumin_g_L: float | None = None,
+    height_age_years: float | None = None,
+    high_urea_persistent: bool = False,
 ) -> dict[str, Any]:
     """对照 PRNT 目标评估 3 日饮食日记均值，给出达成率、缺口/过量、PEW 风险。
 
@@ -722,6 +724,9 @@ def assess_intake_vs_target(
         ckd_stage=ckd_stage, dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
         growth_status=growth_status, is_edema=is_edema,
         pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
+        # M1（2026-08-16）：透传调整参数——与 DAG 内 prnt_targets 同口径，避免
+        # 同一结果的"目标"在展示与摄入评估间矛盾。
+        height_age_years=height_age_years, high_urea_persistent=high_urea_persistent,
     )
     if not tgt["ok"]:
         return tgt
@@ -733,13 +738,8 @@ def assess_intake_vs_target(
     e_pct = (avg_e / target_e * 100.0) if target_e > 0 else 0.0
     p_pct_vs_target = (avg_p / target_p * 100.0) if target_p > 0 else 0.0
 
-    # 状态判定
-    if e_pct < 80:
-        e_status = "deficit"
-    elif e_pct > 120:
-        e_status = "excess"
-    else:
-        e_status = "ok"
+    # 状态判定（M2：统一走 _intake_pct_status 单一阈值——与 diary 90-110 达标口径一致）
+    e_status = _intake_pct_status(e_pct)
 
     if avg_p < floor_p:
         p_status = "below_floor"
@@ -793,6 +793,23 @@ def assess_intake_vs_target(
             "note": "钾/磷/钠上限由临床医生在 clinician_limits 设定，此处仅展示 3 日实测均值。",
         },
     }
+
+
+def _intake_pct_status(pct: float) -> str:
+    """能量/蛋白达成率统一分级（M2，2026-08-16，第七轮审查）——core 与 diary 共用
+    单一阈值（此前分裂：core 能量 <80=deficit / >120=excess，diary 90-110=达标，
+    80-90 与 110-120 区间同一份日记给不同结论）。
+    deficit(<80，PRNT 分级干预线) / low(80-90) / ok(90-110 达标) / high(110-130) /
+    excess(>130)。"""
+    if pct < 80:
+        return "deficit"
+    if pct < 90:
+        return "low"
+    if pct <= 110:
+        return "ok"
+    if pct <= 130:
+        return "high"
+    return "excess"
 
 
 def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
