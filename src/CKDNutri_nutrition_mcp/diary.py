@@ -115,7 +115,17 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                 reason = "内置食物表中未匹配到该名称"
             unmatched.append({"index": index, "food": name, "reason": reason})
             continue
-        grams = entry.get("grams") or entry.get("weight_g")
+        # N1（2026-08-16，九审）：**两处缺陷**——① :118 原 `entry.get("grams") or
+        # entry.get("weight_g")` 中 `or` 短路：grams=0（falsy）被吞成 None/weight_g，
+        # 根本到不了克重分支；② :128 原 `grams > 0` 把残留的字面 0 落 else → 按
+        # "1 份"整份折算（grams=0 的苹果记 106 kcal）。家长误填 0/想表达"没吃"
+        # 反而记满一份，全天钾/磷/能量被高估；且与 fooddb 拒绝负克重不对称
+        # （负报错、0 当 1 份）。修复：显式 None 判断取 weight_g（0 不被吞），
+        # 克重分支改 `>= 0`（0 克按 0 计，scale_nutrients 输出全 0）——
+        # "显式克重 0"与"未提供克重（走份数）"语义分离。
+        grams = entry.get("grams")
+        if grams is None:
+            grams = entry.get("weight_g")
         # #3（2026-08-15）：数值字符串（如 "150"）不得静默按 1 份计——此前仅
         # isinstance(int/float) 走克重，str 数字掉进 parse_portion(None) 按"1 份"
         # 折算（如 150g 苹果算成 1 份≈100g，摄入量低估 33% 且无告警）。
@@ -125,9 +135,16 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                 grams = float(grams)
             except ValueError:
                 grams = None
-        if isinstance(grams, (int, float)) and grams > 0:
+        if isinstance(grams, (int, float)) and not isinstance(grams, bool) and grams >= 0:
             grams = float(grams)
             basis = f"按输入克重 {grams:.0f} g"
+        elif isinstance(grams, (int, float)) and not isinstance(grams, bool):
+            # N1（2026-08-16）：负克重与 fooddb.scale_nutrients 拒绝口径对齐——
+            # 此前负数落 else 按"1 份"折算（-5g 苹果记 106 kcal），比按 0 更危险
+            # （录入错误被放大成整份摄入）。显式拒绝（fail-closed）。
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"food={name!r} grams 不能为负（收到 {grams}）——"
+                              "负克重通常是录入错误"}
         else:
             resolved = parse_portion(entry.get("portion"), row)
             grams = resolved["grams"]

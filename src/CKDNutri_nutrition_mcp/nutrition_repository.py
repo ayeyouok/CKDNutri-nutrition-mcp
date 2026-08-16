@@ -154,7 +154,17 @@ def _read_json_fail_closed(path: str, label: str, default: Any) -> Any:
 
 
 class LocalJsonRepository:
-    """本地 JSON 文件后端（v0.5 起仅本地开发/测试，显式 A207_STORAGE_BACKEND=json）。"""
+    """本地 JSON 文件后端（v0.5 起仅本地开发/测试，显式 A207_STORAGE_BACKEND=json）。
+
+    N4（2026-08-16，九审）：进程内写锁 _LOCAL_JSON_LOCK——save_patient_diary /
+    save_patient_pew 是 load→过滤→整文件原子写（RMW），无锁时两线程/进程同患者
+    并发 append，后写者基于旧快照覆盖 → 先写条目丢失（经典 TOCTOU）。Tablestore
+    后端有 _rev 乐观锁重试，本地 json 后端（dev/A207_ACCEPT_DEV_STORAGE=1）此前
+    无等价保护。threading.Lock 仅保进程内；跨进程仍建议单实例部署（与 care 同口径）。
+    """
+
+    # N4：本地 JSON 后端 RMW 写锁（进程内串行化 load→filter→atomic write）
+    _LOCAL_JSON_LOCK = threading.Lock()
 
     # ---- 饮食日记 ----
     def load_diary(self) -> dict[str, Any]:
@@ -172,12 +182,13 @@ class LocalJsonRepository:
 
     def save_patient_diary(self, patient_id: str,
                            entries: list[dict[str, Any]]) -> None:
-        # 本地 JSON 开发模式：整文件原子写，仅替换该患者条目
-        store = self.load_diary()
-        others = [e for e in store.get("entries", [])
-                  if e.get("patient_id") != patient_id]
-        store["entries"] = others + list(entries)
-        self.save_diary(store)
+        # N4：RMW 全程持锁——防并发 append 后写者覆盖先写条目（TOCTOU）
+        with self._LOCAL_JSON_LOCK:
+            store = self.load_diary()
+            others = [e for e in store.get("entries", [])
+                      if e.get("patient_id") != patient_id]
+            store["entries"] = others + list(entries)
+            self.save_diary(store)
 
     # ---- PEW 历史 ----
     def load_pew(self) -> dict[str, Any]:
@@ -195,10 +206,11 @@ class LocalJsonRepository:
 
     def save_patient_pew(self, patient_id: str,
                          points: list[dict[str, Any]]) -> None:
-        # 本地 JSON 开发模式：整文件原子写，仅替换该患者历史
-        store = self.load_pew()
-        store[patient_id] = list(points)
-        self.save_pew(store)
+        # N4：RMW 全程持锁（同 save_patient_diary，防 TOCTOU 覆盖）
+        with self._LOCAL_JSON_LOCK:
+            store = self.load_pew()
+            store[patient_id] = list(points)
+            self.save_pew(store)
 
 
 class TablestoreRepository(TablestoreBase):

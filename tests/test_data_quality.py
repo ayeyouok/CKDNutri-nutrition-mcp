@@ -88,49 +88,50 @@ def _base_name(name: str) -> str:
 
 
 def test_ckd_json_vs_csv_no_new_drift():
-    """foods_ckd.json 与 food_data.csv 双源偏差。
+    """foods_ckd.json 的 csv_name 必须能在 food_data.csv **精确解析**且**同基名**。
 
-    说明（X5，2026-08-14）：foods_ckd.json 为 CKD「近似值子集」（mealplan 已声明跨源
-    以全量库为准），生熟/加工状态差异天然存在（米粉熟 110 vs 干 349、白菜脱水等），
-    且基名匹配存在脱水/罐头歧义——故**只 warn 不 fail**（不阻塞 CI），偏差清单打印
-    供人工核对；真正硬失败的是 test_csv_no_new_duplicate_conflicts（同源自相矛盾）。
+    N3 修复（2026-08-16，九审）：此前本测试比较 JSON 内嵌 *_per_100g 与 CSV
+    偏差（28 处 >25% 只 warn 不 fail）——但 H2/H3 修复（2026-08-15）后 mealplan
+    已**不再消费内嵌值**（数值单一权威源 = food_data.csv，经 find_food(csv_name)
+    解析），内嵌值成了死数据，偏差测试是"死数据 vs 权威源"的空转，且掩盖真实
+    映射错误（如米粉(熟) csv_name 指向米饭（蒸，代表值）——可解析但取到 116 kcal
+    米饭值而非米粉值）。现改为**硬断言 csv_name 解析一致性**：
+    ① 每个 csv_name 必须能被 find_food 精确解析（fail-fast 同口径）；
+    ② 解析命中行的基名必须与 JSON 条目基名一致（防"米粉→米饭"式错配）；
+    ③ 明确"熟制/干制"状态语义：state=cooked 的条目不得指向干制行
+    （能量/钾磷差 3 倍+，如米粉熟 109 vs 干 349）。
     """
     rows = _load_csv()
-    # 基名 → 代表值行（优先「代表值」行，其次 unit_grams==100）
-    def _score(r):
-        return 2 if "代表值" in r["name"] else (1 if r.get("unit_grams") == "100" else 0)
-
-    by_base: dict[str, dict[str, str]] = {}
-    for r in rows:
-        b = _base_name(r["name"])
-        if b not in by_base or _score(r) > _score(by_base[b]):
-            by_base[b] = r
+    by_name = {r["name"]: r for r in rows}
     ckd = json.loads(CKD_JSON_PATH.read_text(encoding="utf-8"))
     ckd_foods = ckd if isinstance(ckd, list) else ckd.get("foods", [])
 
-    drifts = []
-    for f in ckd_foods:
-        csv_hit = by_base.get(_base_name(f["name"]))
-        if not csv_hit:
-            continue
-        for key, col in (("energy_per_100g", "energy_kcal"), ("protein_per_100g", "protein_g"),
-                         ("potassium_per_100g", "potassium_mg"), ("phosphorus_per_100g", "phosphorus_mg")):
-            try:
-                a, b = float(f.get(key) or 0), float(csv_hit.get(col) or 0)
-            except (TypeError, ValueError):
-                continue
-            if a <= 0 or b <= 0:
-                continue
-            diff = abs(a - b) / max(a, b)
-            if diff > SRC_ALLOWED_DIFF:
-                drifts.append((f["name"], col, a, b, f"{diff*100:.0f}%", csv_hit["name"]))
+    from CKDNutri_nutrition_mcp.fooddb import find_food
 
-    # warn-only：打印供人工核对（近似值子集 + 生熟/加工口径差异为设计内行为）
-    if drifts:
-        print(f"[warn] foods_ckd.json vs food_data.csv 偏差 >25% 共 {len(drifts)} 处"
-              "（近似值子集/生熟口径差异，待营养师核对）:")
-        for n, c, a, b, d, hit in drifts[:10]:
-            print(f"  {n}.{c}: {a} vs {b} ({d} @ {hit})")
+    failures: list[str] = []
+    for f in ckd_foods:
+        name = f.get("name") or ""
+        csv_name = f.get("csv_name") or name
+        row = find_food(csv_name)
+        if row is None:
+            failures.append(f"{name!r}: csv_name={csv_name!r} 无法在 food_data.csv 精确解析")
+            continue
+        # ② 基名一致性：JSON 条目名与 CSV 命中行必须同基名（去括号修饰）
+        if _base_name(csv_name) != _base_name(row["name"]):
+            failures.append(
+                f"{name!r}: csv_name={csv_name!r} 解析命中 {row['name']!r}——基名不一致（疑似错配）")
+            continue
+        # ③ 生熟/干湿语义：cooked 状态不得映射干制行（干米粉 349 vs 熟 109）
+        state = f.get("state")
+        row_name = row["name"]
+        if state == "cooked" and any(tag in row_name for tag in ("干", "（干）", "（干，细）")):
+            failures.append(
+                f"{name!r}: state=cooked 但 csv_name 指向干制行 {row_name!r}"
+                "（能量/钾磷差 3 倍+，疑似错配）")
+
+    assert not failures, (
+        f"foods_ckd.json csv_name 解析一致性失败 {len(failures)} 处: "
+        + "; ".join(failures[:8]))
 
 
 def test_csv_duplicate_names_registry_complete():

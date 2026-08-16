@@ -381,8 +381,13 @@ def comprehensive_nutrition_assessment_tool(
                     pd_notes.append(
                         f"DAG 内部计算腹透葡萄糖吸收 {pd_kcal} kcal/d，已从膳食能量目标扣减。")
                 else:
-                    pd_notes.append("腹透葡萄糖吸收计算失败：" +
-                                    str(pd_result.get("detail", "未知原因")))
+                    # 九审（2026-08-16）：失败 detail 仅记服务端日志——此前内联进
+                    # ok:True 的 notes（内部上下文外泄给调用方；且"成功响应携带失败
+                    # 细节"破坏成功语义）。对外给中性提示，完整原因留日志排查。
+                    logger.warning(
+                        "comprehensive_nutrition_assessment DAG 腹透葡萄糖吸收计算失败: %s",
+                        pd_result.get("detail", "未知原因"))
+                    pd_notes.append("腹透葡萄糖吸收计算失败，能量目标未扣减，请核查透析处方参数。")
 
         # 1) 生长 Z 评分（一次调用同时给 HAZ/WAZ/BAZ 与 growth_status 建议）
         z = calc_growth_zscore(float(age_years), sex,
