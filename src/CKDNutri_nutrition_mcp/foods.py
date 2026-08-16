@@ -45,15 +45,22 @@ _PROTEIN_ROLES = ("肉类", "蛋类", "水产", "豆制品", "奶")
 _STAPLE_ROLES = ("主食",)
 
 # 约束 -> (字段, 中文标签, 模式)。模式 lower=取更低者；iso_energy=等能量替换。
+# L4（2026-08-16，八审）：补空格/连字符英文别名——此前只认下划线形态
+# （low_k/low_potassium），LLM 自然语言输入 "low potassium"/"low-k" 落
+# UNSUPPORTED_CONSTRAINT（实测复现）；现全形态归一（key 已 strip+lower）。
 CONSTRAINT_MAP = {
     "低钾": ("potassium_mg", "钾", "lower"), "限钾": ("potassium_mg", "钾", "lower"),
     "low_k": ("potassium_mg", "钾", "lower"), "low_potassium": ("potassium_mg", "钾", "lower"),
+    "low potassium": ("potassium_mg", "钾", "lower"), "low-k": ("potassium_mg", "钾", "lower"),
     "低磷": ("phosphorus_mg", "磷", "lower"), "限磷": ("phosphorus_mg", "磷", "lower"),
     "low_p": ("phosphorus_mg", "磷", "lower"), "low_phosphorus": ("phosphorus_mg", "磷", "lower"),
+    "low phosphorus": ("phosphorus_mg", "磷", "lower"), "low-p": ("phosphorus_mg", "磷", "lower"),
     "低钠": ("sodium_mg", "钠", "lower"), "限钠": ("sodium_mg", "钠", "lower"),
     "low_na": ("sodium_mg", "钠", "lower"), "low_sodium": ("sodium_mg", "钠", "lower"),
+    "low sodium": ("sodium_mg", "钠", "lower"), "low-na": ("sodium_mg", "钠", "lower"),
     "低蛋白": ("protein_g", "蛋白质", "lower"), "限蛋白": ("protein_g", "蛋白质", "lower"),
     "low_protein": ("protein_g", "蛋白质", "lower"),
+    "low protein": ("protein_g", "蛋白质", "lower"), "low-protein": ("protein_g", "蛋白质", "lower"),
     "等能量": ("energy_kcal", "能量", "iso_energy"), "iso_energy": ("energy_kcal", "能量", "iso_energy"),
     "同热量": ("energy_kcal", "能量", "iso_energy"), "等热量": ("energy_kcal", "能量", "iso_energy"),
 }

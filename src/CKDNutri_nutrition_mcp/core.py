@@ -185,12 +185,11 @@ BMI_P50 = {
     14: (19.3, 19.6), 15: (19.9, 20.2), 16: (20.5, 20.7), 17: (21.1, 21.1),
     18: (21.7, 21.4),
 }
-GLUCOSE_KCAL_PER_G = 3.4   # 葡萄糖一水合物（腹透液用糖）
-PD_ABSORB_ANCHORS = ((1.0, 0.30), (2.0, 0.38), (4.0, 0.55),
-                     (6.0, 0.65), (8.0, 0.72), (12.0, 0.80))
-PD_TRANSPORT_FACTOR = {"high": 1.15, "high_average": 1.05, "average": 1.0,
-                       "low_average": 0.92, "low": 0.85}
-PD_GLUCOSE_KCAL_PER_KG_REF = (7.5, 9.08)  # PRNT 引用的日吸收参考区间
+# 八审（2026-08-16）：GLUCOSE_KCAL_PER_G / PD_ABSORB_ANCHORS / PD_TRANSPORT_FACTOR /
+# PD_GLUCOSE_KCAL_PER_KG_REF 曾在此重复定义——单一事实源在 constants.py（targets.py
+# 已正确从 constants 导入），core 侧 4 个副本为**死常量**（全仓无引用，纯漂移风险：
+# 改 constants 不动 core 即出现两份不同数值）。已删除，统一从 constants 引用。
+
 
 # ---------------------------------------------------------------------------
 # ---- WS/T 586-2018 学龄儿童青少年 BMI 超重界值（M-3，2026-08-15）-------------

@@ -450,6 +450,12 @@ def comprehensive_nutrition_assessment_tool(
                 is_edema=bool(is_edema),
                 pd_glucose_kcal_per_day=pd_kcal,  # BUG-08：透传腹透扣减
                 albumin_g_L=serum_albumin_g_l,  # BUG-61：白蛋白参与摄入路径 PEW 筛查
+                # 八审（2026-08-16）：M1 修复不完整——DAG 此前只给 calc_prnt_targets
+                # 透传 height_age_years/high_urea_persistent（:403-404），摄入评估段漏传，
+                # 默认 high_urea_persistent=False 重算目标 → 同一患儿 PRNT 区块（蛋白下限
+                # 目标）与摄入达成率（上限目标）出现两个矛盾数字。此处与 :403-404 同口径。
+                height_age_years=float(height_age_years) if height_age_years is not None else None,
+                high_urea_persistent=high_urea_persistent,
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake
 
