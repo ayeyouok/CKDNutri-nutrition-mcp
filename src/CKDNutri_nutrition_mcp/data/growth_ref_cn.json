@@ -4,7 +4,7 @@
    "WS/T 423-2022 7岁以下儿童生长水平与营养状况的评价指标和评价方法 (Appendix B SD values)",
    "WS/T 612-2018 7岁~18岁儿童青少年身高发育等级评价 (Appendix A)"
   ],
-  "note": "Rows are [age_months, -3SD, -2SD, -1SD, median(0SD), +1SD, +2SD, +3SD] for WS/T 423-2022 Appendix B (7-band non-uniform SD; Z computed by piecewise interpolation via _z_from_bands, MED-GR-1). height_7_18 keeps [age_years, median, sd] (WS/T 612-2018 uniform 5-band).",
+  "note": "Rows are [age_months, -3SD, -2SD, -1SD, median(0SD), +1SD, +2SD, +3SD] for WS/T 423-2022 Appendix B (7-band non-uniform SD; Z computed by piecewise interpolation via _z_from_bands, MED-GR-1). height_7_18 keeps 8 columns too (WS/T 612-2018 5-band; ±3SD 由外侧斜率外推，十二审 2026-08-17：meta 此前陈旧声明 3 列 [age,median,sd]，实际已 8 列，更正)",
   "height_under7_max_months": 81,
   "weight_bmi_max_months": 81
  },
