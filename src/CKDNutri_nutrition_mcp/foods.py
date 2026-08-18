@@ -62,8 +62,13 @@ CONSTRAINT_MAP = {
     "low_protein": ("protein_g", "蛋白质", "lower"),
     "low protein": ("protein_g", "蛋白质", "lower"), "low-protein": ("protein_g", "蛋白质", "lower"),
     "等能量": ("energy_kcal", "能量", "iso_energy"), "iso_energy": ("energy_kcal", "能量", "iso_energy"),
-    "同热量": ("energy_kcal", "能量", "iso_energy"), "等热量": ("energy_kcal", "能量", "iso_energy"),
+    "同热量": ("energy_kcal", "能量", "iso_energy"),     "等热量": ("energy_kcal", "能量", "iso_energy"),
 }
+
+# P0-1（2026-08-18）：等能量替换按每千卡密度比较 K/P/Na，若候选食物的某电解质在
+# food_data.csv 中缺失（存为 0.0、missing_nutrients 已标记），密度比较会被静默当 0
+# 通过，把缺失数据食物当成"低钾/低磷/低钠"推荐。下列字段参与密度比较，候选缺失其一即剔除。
+_DENSITY_NUTRIENTS = ("potassium_mg", "phosphorus_mg", "sodium_mg")
 
 
 def _not_found(food: str) -> dict[str, Any]:
@@ -231,8 +236,11 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
         k_density_row = row["potassium_mg"] / base
         p_density_row = row["phosphorus_mg"] / base
         na_density_row = row["sodium_mg"] / base
+        # P0-1（2026-08-18）：缺失 K/P/Na 的候选按密度比较会被静默当 0，导致"缺失=低"误推荐
+        # （如羊乳粉 P=0 被当成低磷食物）。候选任一密度字段缺失即剔除。
         candidates = [item for item in pool
                       if item["energy_kcal"] > 0   # BUG-59：显式排除零能量项
+                      and not (set(item.get("missing_nutrients", [])) & set(_DENSITY_NUTRIENTS))
                       and abs(item["energy_kcal"] - base) / base <= 0.30
                       and item["potassium_mg"] / item["energy_kcal"] <= k_density_row
                       and item["phosphorus_mg"] / item["energy_kcal"] <= p_density_row
@@ -240,8 +248,19 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
         candidates.sort(key=lambda item: (abs(item["energy_kcal"] - base), -item["protein_g"]))
         rationale = "同食物角色内能量接近（±30%）且按能量密度折算后钾、磷总量不更高的食物，便于等能量平替"
     else:
+        # P0-1（2026-08-18）：约束字段在基准食物自身缺失时按 0 比较会误导推荐（如基准
+        # 磷缺失=0，则"更低磷"永远成立或永远不成立），显式拒绝并提示补数据。
+        if field in row.get("missing_nutrients", []):
+            return {"ok": True, "data": {
+                "base": food_card(row), "constraint": label, "role": role, "options": [],
+                "message": f"「{row['name']}」的{label}数据缺失，无法以它为准做"
+                           f"「更低{label}」替换推荐，请先补充该食物营养数据。",
+                "tip": _dekalium_tip(row), "source": FOOD_TABLE_REF}}
+        # P0-1（2026-08-18）：候选食物若约束字段缺失（存为 0.0），按 0 比较会"缺失=低"
+        # 误推荐（如全脂奶粉（羊乳粉）P=0 被当低磷）。该字段在 missing_nutrients 中即剔除。
         candidates = [item for item in pool
                       if item["energy_kcal"] > 0   # BUG-59：零能量项非有效替换，显式排除
+                      and field not in item.get("missing_nutrients", [])
                       and item[field] < row[field]]
         candidates.sort(key=lambda item: (item[field], -item["energy_kcal"]))
         rationale = f"同食物角色内{label}低于「{row['name']}」的食物，按{label}升序推荐"
@@ -341,7 +360,7 @@ def calc_pnpr(food: str | None = None, protein_g: float | None = None,
         row = find_food(food)
         if row is None:
             return _not_found(food)
-        scaled = scale_nutrients(row, float(grams or 100.0))
+        scaled = scale_nutrients(row, float(grams) if grams is not None else 100.0)
         protein = scaled["protein_g"]
         phosphorus = scaled["phosphorus_mg"]
         origin = f"内置食物表：{row['name']} {scaled['grams']:.0f} g"

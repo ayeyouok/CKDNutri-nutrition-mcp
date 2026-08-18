@@ -230,7 +230,11 @@ def find_food(query: str) -> dict[str, Any] | None:
                 if "水发" in n:
                     return 3
                 return 4
-            return min(group, key=_state_rank)
+            # P0-1（2026-08-18）：代表值优先选"缺失字段最少"的行——否则「全脂奶粉」会被
+            # 解析成 P=0 的羊乳粉变体（缺失全四电解质），基准营养素按 0 算，派生计算全错。
+            def _completeness(r: dict[str, Any]) -> int:
+                return len(r.get("missing_nutrients", []))
+            return min(group, key=lambda r: (_completeness(r), _state_rank(r)))
         # 4) 精确重名（名称完全相同）才做真数据冲突判定——CSV 已修正无精确重名，
         # 保留兜底防未来数据回归。
         _ELECTROLYTES = ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")

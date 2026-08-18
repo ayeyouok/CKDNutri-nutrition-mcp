@@ -18,6 +18,7 @@ import math
 import threading
 import os
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -273,7 +274,21 @@ _PRNT_BANDS = [
 
 
 def _round(x: float, n: int = 2) -> float:
-    return round(x, n)
+    """四舍五入（ROUND_HALF_UP，非银行家舍入），并归一化 -0.0 → 0.0。
+
+    P2（2026-08-18）：原 round() 为银行家舍入（33.25→33.2、2.5→2.0），且浮点表示会
+    产出 -0.0 / 1.2300000001 等展示抖动；临床展示应"四舍五入"，避免等级/数值误读。
+    """
+    if x is None:
+        return None
+    try:
+        d = Decimal(str(x)).quantize(Decimal(1).scaleb(-n), rounding=ROUND_HALF_UP)
+    except Exception:
+        return round(x, n)
+    f = float(d)
+    if f == 0.0:
+        f = 0.0  # 归一化 -0.0
+    return f
 
 
 def _band_for_age(age: float, sex: str) -> dict[str, Any]:
@@ -492,7 +507,11 @@ def calc_prnt_targets(
 
         # 腹透葡萄糖供能扣减：PD 患者从腹透液吸收葡萄糖，等量减少膳食能量目标
         pd_deduction = 0.0
-        if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
+        # P1（2026-08-18）：① Inf/NaN 拒绝——inf 会把能量扣成 0，静默低估膳食目标；
+        # ② 非透析（dm="none"）不应扣 PD 葡萄糖：无腹透则无葡萄糖吸收，扣减属数据错配
+        # （standard 方案标签"未透析"却仍扣 PD，能量目标被错误下压）。
+        if (pd_glucose_kcal_per_day is not None and math.isfinite(pd_glucose_kcal_per_day)
+                and pd_glucose_kcal_per_day > 0 and dm != "none"):
             pd_deduction = float(pd_glucose_kcal_per_day)
             energy_day = max(energy_day - pd_deduction, 0.0)
             e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
@@ -716,6 +735,17 @@ def assess_intake_vs_target(
                 "detail": "diet 需含 avg_energy_kcal 与 avg_protein_g"}
     # BUG-61 后补（2026-08-12）：键存在但值为 None（JSON null）时 .get(k, 0.0) 仍返回
     # None，float(None) 会抛未捕获 TypeError——统一 `or 0.0` 清洗，空值按 0 处理。
+    # P1（2026-08-18）：NaN/Inf 显式拒绝——`nan or 0.0` 仍为 nan（nan 为真值），会穿透
+    # 并在 _intake_pct_status(nan) 末支被静默判为"excess"（缺失摄入被误报为超标），临床误导。
+    for _name, _raw in (("avg_energy_kcal", diet.get("avg_energy_kcal")),
+                        ("avg_protein_g", diet.get("avg_protein_g")),
+                        ("avg_potassium_mg", diet.get("avg_potassium_mg")),
+                        ("avg_phosphorus_mg", diet.get("avg_phosphorus_mg")),
+                        ("avg_sodium_mg", diet.get("avg_sodium_mg"))):
+        _v = _raw if _raw is not None else 0.0
+        if not isinstance(_v, (int, float)) or isinstance(_v, bool) or not math.isfinite(float(_v)):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 必须为有限数值（NaN/Inf 拒绝），收到 {_raw!r}"}
     avg_e = float(diet.get("avg_energy_kcal") or 0.0)
     avg_p = float(diet.get("avg_protein_g") or 0.0)
     avg_k = float(diet.get("avg_potassium_mg") or 0.0)
@@ -824,6 +854,10 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     score 导致编排层无值可传）。打分规则透明：蛋白缺乏 40 分 + 能量缺乏 40 分 +
     低白蛋白 20 分；high ≥80、medium 40-60、low 0。
     """
+    # P1（2026-08-18）：albumin=nan/inf 视为"未提供"（与 None 同口径）——此前 nan 因
+    # `nan < 38` 恒 False 被静默当"不低白蛋白"，PEW 评分漏扣 20 分、低估风险。
+    if albumin_g_L is not None and not math.isfinite(albumin_g_L):
+        albumin_g_L = None
     protein_deficit = avg_p < floor_p
     energy_deficit = (avg_e / target_e) < 0.8 if target_e > 0 else False
     low_albumin = (albumin_g_L is not None and albumin_g_L < 38)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
@@ -938,11 +972,13 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     used = [e for d in days for e in by_day[d]]
     num_days = max(len(days), 1)
     avg = {
-        "avg_energy_kcal": sum(e.get("energy_kcal", 0.0) for e in used) / num_days,
-        "avg_protein_g": sum(e.get("protein_g", 0.0) for e in used) / num_days,
-        "avg_potassium_mg": sum(e.get("potassium_mg", 0.0) for e in used) / num_days,
-        "avg_phosphorus_mg": sum(e.get("phosphorus_mg", 0.0) for e in used) / num_days,
-        "avg_sodium_mg": sum(e.get("sodium_mg", 0.0) for e in used) / num_days,
+        # P1（2026-08-18）：条目营养键可能为 None（脏数据）→ `None + 0.0` 抛 TypeError 500；
+        # 用 `or 0.0` 清洗（None/空按 0 计），与 diary 写路径同口径 fail-soft。
+        "avg_energy_kcal": sum((e.get("energy_kcal") or 0.0) for e in used) / num_days,
+        "avg_protein_g": sum((e.get("protein_g") or 0.0) for e in used) / num_days,
+        "avg_potassium_mg": sum((e.get("potassium_mg") or 0.0) for e in used) / num_days,
+        "avg_phosphorus_mg": sum((e.get("phosphorus_mg") or 0.0) for e in used) / num_days,
+        "avg_sodium_mg": sum((e.get("sodium_mg") or 0.0) for e in used) / num_days,
     }
     return {"day_count": len(days), "entry_count": len(used), "diet_diary_3d": avg}
 

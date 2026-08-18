@@ -108,7 +108,7 @@ def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = Tr
 
 @mcp.tool
 def get_food_diary_summary_tool(patient_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
-    """查最近饮食日记脱敏摘要（含最近 3 日均值 diet_diary_3d）。家长须携带 guardian_token。"""
+    """查最近饮食日记摘要（含最近 3 日均值 diet_diary_3d；摘要含食物名称，非脱敏展示）。家长须携带 guardian_token。"""
     try:
         return get_food_diary_summary(patient_id, guardian_token)
     except Exception as exc:

@@ -270,6 +270,9 @@ def generate_meal_plan(
     veg_pool = sorted(vegs, key=lambda f: f["potassium_per_100g"])
     fruit_pool = sorted(fruits, key=lambda f: f["potassium_per_100g"])
     _FAT_MAX_G = 25.0  # 烹调油/黄油每日上限（油脂炸弹防护）
+    _STAPLE_MAX_G = 600.0  # P0-2（2026-08-18）：主食每日克数上限——低蛋白主食（如米粉(熟) 0.9g/100g）
+    #   按 40% 蛋白配额折算会爆到 1500g+/天、能量超目标 130%+，钳制并提示蛋白缺口由蛋白源补足。
+    _PROT_MAX_G = 400.0  # P0-2（2026-08-18）：蛋白源每日克数上限（同口径，防低蛋白"蛋白源"爆量）
 
     for d in range(days):
         # N-S6：主食/蛋白源按「预计 K+P 不超限」顺延选择——pool 已按低钾磷排序，
@@ -329,6 +332,14 @@ def generate_meal_plan(
         #    收进主食导致克数/蛋白失控（N-S6）
         staple_g = max(10, round(prot_staple_quota / staple["protein_per_100g"] * 100)) \
             if staple["protein_per_100g"] > 0 else 0
+        # P0-2（2026-08-18）：低蛋白主食按 40% 蛋白配额折算会爆量（米粉(熟) 0.9g/100g →
+        # 1556g/天、能量超 130%）。钳制到上限，蛋白缺口由蛋白源/补充剂补足，避免"主食炸弹"。
+        if staple_g > _STAPLE_MAX_G:
+            plan_warnings.append(
+                f"第 {d + 1} 天：主食「{staple['name']}」蛋白密度低"
+                f"（{staple['protein_per_100g']:.1f}g/100g），按 40% 蛋白配额需 {staple_g:.0f}g/天，"
+                f"已钳制为 {_STAPLE_MAX_G:.0f}g；主食蛋白不足部分由蛋白源/营养补充剂补足")
+            staple_g = int(_STAPLE_MAX_G)
         e_staple = staple_g * staple["energy_per_100g"] / 100
         prot_staple = staple_g * staple["protein_per_100g"] / 100
         # 3) 蛋白源：补差 = 目标蛋白 − 主食蛋白 − 蔬果蛋白（精确不超供）
@@ -336,6 +347,12 @@ def generate_meal_plan(
         rem_protein = max(0.0, target_protein_g - prot_staple - prot_veg_fruit)
         prot_g = max(0, round(rem_protein / prot["protein_per_100g"] * 100)) \
             if prot["protein_per_100g"] > 0 else 0
+        # P0-2（2026-08-18）：蛋白源克数上限钳制（同口径，低蛋白"蛋白源"不会爆量）
+        if prot_g > _PROT_MAX_G:
+            plan_warnings.append(
+                f"第 {d + 1} 天：蛋白源「{prot['name']}」克数 {prot_g:.0f}g 超安全上限"
+                f"{_PROT_MAX_G:.0f}g，已钳制；请检查该食物蛋白密度或目标蛋白设置")
+            prot_g = int(_PROT_MAX_G)
         # BUG-30 修复（2026-08-12）：蛋白能量统一用食物表总能量（energy_per_100g），
         # 此前用"蛋白g × 4 kcal/g"简化——对鸡蛋/瘦肉等含脂肪蛋白源会低估其能量贡献，
         # 导致 rem（脂肪额度）偏高、day_totals 实际能量系统性超 target。
@@ -351,6 +368,13 @@ def generate_meal_plan(
                 f"第 {d + 1} 天：食谱能量 {round(e_total, 0):.0f} kcal，缺口 {round(gap, 0):.0f} kcal"
                 "（蛋白已按目标精确配比、油脂已封顶 25g/天）——建议经临床评估后增加主食/"
                 "加餐分量或营养补充剂补足能量，避免限磷限钾下纯油脂补能")
+        # P0-2（2026-08-18）：超能告警（与缺口告警对称）——此前仅 deficit 告警，能量超目标
+        # （如低蛋白主食爆量）被静默放过，医生无感知。超 120 kcal 即显式告警。
+        elif gap < -120:
+            plan_warnings.append(
+                f"第 {d + 1} 天：食谱能量 {round(e_total, 0):.0f} kcal，超出目标 "
+                f"{round(-gap, 0):.0f} kcal（{round(e_total / target_energy_kcal * 100):.0f}%）"
+                "——建议减少主食/油脂分量，或经临床评估放宽能量目标")
 
         items = [
             _item(staple, staple_g), _item(prot, prot_g),
