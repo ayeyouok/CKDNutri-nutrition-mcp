@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from typing import Any, Optional
 
@@ -74,20 +75,34 @@ def _unwrap_plan(plan: Any) -> Any:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")  # C2（2026-08-15）：生产 stdout 可采集
-    # A3（2026-08-15）：启动 OTS 自检 fail-fast（对齐 P1）——此前缺 A207_OTS_* 参数时
-    # "服务活着但每个工具 INTERNAL_ERROR"（比启动失败更难发现，医疗数据读写全挂）。
     logger = logging.getLogger(__name__)
-    try:
-        from .nutrition_repository import get_repository
+    # P2-7（2026-08-18）：启动自检按后端条件分支（对齐 P1 临床数据域）——本地 JSON
+    # 开发模式（A207_STORAGE_BACKEND=json）此前无条件走 OTS 自检：LocalJsonRepository
+    # 无 _get_client → AttributeError 被误报为"无法连接表格存储"（误导排障），开发
+    # 环境无法启动。json → 跳过 OTS 自检；未知后端 → fail-fast SystemExit(1)。
+    from .nutrition_repository import STORAGE_BACKEND_ENV
 
-        repo = get_repository()
-        tables = repo._get_client().list_table()
-        logger.info("[ots-selfcheck] OK 已连通表格存储，表=%s", sorted(tables))
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
-            "环境变量与网络后重试；服务未启动。", type(exc).__name__)
-        raise SystemExit(1) from exc
+    backend = os.environ.get(STORAGE_BACKEND_ENV, "tablestore").strip().lower()
+    if backend not in ("tablestore", "json"):
+        logger.error("[selfcheck] FAIL A207_STORAGE_BACKEND=%r 非法（仅支持 "
+                     "tablestore/json），服务未启动。", backend)
+        raise SystemExit(1)
+    if backend == "json":
+        logger.info("[selfcheck] OK 本地 JSON 开发模式（A207_STORAGE_BACKEND=json），跳过 OTS 自检")
+    else:
+        # A3（2026-08-15）：启动 OTS 自检 fail-fast（对齐 P1）——此前缺 A207_OTS_* 参数时
+        # "服务活着但每个工具 INTERNAL_ERROR"（比启动失败更难发现，医疗数据读写全挂）。
+        try:
+            from .nutrition_repository import get_repository
+
+            repo = get_repository()
+            tables = repo._get_client().list_table()
+            logger.info("[ots-selfcheck] OK 已连通表格存储，表=%s", sorted(tables))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
+                "环境变量与网络后重试；服务未启动。", type(exc).__name__)
+            raise SystemExit(1) from exc
     mcp.run()
 
 

@@ -250,10 +250,13 @@ def test_med1_missing_nutrients_flag():
     assert rows, "食物表为空"
     # H1（2026-08-15）：四电解质全 0 行（68 行）现被正确标记缺失——断言放宽为
     # "标记的行确实四电解质全 0/空"，而非"全部无缺失"
+    # P0-1（2026-08-18）：缺失判定升级——单列 K/P 字面 0 也标记缺失（荔枝干 K=0 真实
+    # ≈900、籼稻谷 P=0 真实≈110），断言改为"**每个被标记的键值确实为 0**"（旧断言
+    # "被标记 ⇒ 四电解质全 0"编码的是 H1 旧语义，与 P0-1 单列缺失扩展矛盾）。
     missing_rows = [r for r in rows if r.get("missing_nutrients")]
     assert missing_rows, "应存在被标记的缺失行（H1 四电解质全 0 检测）"
     for r in missing_rows:
-        for k in ("potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg"):
+        for k in r["missing_nutrients"]:
             assert r[k] in (0, 0.0), (r["name"], k, r[k])
 
     # 构造缺失行验证提示路径

@@ -35,21 +35,71 @@ _GRAM_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(kg|千克|公斤|g|克|ml|毫升|mL|
 _NUM_RE = re.compile(r"^(\d+(?:\.\d+)?)")
 
 
+def _cn_numeral(s: str) -> float | None:
+    """把中文数字前缀（1-99）解析为数值；不是数字前缀返回 None。
+
+    P1-3（2026-08-18）：复合中文数词此前只取首字——"二十个"被解析成 2 个（10 倍
+    低估）、"十二碗"解析成 1 碗。现支持 十/十一~十九/二十~九十九 组合。
+    """
+    digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if not s:
+        return None
+    if s[0] == "十":
+        # 十 / 十一~十九
+        if len(s) >= 2 and s[1] in digits:
+            return float(10 + digits[s[1]])
+        return 10.0
+    if s[0] in digits:
+        if len(s) == 1:
+            return float(digits[s[0]])
+        if s[1] == "十":
+            # 二十 / 二十三 / 九十
+            base = digits[s[0]] * 10
+            if len(s) >= 3 and s[2] in digits:
+                return float(base + digits[s[2]])
+            return float(base)
+        if s[1] in digits:
+            # 十一~九十九 的无"十"简写（如"三五"），按十位+个位
+            return float(digits[s[0]] * 10 + digits[s[1]])
+        return float(digits[s[0]])
+    return None
+
+
 def _parse_quantity(text: str) -> tuple[float, str]:
     """从量具串首部剥离数量，返回 (数量, 剩余量词串)。"""
     for word, value in sorted(CN_FRACTION.items(), key=lambda kv: -len(kv[0])):
         if text.startswith(word):
             return value, text[len(word):]
+    # P1-3（2026-08-18）：通用分数词 "X分之一"（二分之一/五分之一/十分之一…）——
+    # 此前仅枚举了 三分之一/四分之一/四分之三，"二分之一碗"被解析成 2 碗（4 倍高估）。
+    _frac = re.match(r"^([零一二两三四五六七八九十]{1,2})分之一", text)
+    if _frac:
+        n = _cn_numeral(_frac.group(1))
+        if n and n > 0:
+            return 1.0 / n, text[_frac.end():]
     match = _NUM_RE.match(text)
     if match:
         return float(match.group(1)), text[match.end():]
     if text and text[0] in CN_NUMBER:
-        head = CN_NUMBER[text[0]]
-        rest = text[1:]
+        # P1-3（2026-08-18）：复合中文数词（二十/十二/二十三）——此前只取首字
+        # （"二十个"→2 个，10 倍低估）。_cn_numeral 解析 1-2 字前缀后按实际长度剥离。
+        cn_val = _cn_numeral(text)
+        if cn_val is not None:
+            head = cn_val
+            head_len = 2 if len(text) >= 2 and (text[1] in CN_NUMBER or text[0] == "十") else 1
+        else:
+            head = CN_NUMBER[text[0]]
+            head_len = 1
+        rest = text[head_len:]
         if rest.startswith("点") and len(rest) > 1 and rest[1] in CN_NUMBER:
             return head + CN_NUMBER[rest[1]] / 10.0, rest[2:]
         if rest.startswith("半"):
             return head + 0.5, rest[1:]
+        # P1-3（2026-08-18）："X个半"（2.5 份）——数量后跟量词再跟"半"，如"两个半"。
+        # 此时 rest="个半"，半份附在量词后：0.5 并入数量、量词保留。
+        if len(rest) >= 2 and rest.endswith("半"):
+            return head + 0.5, rest[:-1]
         return head, rest
     return 1.0, text
 
@@ -73,6 +123,20 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
         if token and text.endswith(token) and text != token:
             text = text[: -len(token)]
     text = text or "1份"
+
+    # P2-4（2026-08-18）：尾部括号解析——
+    # ① "1碗(200g)"：括号内克重为**权威值**（此前被无视，按碗 150g 计，摄入低估 25%）；
+    # ② "30g(干)"：括号内无克重（规格说明）→ 剥离括号后按常规解析（此前整体回落 1 份，
+    #    30g 被记成 100g，3 倍高估）。
+    _trail = re.search(r"[（(]([^）)]*)[)）]$", text)
+    if _trail:
+        _inner = _trail.group(1).strip()
+        _gm = re.match(r"^(\d+(?:\.\d+)?)\s*(g|克|ml|毫升)$", _inner, re.I)
+        if _gm:
+            _v = float(_gm.group(1))
+            return {"grams": _v, "resolved": True,
+                    "basis": f"按括号标注克重 {_v:.0f} g 计（{text}）"}
+        text = (text[:_trail.start()] or text).strip()
 
     match = _GRAM_RE.match(text)
     if match:

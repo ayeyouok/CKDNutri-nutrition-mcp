@@ -99,6 +99,17 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                 else:
                     row["missing_nutrients"] = [k for k in NUTRIENT_KEYS
                                                  if not (raw.get(k) or "").strip()]
+                    # P0-1（2026-08-18）：**单列字面 0 判定**——钾/磷是真实食物必有成分
+                    # （荔枝(干) 真实 K≈900、藜麦/鸭蛋白蛋白>0 必有磷），单列 K=0/P=0 是
+                    # CSV 数据缺失而非真实零值；此前只判"四电解质全 0"（H1），单列 0 落空
+                    # → 低钾 top1 荔枝(干) K=0 被当低钾推荐（真实高钾，56 倍级误导）、
+                    # 低磷 top1 藜麦 P=0 同理，且 foods.py 的 missing_nutrients 防线不命中。
+                    # 钠单列 0 **不判**（H1 保留：谷物/天然食材低钠是成分表正常标注，
+                    # 51% 钠 0 属正常分布）。空串分支上面已覆盖，此处仅补字面 0。
+                    for _k in ("potassium_mg", "phosphorus_mg"):
+                        if (raw.get(_k) or "").strip() in ("0", "0.0") \
+                                and _k not in row["missing_nutrients"]:
+                            row["missing_nutrients"].append(_k)
                 row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
                 row["phosphorus_level"], row["phosphorus_label"] = classify(row["phosphorus_mg"], P_LEVELS)
                 row["sodium_high"] = row["sodium_mg"] >= NA_HIGH_MG_PER_100G
@@ -132,24 +143,29 @@ def _match_score(row: dict[str, Any], query: str) -> float:
     仅对主名生效。原因：别名语义是「同一食物的另一种叫法」，不是「包含该词的食物」——
     此前「粟米」子串命中别名「粟米油」→ 误匹配「大麻油」；「西红柿」命中「奶柿子」
     同类误伤。别名一旦精确命中即 score=0（最高优先）。
+    P1-1（2026-08-18）：**括号归一化**——foods_ckd.json 显示名/用户输入常用半角
+    （"米粉(熟)"），主表全角（"米粉（熟）"），半角不归一导致"米粉(熟)"模糊命中
+    "米粉"（干）349 kcal 错行 3.2 倍；比较前统一半角→全角。
     """
+    q = query.replace("(", "（").replace(")", "）").strip()
     best = 99.0
     # 1) 别名：只允许精确匹配（方言词入别名后即精确命中，杜绝子串误伤）
     for alias in row["aliases"]:
-        if alias == query:
+        if alias == q or alias == query:
             return 0.0
     # 2) 主名：保留前缀/子串/相似度（名称是描述性短语，模糊匹配合理）
     name = row["name"]
-    if name == query:
+    norm_name = name.replace("(", "（").replace(")", "）")
+    if norm_name == q:
         best = 0.0
-    elif name.startswith(query) or query.startswith(name):
+    elif norm_name.startswith(q) or q.startswith(norm_name):
         best = min(best, 1.0)
-    elif query in name:
+    elif q in norm_name:
         best = min(best, 2.0)
-    elif name in query:
+    elif norm_name in q:
         best = min(best, 3.0)
     else:
-        ratio = difflib.SequenceMatcher(None, query, name).ratio()
+        ratio = difflib.SequenceMatcher(None, q, norm_name).ratio()
         # 阈值收紧到 0.80：1752 食物下表，过低会张冠李戴（如“猪瘦肉”误匹配“猪肉脯”）。
         if ratio >= 0.80:
             best = min(best, 4.0 + (1.0 - ratio) * 10.0)
@@ -165,8 +181,15 @@ def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
     "100g"）同理拒绝。返回空列表由调用方转 INVALID_INPUT / 提示细化关键词。
     """
     text = (query or "").strip()
-    if not text or len(text) < 2:
+    if not text:
         return []
+    # P1-2（2026-08-18）：单字符仅允许**精确命中**（别名/主名 == 查询，如显示名"梨"→
+    # 梨（代表值）别名）——P0-6 的"单字符拒绝"防的是子串误伤（"鱼"→鱼腥草叶），
+    # 精确命中是数据层已声明的别名关系，安全放行。
+    if len(text) < 2:
+        exact = [row for row in load_foods()
+                 if row["name"] == text or text in row["aliases"]]
+        return exact[:limit]
     # 数字串（如 "123"）不是食物名，拒绝
     if text.isdigit():
         return []
@@ -175,8 +198,14 @@ def search_food(query: str, limit: int = 5) -> list[dict[str, Any]]:
     # 此前 (score, name) 按名称升序，全角括号码点（U+FF08）> 汉字码点，导致
     # "苹果梨"排在"苹果（代表值）"前（苹果→苹果梨 K=180 误匹配）；代表值行
     # 是中国食物成分表的通用主条目，必须优先于变体。
+    # P1-2（2026-08-18）：排序键增 **base_name 精确** 优先级——此前"粳米"在
+    # 粳米（标一）与粳米粥 之间同分（1.0 前缀），名称短者（粳米粥 3 字）胜出，
+    # 干粮被替换成粥（K 13 vs 97 低估）；base_name == 查询 的规格行（粳米（标一）
+    # base=粳米）优先。同理"猪蹄筋(泡发)" base=猪蹄筋 优先于 猪蹄（子串 3.0 同分）。
     hits = sorted([item for item in scored if item[1] < 90.0],
-                  key=lambda x: (x[1], 0 if "代表值" in x[0]["name"] else 1,
+                  key=lambda x: (x[1],
+                                 0 if base_name(x[0]["name"]) == base_name(text) else 1,
+                                 0 if "代表值" in x[0]["name"] else 1,
                                  len(x[0]["name"]), x[0]["name"]))
     return [row for row, _ in hits[:limit]]
 
@@ -286,18 +315,45 @@ def scale_nutrients(row: dict[str, Any], grams: float,
     if grams < 0:
         raise ValueError(f"grams 不能为负（收到 {grams}）——负克重通常是录入错误")
     ratio = grams / 100.0
-    method = COOKING_ALIAS.get((cooking or "").strip(), (cooking or "raw").strip())
+    raw_method = (cooking or "").strip()
+    # P2-5（2026-08-18）：**组合烹调**支持——"焯水+浸泡"等用 "+"（全角/半角）连接的
+    # 组合此前未命中 COOKING_ALIAS 回落 raw（临床最常用的"先焯后泡"被当生食，钾保留
+    # 系数 1.0 高估）；现拆分为多段分别取系数后**相乘**（顺序无关，各段系数独立）。
+    segments = [s.strip() for s in re.split(r"[+＋]", raw_method) if s.strip()]
+    method = None
+    factors: dict[str, float] = {}
     cooking_note: str | None = None
-    if method not in COOKING_LOSS:
+    _labels: list[str] = []
+    _is_combination = False
+    if len(segments) > 1:
+        all_known = True
+        for seg in segments:
+            m = COOKING_ALIAS.get(seg)
+            if m is None or m not in COOKING_LOSS:
+                all_known = False
+                break
+            f = COOKING_LOSS[m]["factor"]
+            for k, v in f.items():
+                factors[k] = factors.get(k, 1.0) * v
+            _labels.append(COOKING_LOSS[m]["label"])
+        if all_known:
+            method = "+".join(_labels)
+            _is_combination = True
+    if method is None:
+        method = COOKING_ALIAS.get(raw_method, raw_method or "raw")
+    # 组合 method 是 label 拼接串（非 COOKING_LOSS 键），跳过回落判定
+    if not _is_combination and method not in COOKING_LOSS:
         # P2 其余（2026-08-15）：未知 cooking 静默回落 raw（系数 1.0，如"蒸"被当生食
         # 算）会高估钾磷实际摄入——回落保留（数值契约）但显式标记，供日记层提示。
         cooking_note = (f"烹调方式「{cooking}」不在受支持集合"
                         f"（{'/'.join(COOKING_LOSS)}），已按生食（raw，保留系数 1.0）计算，"
                         "请核实输入")
         method = "raw"
-    factors = COOKING_LOSS[method]["factor"]
+    if not factors:
+        factors = COOKING_LOSS[method]["factor"]
     out: dict[str, Any] = {"grams": round(grams, 1), "cooking": method,
-                           "cooking_label": COOKING_LOSS[method]["label"]}
+                           "cooking_label": method if "+" in method
+                           else COOKING_LOSS[method]["label"]}
     if cooking_note:
         out["cooking_warning"] = cooking_note
     for key in NUTRIENT_KEYS:

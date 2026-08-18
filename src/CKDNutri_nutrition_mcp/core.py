@@ -83,6 +83,10 @@ def _repo():
 # 写权判定经 enforce_nutrition_tool 工具级 ACL（P1-1：单一事实源在 a207_policy），
 # 本包不再维护本地写白名单（2026-08-12 双轨制清理）。
 
+# P2-1（2026-08-18）：日记餐次白名单——此前 meal 零校验任意值落库（幂等键混入
+# dict/list 还会抛不可哈希 500）；儿科 CKD 日记餐次收敛为四档。
+_MEAL_TYPES: frozenset[str] = frozenset({"早餐", "午餐", "晚餐", "加餐"})
+
 # ---------------------------------------------------------------------------
 # 家长-患儿绑定核验（与 P1 his.py 共享 guardian_tokens.json 状态库）
 # 需求：家长受限视图必须经监护人令牌绑定核验（同 HIS get_labs 的 _guard_guardian）。
@@ -419,6 +423,12 @@ def calc_prnt_targets(
         raise ValueError("age_years 必须为不小于 0 的有限数值")
     if not math.isfinite(weight_kg) or weight_kg <= 0:
         raise ValueError("weight_kg 必须为 > 0 的有限数值")
+    # P0-3（2026-08-18）：height_cm 有限性校验——此前仅校验 age/weight，height_cm=NaN
+    # 穿透到 schofield_bmr_kcal（`NaN <= 0` 恒 False → 不返回 None）产出 NaN BMR，
+    # schofield_cross 输出 NaN + flag="consistent"（非法 JSON 字面量 + 反方向误导）。
+    # 0 保留为"未提供"哨兵（schofield 跳过交叉校验，既有语义）；NaN/Inf/负拒绝。
+    if not math.isfinite(height_cm) or height_cm < 0:
+        raise ValueError("height_cm 必须为不小于 0 的有限数值（0=未提供，跳过 Schofield 交叉校验）")
     if growth_status not in ("normal", "failure", "overweight"):
         raise ValueError(
             f"growth_status 必须是 normal / failure / overweight 之一，收到：{growth_status!r}")
@@ -930,6 +940,14 @@ def assess_pew_risk(
     if target_protein_g <= 0 or target_energy_kcal <= 0:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "target_protein_g 与 target_energy_kcal 必须 > 0"}
+    # P1-5（2026-08-18）：floor_protein_g 校验——此前零校验直通 _screen_pew：
+    # floor=0/-5 使"蛋白低于下限"恒不成立 → PEW 假阴性（risk=low, score=0）；
+    # floor=inf 使"蛋白低于下限"恒成立 → 恒判 medium/40；bool/NaN 同理穿透。
+    if floor_protein_g is not None and (
+            isinstance(floor_protein_g, bool)
+            or not math.isfinite(floor_protein_g) or floor_protein_g <= 0):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"floor_protein_g 必须为 > 0 的有限数值（收到 {floor_protein_g!r}）"}
     floor_p = floor_protein_g if floor_protein_g is not None else target_protein_g * 0.85
     pew = _screen_pew(avg_protein_g, avg_energy_kcal, floor_p, target_energy_kcal, albumin_g_L)
     # S2 修复（2026-08-13）：透出数值 score——record_pew_risk.score 契约字段
@@ -966,19 +984,32 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     对照会触发能量不足误报与 PEW 假阳性。
     """
     by_day: dict[str, list[dict[str, Any]]] = {}
+    # P1-6（2026-08-18）：非 dict 条目跳过——此前 store 混入 None/str 条目（旧版本
+    # 写入或外部污染）时 `e.get` 抛 AttributeError → 500，且每次读都崩（日记永久
+    # 不可读）。写路径 F-4 已防新脏数据，读路径对历史脏条目 fail-soft 跳过（脏条目
+    # 无营养值可贡献，剔除不改变均值语义）。
     for e in entries:
+        if not isinstance(e, dict):
+            continue
         by_day.setdefault(e.get("date", ""), []).append(e)
     days = sorted(by_day.keys(), reverse=True)[:3]
     used = [e for d in days for e in by_day[d]]
     num_days = max(len(days), 1)
+    # P3（2026-08-18）：NaN 清洗——`or 0.0` 拦不住 NaN（NaN 是 truthy），写路径
+    # N-S4 已拒 NaN，但历史脏数据仍会经 sum() 产出 NaN 键；非有限值按 0 计（fail-soft，
+    # 与 `or 0.0` 的 None 口径对齐）。
+    def _num(v: Any) -> float:
+        if isinstance(v, bool):
+            return 0.0
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            return float(v)
+        return 0.0
     avg = {
-        # P1（2026-08-18）：条目营养键可能为 None（脏数据）→ `None + 0.0` 抛 TypeError 500；
-        # 用 `or 0.0` 清洗（None/空按 0 计），与 diary 写路径同口径 fail-soft。
-        "avg_energy_kcal": sum((e.get("energy_kcal") or 0.0) for e in used) / num_days,
-        "avg_protein_g": sum((e.get("protein_g") or 0.0) for e in used) / num_days,
-        "avg_potassium_mg": sum((e.get("potassium_mg") or 0.0) for e in used) / num_days,
-        "avg_phosphorus_mg": sum((e.get("phosphorus_mg") or 0.0) for e in used) / num_days,
-        "avg_sodium_mg": sum((e.get("sodium_mg") or 0.0) for e in used) / num_days,
+        "avg_energy_kcal": sum(_num(e.get("energy_kcal")) for e in used) / num_days,
+        "avg_protein_g": sum(_num(e.get("protein_g")) for e in used) / num_days,
+        "avg_potassium_mg": sum(_num(e.get("potassium_mg")) for e in used) / num_days,
+        "avg_phosphorus_mg": sum(_num(e.get("phosphorus_mg")) for e in used) / num_days,
+        "avg_sodium_mg": sum(_num(e.get("sodium_mg")) for e in used) / num_days,
     }
     return {"day_count": len(days), "entry_count": len(used), "diet_diary_3d": avg}
 
@@ -1034,6 +1065,18 @@ def upsert_food_diary(
         if not isinstance(_e, dict):
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"entries[{_i}] 必须为对象（dict），收到 {type(_e).__name__}"}
+    # P2-1（2026-08-18）：meal 枚举校验——此前零校验，"夜宵"/123/None/"第25餐" 全部
+    # 落库（幂等键 content_key=(date,meal,food) 混入 dict/list 时抛不可哈希 TypeError
+    # 500）；显式白名单 + 拒绝不可哈希类型（dict/list/set → INVALID_INPUT）。
+    for _i, _e in enumerate(entries):
+        _meal = _e.get("meal")
+        if _meal is None or _meal == "":
+            continue
+        if isinstance(_meal, (dict, list, set, tuple)) or not isinstance(_meal, str) \
+                or _meal.strip() not in _MEAL_TYPES:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"entries[{_i}].meal 必须为 {_MEAL_TYPES} 之一"
+                              f"（收到 {_meal!r}）"}
 
     with _STORE_LOCK:
         # N-MEM-2（2026-08-14）：患者级读——此前 _load_store() 全表 GetRange +
@@ -1583,6 +1626,15 @@ def calc_growth_zscore(age_years: float, sex: str,
         growth_status = "failure"          # 生长迟缓 → 能量取 SDI 上限
     elif waz_z is not None and waz_z < -2:
         growth_status = "failure"          # 低体重/消瘦 → 能量取 SDI 上限
+    elif baz_z is not None and baz_z < -2:
+        # P0-2（2026-08-18）：**BAZ<-2 消瘦 → failure**——此前决策链只认 HAZ/WAZ 负向
+        # 与 BAZ 正向（≥1 超重），BAZ=-2.43 时 _baz_nutrition 判"消瘦"但 growth_status
+        # 落 else 判 normal（同函数自相矛盾），急性营养不良患儿能量按 SDI 中点而非上限
+        # （促生长）。消瘦属生长衰竭（与 HAZ/WAZ<-2 同口径），取 SDI 上限。
+        growth_status = "failure"
+        warnings.append(
+            f"BAZ {baz_z:.2f} < -2（消瘦，WS/T 423 年龄别 BMI），判生长衰竭，"
+            "能量按 SDI 上限（促生长）；请结合临床评估。")
     elif baz_z is not None and baz_z >= 1:
         growth_status = "overweight"        # BAZ≥1 → 超重/肥胖，能量向下调整
     elif baz_z is None and bmi is not None and age_months >= 84:
@@ -1613,7 +1665,16 @@ def calc_growth_zscore(age_years: float, sex: str,
                     "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
             growth_status = "normal"
         else:
-            growth_status = "normal"
+            # P2-6（2026-08-18）：≥18 岁 WS/T 586 超窗（_ws586 上限 18.0）——此前
+            # _ov_thr=None 静默落 normal，18.5 岁 BMI 33.8 判 normal（超窗静默）。
+            # 成人超重界值按中国标准 BMI≥24（28 及以上为肥胖），能量同样向下调整。
+            if age_years > 18.0 and bmi >= 24.0:
+                growth_status = "overweight"
+                warnings.append(
+                    f"≥18 岁无 WS/T 儿童界值，BMI {bmi:.1f} ≥ 24（中国成人超重界值），"
+                    "判超重；能量向下调整。")
+            else:
+                growth_status = "normal"
     else:
         growth_status = "normal"
     d["growth_status_suggestion"] = growth_status
@@ -1668,6 +1729,11 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     # LOW-3 修复（2026-08-15）：score 有限性校验（对齐 N-S4 写路径口径）——此前
     # score 直接落库，NaN/Inf 可静默入库（读路径比较恒 False → 趋势判定失真、无告警），
     # 与 diary 写路径同口径 fail-closed。
+    # P1-4（2026-08-18）：bool 在 float() 转换**之前**拒绝（float(True)=1.0 此前
+    # 静默入库）；随后校验有限性与契约域 0-100（score=500/-50/101 拒绝）。
+    if isinstance(score, bool):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"score 不能为 bool（收到 {score!r}）"}
     try:
         score = float(score)
     except (TypeError, ValueError):
@@ -1676,6 +1742,9 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     if not math.isfinite(score):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"score 必须为有限数值（NaN/Inf 拒绝）：{score!r}"}
+    if not (0.0 <= score <= 100.0):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"score 必须为 0-100 的数值（收到 {score!r}）"}
     # BUG-60：PEW 历史按日期排序去重，日期必须归一化，否则异形日期破坏时间线
     date = _normalize_date(date, "date")
     # 边界（2026-08-15）：未来日期拒绝——未来 PEW 点会成为趋势窗口的"未来锚点"
@@ -1731,14 +1800,22 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     pts = store.get(patient_id, [])
     trend = "no_data"
     if len(pts) >= 2:
-        first, last = pts[0], pts[-1]
-        fo, lo = _PEW_LEVEL_ORDER.get(first["level"], 0), _PEW_LEVEL_ORDER.get(last["level"], 0)
-        if lo > fo:
-            trend = "worsening"
-        elif lo < fo:
-            trend = "improving"
-        else:
-            trend = "stable"
+        # P1-7（2026-08-18）：legacy/脏点缺 level 不再 KeyError 500——此前
+        # `first["level"]` 直索引（.get 只护外层字典），旧数据缺 level 时整接口崩。
+        # 过滤出 level 合法的点参与趋势；不足 2 个有效点 → no_data（fail-closed，
+        # 不把缺 level 的点当 low 静默参与趋势——可能掩盖历史高风险）。
+        valid = [p for p in pts
+                 if isinstance(p, dict)
+                 and str(p.get("level", "")).strip().lower() in _PEW_LEVEL_ORDER]
+        if len(valid) >= 2:
+            first, last = valid[0], valid[-1]
+            fo, lo = _PEW_LEVEL_ORDER[first["level"]], _PEW_LEVEL_ORDER[last["level"]]
+            if lo > fo:
+                trend = "worsening"
+            elif lo < fo:
+                trend = "improving"
+            else:
+                trend = "stable"
     # 一般 2（2026-08-14）：信封统一 {ok, data}——此前扁平 {ok, patient_id, count,
     # points, trend} 与 record_pew_risk 的 {ok, data} 不一致（core.py:1346 注释自称
     # "统一"但并未统一），编排层需双形态兼容。消费方（care get_pew_timeline /

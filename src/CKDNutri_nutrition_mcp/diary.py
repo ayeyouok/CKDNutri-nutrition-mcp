@@ -2,6 +2,7 @@
 """饮食日记汇总与目标达成率评估。"""
 from __future__ import annotations
 
+from datetime import date as _date, datetime, timezone
 from typing import Any
 
 from a207_policy import enforce_read, get_caller
@@ -158,6 +159,16 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         except ValueError:
             date = str(raw_date)
             bad_dates.append(str(raw_date))  # BUG-64：计数并随结果警告
+        # P2-2（2026-08-18）：未来日期排除——写路径已拒未来（upsert 未来日期
+        # INVALID_INPUT），读路径此前照吃（2099-01-01 条目成为最新"今天"，3 日均值
+        # 被拉向未来、今日摄入缺失且无告警）；与写路径同口径（UTC 业务日）跳过并告警。
+        if date != "未标注日期":
+            try:
+                if _date.fromisoformat(date) > datetime.now(timezone.utc).date():
+                    bad_dates.append(str(raw_date))
+                    continue
+            except ValueError:
+                pass  # 非 ISO 日期已在上面分桶（宽容归一化路径），不重复拦截
         bucket = per_day.setdefault(date, {"date": date, "items": 0, "totals": _blank_totals()})
         bucket["items"] += 1
         for key in SUM_KEYS:
