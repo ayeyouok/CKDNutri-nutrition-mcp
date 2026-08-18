@@ -233,19 +233,30 @@ class TablestoreRepository(TablestoreBase):
         entries: list[dict[str, Any]] = []
         for item in self._range_all(TABLE_FOOD_DIARY, ["patient_id"]):
             raw = item["attrs"].get("entries")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    # X1（2026-08-14）：损坏 JSON 一律抛错（fail-closed，与 JSON 端
-                    # _read_json_file 同口径）——此前 except 静默置 []，读到的空列表经
-                    # save_diary 全量覆盖写回 → 患儿饮食日记**永久丢失**且无任何告警。
-                    # 损坏即显式失败，交由上层定位（人工修复或降级），绝不静默。
-                    raise RuntimeError(
-                        f"饮食日记列 entries 损坏（非法 JSON）：{exc}——拒绝静默清空，"
-                        "请人工修复 Tablestore 该行数据") from exc
-                if isinstance(data, list):
-                    entries.extend(data)
+            if raw is None:
+                continue
+            # P1-9（2026-08-18 四审）：非字符串 entries 类型 fail-closed——此前仅
+            # `isinstance(raw, str)` 走解析，dict/list 等错误类型被静默跳过（读到的
+            # 空列表经 save 覆盖写回 → 日记**永久丢失**且无告警，同 X1 原则）。
+            if not isinstance(raw, str):
+                raise RuntimeError(
+                    f"饮食日记列 entries 类型错误：期望 JSON 字符串，实际为 "
+                    f"{type(raw).__name__}——拒绝静默清空，请人工修复 Tablestore 该行数据")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                # X1（2026-08-14）：损坏 JSON 一律抛错（fail-closed，与 JSON 端
+                # _read_json_file 同口径）——此前 except 静默置 []，读到的空列表经
+                # save_diary 全量覆盖写回 → 患儿饮食日记**永久丢失**且无任何告警。
+                # 损坏即显式失败，交由上层定位（人工修复或降级），绝不静默。
+                raise RuntimeError(
+                    f"饮食日记列 entries 损坏（非法 JSON）：{exc}——拒绝静默清空，"
+                    "请人工修复 Tablestore 该行数据") from exc
+            if not isinstance(data, list):
+                raise RuntimeError(
+                    f"饮食日记列 entries 解析结果类型错误：期望 list，实际为 "
+                    f"{type(data).__name__}——拒绝静默清空，请人工修复 Tablestore 该行数据")
+            entries.extend(data)
         return {"entries": entries}
 
     def save_diary(self, store: dict[str, Any]) -> None:

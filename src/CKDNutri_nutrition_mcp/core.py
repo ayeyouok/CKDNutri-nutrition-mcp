@@ -421,6 +421,13 @@ def calc_prnt_targets(
     # NaN 体重会静默产出 NaN 能量/蛋白目标（脏数据参与临床判定且无任何提示）。
     if not math.isfinite(age_years) or age_years < 0:
         raise ValueError("age_years 必须为不小于 0 的有限数值")
+    # P0-2（2026-08-18 四审）：PRNT 2020 适用域上限 18——此前 age_years>18 仅附
+    # Warning 仍按 15-17 岁段生成完整处方（上游 LLM/调用方极易直接误用成少年目标）；
+    # 超域即拒绝（与下方 height_age_years>18 拒绝同口径 fail-closed）。
+    if age_years > 18:
+        raise ValueError(
+            f"age_years={age_years} 超出 PRNT 2020 适用域（0-18 岁）：15-17 岁段参数"
+            "不适用于成人，拒绝生成处方（成人营养目标请按成人标准另行计算）")
     if not math.isfinite(weight_kg) or weight_kg <= 0:
         raise ValueError("weight_kg 必须为 > 0 的有限数值")
     # P0-3（2026-08-18）：height_cm 有限性校验——此前仅校验 age/weight，height_cm=NaN
@@ -520,11 +527,27 @@ def calc_prnt_targets(
         # P1（2026-08-18）：① Inf/NaN 拒绝——inf 会把能量扣成 0，静默低估膳食目标；
         # ② 非透析（dm="none"）不应扣 PD 葡萄糖：无腹透则无葡萄糖吸收，扣减属数据错配
         # （standard 方案标签"未透析"却仍扣 PD，能量目标被错误下压）。
-        if (pd_glucose_kcal_per_day is not None and math.isfinite(pd_glucose_kcal_per_day)
-                and pd_glucose_kcal_per_day > 0 and dm != "none"):
-            pd_deduction = float(pd_glucose_kcal_per_day)
-            energy_day = max(energy_day - pd_deduction, 0.0)
-            e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
+        # P0-1（2026-08-18 四审）：扣减条件收紧为 **dm == "peritoneal"**——此前
+        # `dm != "none"` 使 **HD（hemodialysis）患儿也扣 PD 葡萄糖**（血液透析不吸收
+        # 透析液葡萄糖，膳食目标被错误下压）；且非 peritoneal 模式传入
+        # pd_glucose_kcal_per_day 属数据错配，显式拒绝（严禁带 Warning 的错误计算结果）。
+        if pd_glucose_kcal_per_day is not None:
+            if not math.isfinite(pd_glucose_kcal_per_day) or pd_glucose_kcal_per_day < 0:
+                raise ValueError(
+                    f"pd_glucose_kcal_per_day 必须为不小于 0 的有限数值"
+                    f"（收到 {pd_glucose_kcal_per_day!r}）")
+            # 用**患者级 dialysis_mode**（外层归一化值）判定——_plan 内层 dm 是方案场景
+            # 标签（standard 方案恒传 "none"=未透析场景，与患者实际透析状态无关），
+            # 用 dm 会把腹膜透析患儿的两个方案都误拒。
+            if pd_glucose_kcal_per_day > 0 and dialysis_mode != "peritoneal":
+                raise ValueError(
+                    f"pd_glucose_kcal_per_day 仅适用于腹膜透析（peritoneal），"
+                    f"当前 dialysis_mode={dialysis_mode!r}——HD/未透析患儿不吸收透析液"
+                    "葡萄糖，禁止扣减；请核对输入")
+            if dialysis_mode == "peritoneal" and pd_glucose_kcal_per_day > 0:
+                pd_deduction = float(pd_glucose_kcal_per_day)
+                energy_day = max(energy_day - pd_deduction, 0.0)
+                e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
 
         # 蛋白质：默认目标=SDI 上限（促生长）；高尿素血症 → 目标降至 SDI 下限（保能量）；
         # 下限为最低安全量（防 PEW）；透析额外补充叠加（补偿丢失）
@@ -864,10 +887,16 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     score 导致编排层无值可传）。打分规则透明：蛋白缺乏 40 分 + 能量缺乏 40 分 +
     低白蛋白 20 分；high ≥80、medium 40-60、low 0。
     """
-    # P1（2026-08-18）：albumin=nan/inf 视为"未提供"（与 None 同口径）——此前 nan 因
-    # `nan < 38` 恒 False 被静默当"不低白蛋白"，PEW 评分漏扣 20 分、低估风险。
-    if albumin_g_L is not None and not math.isfinite(albumin_g_L):
-        albumin_g_L = None
+    # P0-3（2026-08-18 四审）：albumin 非法值防御性拒绝——入口 assess_pew_risk 已
+    # INVALID_INPUT 拦截；此处兜底直调（_screen_pew 为模块内纯函数可被直调）——
+    # 此前 `nan < 38` 恒 False 被静默当"不低白蛋白"（漏扣 20 分低估风险），且 NaN
+    # 被静默转 None（fail-open）；一律显式拒绝。
+    if albumin_g_L is not None and (
+            isinstance(albumin_g_L, bool) or not isinstance(albumin_g_L, (int, float))
+            or not math.isfinite(albumin_g_L) or albumin_g_L <= 0):
+        raise ValueError(
+            f"albumin_g_L 必须为 > 0 的有限数值或 None（收到 {albumin_g_L!r}），"
+            "拒绝以脏值参与 PEW 判定")
     protein_deficit = avg_p < floor_p
     energy_deficit = (avg_e / target_e) < 0.8 if target_e > 0 else False
     low_albumin = (albumin_g_L is not None and albumin_g_L < 38)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
@@ -940,6 +969,16 @@ def assess_pew_risk(
     if target_protein_g <= 0 or target_energy_kcal <= 0:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "target_protein_g 与 target_energy_kcal 必须 > 0"}
+    # P0-3（2026-08-18 四审）：albumin_g_L 严格校验——此前 NaN/Inf 在 _screen_pew
+    # 内被静默转 None（"按未提供"继续计算，漏扣 20 分低估风险、违反 fail-closed），
+    # 非数字字符串抛裸 TypeError 500。None=未提供合法（PEW 可不含白蛋白）；
+    # 显式传入的非法值（非数值/bool/NaN/Inf/<=0）一律 INVALID_INPUT，禁止隐式转 None。
+    if albumin_g_L is not None:
+        if isinstance(albumin_g_L, bool) or not isinstance(albumin_g_L, (int, float)) \
+                or not math.isfinite(albumin_g_L) or albumin_g_L <= 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"albumin_g_L 必须为 > 0 的有限数值或 None（未提供），"
+                              f"收到 {albumin_g_L!r}"}
     # P1-5（2026-08-18）：floor_protein_g 校验——此前零校验直通 _screen_pew：
     # floor=0/-5 使"蛋白低于下限"恒不成立 → PEW 假阴性（risk=low, score=0）；
     # floor=inf 使"蛋白低于下限"恒成立 → 恒判 medium/40；bool/NaN 同理穿透。

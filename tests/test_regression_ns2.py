@@ -225,3 +225,143 @@ def test_p27_json_backend_main_ok():
             os.environ.pop("A207_STORAGE_BACKEND", None)
         else:
             os.environ["A207_STORAGE_BACKEND"] = old
+
+
+def test_p01_hd_not_deduct_pd_glucose():
+    """P0-1（四审）：HD 患儿不扣 PD 葡萄糖（此前 dm != "none" 令 HD 也扣）；
+    非 peritoneal 传 pd_glucose 拒绝；peritoneal 正常扣减。"""
+    from CKDNutri_nutrition_mcp import core
+
+    # HD + pd_glucose → 拒绝（严禁带 Warning 的错误扣减）
+    try:
+        core.calc_prnt_targets(age_years=8, sex="M", weight_kg=25.0, height_cm=125.0,
+                               ckd_stage=4, dialysis_mode="hemodialysis",
+                               pd_glucose_kcal_per_day=300.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("HD 患儿传 pd_glucose 未被拒绝")
+    # none + pd_glucose → 拒绝
+    try:
+        core.calc_prnt_targets(age_years=8, sex="M", weight_kg=25.0, height_cm=125.0,
+                               ckd_stage=4, dialysis_mode="none",
+                               pd_glucose_kcal_per_day=300.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未透析传 pd_glucose 未被拒绝")
+    # peritoneal → 正常扣减（能量目标低于未扣减版）
+    base = core.calc_prnt_targets(age_years=8, sex="M", weight_kg=25.0, height_cm=125.0,
+                                  ckd_stage=4, dialysis_mode="peritoneal")
+    ded = core.calc_prnt_targets(age_years=8, sex="M", weight_kg=25.0, height_cm=125.0,
+                                 ckd_stage=4, dialysis_mode="peritoneal",
+                                 pd_glucose_kcal_per_day=300.0)
+    assert base["ok"] is True and ded["ok"] is True
+    assert ded["data"]["energy"]["target_kcal_per_day"] < base["data"]["energy"]["target_kcal_per_day"], \
+        (base["data"]["energy"], ded["data"]["energy"])
+
+
+def test_p02_prnt_age_gt18_rejected():
+    """P0-2（四审）：age_years>18 拒绝生成处方（此前仅 Warning 仍按 15-17 段计算）。"""
+    from CKDNutri_nutrition_mcp import core
+
+    try:
+        core.calc_prnt_targets(age_years=19, sex="M", weight_kg=60.0, height_cm=175.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("age_years=19 未被拒绝")
+    assert core.calc_prnt_targets(age_years=18, sex="M", weight_kg=55.0,
+                                  height_cm=170.0)["ok"] is True
+
+
+def test_p03_albumin_strict_validation():
+    """P0-3（四审）：assess_pew_risk albumin_g_L 严格校验（NaN/Inf/负/非数值/bool
+    拒绝，不再静默转 None 漏扣 20 分）。"""
+    import math
+
+    from CKDNutri_nutrition_mcp import core
+
+    with as_caller("doctor_assistant"):
+        for bad in (float("nan"), float("inf"), -5.0, 0.0, "abc", True):
+            r = core.assess_pew_risk(avg_protein_g=40.0, avg_energy_kcal=1000.0,
+                                     target_protein_g=50.0, target_energy_kcal=1200.0,
+                                     albumin_g_L=bad)
+            assert r["ok"] is False and r["error"] == "INVALID_INPUT", (bad, r)
+        # None=未提供 合法；正常值放行
+        assert core.assess_pew_risk(avg_protein_g=40.0, avg_energy_kcal=1000.0,
+                                    target_protein_g=50.0,
+                                    target_energy_kcal=1200.0)["ok"] is True
+        assert core.assess_pew_risk(avg_protein_g=40.0, avg_energy_kcal=1000.0,
+                                    target_protein_g=50.0, target_energy_kcal=1200.0,
+                                    albumin_g_L=25.0)["ok"] is True
+
+
+def test_p04_pharma_arb_split():
+    """P0-4（四审）：ARB/沙坦与 ACEI 拆分——氯沙坦/缬沙坦 不再解析到 依那普利。"""
+    from CKDNutri_nutrition_mcp import pharma
+
+    assert pharma._resolve_drug("氯沙坦")[0] == "氯沙坦"
+    assert pharma._resolve_drug("缬沙坦")[0] == "缬沙坦"
+    assert pharma._resolve_drug("arb")[0] == "氯沙坦"   # 类名归 ARB（氯沙坦）
+    assert pharma._resolve_drug("沙坦")[0] in ("氯沙坦", "缬沙坦")
+    assert pharma._resolve_drug("依那普利")[0] == "依那普利"
+    assert pharma._resolve_drug("培哚普利")[0] == "培哚普利"
+    # 依那普利 不再含 ARB 别名
+    info = pharma.DRUGS["依那普利"]
+    assert "氯沙坦" not in info["aliases"] and "沙坦" not in info["aliases"], info
+
+
+def test_p16_nan_grams_blocked():
+    """P1-6（四审）：scale_nutrients / to_household 阻断 NaN/Inf/bool 克重。"""
+    import math
+
+    from CKDNutri_nutrition_mcp import fooddb, measures
+
+    row = {"name": "苹果", "unit_name": "个", "unit_grams": 100.0, "aliases": [],
+           "energy_kcal": 50.0, "protein_g": 0.5, "fat_g": 0.2, "carb_g": 12.0,
+           "potassium_mg": 100.0, "phosphorus_mg": 10.0, "sodium_mg": 1.0,
+           "calcium_mg": 5.0}
+    for bad in (float("nan"), float("inf"), True):
+        try:
+            fooddb.scale_nutrients(row, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"scale_nutrients grams={bad!r} 未拒绝")
+        try:
+            measures.to_household(row, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"to_household grams={bad!r} 未拒绝")
+    assert fooddb.scale_nutrients(row, 100.0)["potassium_mg"] == 100.0
+
+
+def test_p17_hundred_and_catty():
+    """P1-7（四审）：中文数词"百"/"斤半"——一百克=100、两百克=200、一斤半=750。"""
+    from CKDNutri_nutrition_mcp import measures
+
+    row = {"name": "米", "unit_name": "碗", "unit_grams": 100.0, "unit_desc": "", "aliases": []}
+    assert measures.parse_portion("一百克", row)["grams"] == 100.0
+    assert measures.parse_portion("两百克", row)["grams"] == 200.0
+    assert measures.parse_portion("一斤半", row)["grams"] == 750.0
+    assert measures.parse_portion("十一碗", row)["grams"] == 1100.0
+
+
+def test_p111_meal_plan_nutrients_guard():
+    """P1-11（四审）：get_meal_plan_nutrients 输入防护（plan 非 dict/缺 days/非数值
+    拒绝，不再 500）。"""
+    from CKDNutri_nutrition_mcp import mealplan
+
+    good = {"days": [{"day_totals": {"energy_kcal": 1200.0, "protein_g": 40.0,
+                                     "potassium_mg": 1000.0, "phosphorus_mg": 300.0,
+                                     "sodium_mg": 1500.0}}]}
+    for bad in (None, "plan", {}, {"days": []}, {"days": [None]},
+                {"days": [{"day_totals": {"energy_kcal": float("nan")}}]}):
+        try:
+            mealplan.get_meal_plan_nutrients(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"plan={bad!r} 未拒绝")
+    assert mealplan.get_meal_plan_nutrients(good)["energy_kcal"] == 1200.0

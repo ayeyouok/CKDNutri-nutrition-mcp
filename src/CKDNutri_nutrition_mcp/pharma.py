@@ -175,13 +175,38 @@ DRUGS: dict[str, dict[str, Any]] = {
                                 "monitor: 身高速率、IGF-1、白蛋白", "high"),
                     "energy": ("能量摄入不足会抵消治疗效果，需同步评估摄入达成率。",
                                "monitor: 能量达成率、体重", "high")}},
-    "依那普利": {"aliases": ["acei", "arb", "氯沙坦", "缬沙坦", "培哚普利", "普利", "沙坦"],
-             "drug_class": "RAAS 抑制剂",
+    "依那普利": {"aliases": ["acei", "普利", "enalapril"],
+             "drug_class": "ACEI（血管紧张素转换酶抑制剂）",
              "effects": {
                  "potassium": ("抑制醛固酮致血钾升高，与限钾饮食、保钾利尿剂叠加风险更高。",
                                "monitor: 血钾、肌酐", "high"),
                  "protein": ("用于降蛋白尿，与限蛋白饮食是两条独立路径，不可互相替代。",
                              "monitor: 尿蛋白/肌酐比", "medium")}},
+    # P0-4（2026-08-18 四审）：ARB/沙坦类药物此前被误挂到 依那普利（ACEI）别名下
+    # （氯沙坦/缬沙坦/arb/沙坦/培哚普利）——ARB 与 ACEI 是不同药理类别，实体解析
+    # 错配会给出错误的药物相互作用建议；拆分为独立条目。ARB 与 ACEI 共用 RAAS
+    # 抑制的高钾/降蛋白尿效应提示。
+    "氯沙坦": {"aliases": ["losartan", "科素亚", "arb", "沙坦"],
+            "drug_class": "ARB（血管紧张素Ⅱ受体拮抗剂）",
+            "effects": {
+                "potassium": ("抑制醛固酮致血钾升高，与限钾饮食、保钾利尿剂叠加风险更高。",
+                              "monitor: 血钾、肌酐", "high"),
+                "protein": ("用于降蛋白尿，与限蛋白饮食是两条独立路径，不可互相替代。",
+                            "monitor: 尿蛋白/肌酐比", "medium")}},
+    "缬沙坦": {"aliases": ["valsartan", "代文", "沙坦"],
+            "drug_class": "ARB（血管紧张素Ⅱ受体拮抗剂）",
+            "effects": {
+                "potassium": ("抑制醛固酮致血钾升高，与限钾饮食、保钾利尿剂叠加风险更高。",
+                              "monitor: 血钾、肌酐", "high"),
+                "protein": ("用于降蛋白尿，与限蛋白饮食是两条独立路径，不可互相替代。",
+                            "monitor: 尿蛋白/肌酐比", "medium")}},
+    "培哚普利": {"aliases": ["perindopril", "雅施达", "普利"],
+              "drug_class": "ACEI（血管紧张素转换酶抑制剂）",
+              "effects": {
+                  "potassium": ("抑制醛固酮致血钾升高，与限钾饮食、保钾利尿剂叠加风险更高。",
+                                "monitor: 血钾、肌酐", "high"),
+                  "protein": ("用于降蛋白尿，与限蛋白饮食是两条独立路径，不可互相替代。",
+                              "monitor: 尿蛋白/肌酐比", "medium")}},
 }
 
 

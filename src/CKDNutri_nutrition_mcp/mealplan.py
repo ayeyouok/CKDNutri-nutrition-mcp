@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from typing import Optional
@@ -423,9 +424,29 @@ def get_meal_plan_nutrients(plan: dict) -> dict:
     caller = get_caller()
     # BUG-02 修复：recipe 组仅临床助手
     enforce_nutrition_tool(caller, "get_meal_plan_nutrients")
+    # P1-11（2026-08-18 四审）：输入安全防护——此前 plan=None/str → .get AttributeError
+    # 500、缺 days → KeyError 500、day_totals 缺键/非数值 → TypeError 500；显式校验
+    # （plan dict + days 非空 list + 每日 day_totals 含必要数值键），fail-closed。
+    if not isinstance(plan, dict):
+        raise ValueError(f"plan 必须为对象（dict），收到 {type(plan).__name__}")
+    days = plan.get("days")
+    if not isinstance(days, list) or not days:
+        raise ValueError("plan.days 必须为非空列表")
+    for i, d in enumerate(days):
+        if not isinstance(d, dict):
+            raise ValueError(f"plan.days[{i}] 必须为对象（dict），收到 {type(d).__name__}")
+        dt = d.get("day_totals")
+        if not isinstance(dt, dict):
+            raise ValueError(f"plan.days[{i}].day_totals 必须为对象（dict），"
+                             f"收到 {type(dt).__name__}")
+        for k in ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg", "sodium_mg"):
+            v = dt.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(
+                    f"plan.days[{i}].day_totals.{k} 必须为有限数值（收到 {v!r}）")
     totals = {k: 0.0 for k in ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg", "sodium_mg")}
-    n = len(plan["days"])
-    for d in plan["days"]:
+    n = len(days)
+    for d in days:
         for k in totals:
             totals[k] += d["day_totals"][k]
     return {k: round(v / n, 1) for k, v in totals.items()}

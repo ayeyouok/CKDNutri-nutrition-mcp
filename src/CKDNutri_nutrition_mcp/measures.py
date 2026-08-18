@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -36,10 +37,12 @@ _NUM_RE = re.compile(r"^(\d+(?:\.\d+)?)")
 
 
 def _cn_numeral(s: str) -> float | None:
-    """把中文数字前缀（1-99）解析为数值；不是数字前缀返回 None。
+    """把中文数字前缀（1-999）解析为数值；不是数字前缀返回 None。
 
     P1-3（2026-08-18）：复合中文数词此前只取首字——"二十个"被解析成 2 个（10 倍
     低估）、"十二碗"解析成 1 碗。现支持 十/十一~十九/二十~九十九 组合。
+    P1-7（2026-08-18 四审）：补"百"（一百/两百/一百零五/一百二十）——"一百克"
+    此前解析成 1（"百"不识别），"两百克"静默回退 1 份（2 倍低估）。
     """
     digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
               "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -53,6 +56,21 @@ def _cn_numeral(s: str) -> float | None:
     if s[0] in digits:
         if len(s) == 1:
             return float(digits[s[0]])
+        if s[1] == "百":
+            # 一百 / 两百 / 一百零五 / 一百二十 / 一百二十三
+            base = digits[s[0]] * 100
+            rest = s[2:]
+            if not rest:
+                return float(base)
+            if rest[0] == "零" and len(rest) >= 2 and rest[1] in digits:
+                return float(base + digits[rest[1]])
+            if rest[0] == "十":
+                if len(rest) >= 2 and rest[1] in digits:
+                    return float(base + 10 + digits[rest[1]])
+                return float(base + 10)
+            if rest[0] in digits:
+                return float(base + digits[rest[0]])
+            return float(base)
         if s[1] == "十":
             # 二十 / 二十三 / 九十
             base = digits[s[0]] * 10
@@ -64,6 +82,9 @@ def _cn_numeral(s: str) -> float | None:
             return float(digits[s[0]] * 10 + digits[s[1]])
         return float(digits[s[0]])
     return None
+
+
+_CN_NUMERAL_CHARS = frozenset("零一二两三四五六七八九十百")
 
 
 def _parse_quantity(text: str) -> tuple[float, str]:
@@ -83,11 +104,17 @@ def _parse_quantity(text: str) -> tuple[float, str]:
         return float(match.group(1)), text[match.end():]
     if text and text[0] in CN_NUMBER:
         # P1-3（2026-08-18）：复合中文数词（二十/十二/二十三）——此前只取首字
-        # （"二十个"→2 个，10 倍低估）。_cn_numeral 解析 1-2 字前缀后按实际长度剥离。
+        # （"二十个"→2 个，10 倍低估）。_cn_numeral 解析前缀后按实际字符数剥离。
+        # P1-7（2026-08-18 四审）：剥离长度覆盖 百 组合（一百=2 字、一百零五=4 字）。
         cn_val = _cn_numeral(text)
         if cn_val is not None:
             head = cn_val
-            head_len = 2 if len(text) >= 2 and (text[1] in CN_NUMBER or text[0] == "十") else 1
+            head_len = 0
+            for _ch in text:
+                if _ch in _CN_NUMERAL_CHARS:
+                    head_len += 1
+                else:
+                    break
         else:
             head = CN_NUMBER[text[0]]
             head_len = 1
@@ -163,6 +190,12 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
         return {"grams": grams, "resolved": True, "basis": basis}
 
     quantity, rest = _parse_quantity(text)
+    # P1-7（2026-08-18 四审）：中文数量 + 克（"一百克"→100g、"两百克"→200g）——
+    # 克 不在通用量具表（GENERIC_UNIT_GRAMS），此前静默回落 1 份（"两百克"被记成
+    # 100g，2 倍低估）；数量即克重直出。
+    if rest in ("克", "g", "G"):
+        return {"grams": quantity, "resolved": True,
+                "basis": f"按中文数量「{text}」计 {quantity:.0f} g"}
     unit = _find_unit(rest) or _find_unit(text)
     if unit is None:
         if "份" in text or not rest:
@@ -202,6 +235,12 @@ def _qty_phrase(count: float, unit: str) -> str:
 
 def to_household(row: dict[str, Any], grams: float) -> dict[str, Any]:
     """克重 -> 家庭量具表达（主表达 + 通用量具备选）。"""
+    # P1-6（2026-08-18 四审）：NaN/Inf/bool 阻断——NaN 克重产出 NaN count 与 NaN
+    # 替代项（下游展示/换算污染）；显式拒绝（调用方 diary 入口已有克重校验）。
+    if not isinstance(grams, (int, float)) or isinstance(grams, bool):
+        raise ValueError(f"grams 必须为数值（收到 {grams!r}）")
+    if not math.isfinite(grams):
+        raise ValueError(f"grams 必须为有限数值（收到 {grams!r}），NaN/Inf 拒绝")
     unit_grams = row.get("unit_grams") or 100.0
     unit_name = row.get("unit_name") or "份"
     count = grams / unit_grams if unit_grams else 0.0

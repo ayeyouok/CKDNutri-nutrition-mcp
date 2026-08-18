@@ -10,6 +10,7 @@ import csv
 import difflib
 import os
 import re
+import math
 import threading
 from typing import Any
 
@@ -310,8 +311,12 @@ def scale_nutrients(row: dict[str, Any], grams: float,
     # LOW-5（2026-08-15）：负克重不得静默归 0——此前 max(grams, 0.0) 把录入错误
     # （如 -50g）当 0 克处理，产出"本次 0 营养"的假安全结果。显式拒绝（INVALID_INPUT
     # 语义），调用方（diary/foods）在入口已有克重校验，此处为第二道防线。
-    if not isinstance(grams, (int, float)):
+    # P1-6（2026-08-18 四审）：NaN/Inf 阻断——`isinstance(nan, float)` 与 `nan < 0`
+    # 恒 False，NaN 克重此前穿透产出 NaN 营养素（污染下游聚合/PEW）；有限性校验。
+    if not isinstance(grams, (int, float)) or isinstance(grams, bool):
         raise ValueError(f"grams 必须为数值，收到 {grams!r}")
+    if not math.isfinite(grams):
+        raise ValueError(f"grams 必须为有限数值（收到 {grams!r}），NaN/Inf 拒绝")
     if grams < 0:
         raise ValueError(f"grams 不能为负（收到 {grams}）——负克重通常是录入错误")
     ratio = grams / 100.0
