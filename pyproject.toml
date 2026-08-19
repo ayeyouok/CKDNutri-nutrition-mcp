@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-nutrition-mcp"
-version = "0.5.38"
+version = "0.5.39"
 description = "P2 营养计算域——PRNT目标+食物DB+食谱+生长Z+PEW+日记"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,3 +25,16 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 CKDNutri_nutrition_mcp = ["data/*.json", "data/*.csv"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # 行超长不阻断（存量历史注释多），仅提示
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]  # 测试：sys.path/env 设置在 import 前（既有标准模式）
+"src/**/__init__.py" = ["E402", "N999"]  # __init__：先定义 __version__ 再 import 子模块；N999=包名带大写为 PyPI 约定

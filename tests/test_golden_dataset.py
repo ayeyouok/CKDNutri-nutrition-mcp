@@ -11,6 +11,7 @@ import-smoke（验证"能 import"）+ 手动 probe（tests/probe_*.py，不在 C
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import sys
@@ -309,9 +310,9 @@ def test_pew_golden_levels():
                              target_protein_g=40, target_energy_kcal=1000, albumin_g_L=30.0)
     assert m["data"]["pew_risk"] == "medium" and m["data"]["score"] == 20.0, m
     # low：全部达标
-    l = core.assess_pew_risk(avg_protein_g=45, avg_energy_kcal=950,
-                             target_protein_g=40, target_energy_kcal=1000, albumin_g_L=40.0)
-    assert l["data"]["pew_risk"] == "low" and l["data"]["score"] == 0.0, l
+    lvl = core.assess_pew_risk(avg_protein_g=45, avg_energy_kcal=950,
+                               target_protein_g=40, target_energy_kcal=1000, albumin_g_L=40.0)
+    assert lvl["data"]["pew_risk"] == "low" and lvl["data"]["score"] == 0.0, lvl
 
 
 def test_pew_golden_invalid():

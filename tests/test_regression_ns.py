@@ -1,13 +1,13 @@
-# -*- coding: utf-8 -*-
 """N-S2/N-S3/N-S4/N-S5/N-S6/N-B8 回归测试（2026-08-14 修复后固化）。
 
 python 直接运行 + pytest 双模式（对齐 P1 test_tools 风格）。
 """
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
-import sys
 import math
+import sys
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -129,10 +129,9 @@ def test_nb8_pharma_alias_split():
     expect = {"他克莫司": "他克莫司", "环孢素": "环孢素",
               "骨化三醇": "骨化三醇", "阿法骨化醇": "阿法骨化醇",
               "聚苯乙烯磺酸钙": "聚苯乙烯磺酸钙", "聚苯乙烯磺酸钠": "聚苯乙烯磺酸钠"}
-    for q, want in expect.items():
+    for q, _want in expect.items():
         r = check_drug_nutrient_interaction(q)
         d = r.get("data", {})
-        got = d.get("drug") or d.get("drug_name") or ""
         # 通过 drug_class 区分（钙型 vs 钠型；前药 vs 活性形式）
         cls = d.get("drug_class", "")
         if "聚苯乙烯磺酸" in q:
@@ -174,9 +173,9 @@ def test_med1_schofield_authoritative():
 
 def test_low3_pew_score_finite():
     """LOW-3（2026-08-15）：record_pew_risk 的 score 有限性校验（NaN/Inf/非数值拒绝）。"""
-    import math
 
     from a207_policy import as_caller
+
     from CKDNutri_nutrition_mcp import core
 
     with as_caller("doctor_assistant"):

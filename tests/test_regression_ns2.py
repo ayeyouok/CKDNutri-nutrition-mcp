@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """十五审（2026-08-18）nutrition-mcp 三审回归：P0×3 / P1×7 / P2 关键项。
 
 覆盖：单列 0 缺失判定、BAZ<-2 生长衰竭、height_cm 有限性、find_food 括号/基名/
@@ -6,6 +5,7 @@
 level、meal 枚举、未来日期排除、括号克重、cooking 组合、json 后端启动。
 """
 import os
+
 os.environ.setdefault("A207_ENV", "test")
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")
 os.environ.setdefault("A207_CALLER", "doctor_assistant")
@@ -23,8 +23,9 @@ for p in (_SRC, _POLICY):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from CKDNutri_nutrition_mcp import core, diary, fooddb, measures  # noqa: E402
-from a207_policy import as_caller  # noqa: E402
+from a207_policy import as_caller
+
+from CKDNutri_nutrition_mcp import core, diary, fooddb, measures
 
 
 def test_p01_single_column_zero_flagged_missing():
@@ -52,7 +53,6 @@ def test_p02_baz_minus2_wasting_is_failure():
 def test_p03_height_nan_rejected():
     """P0-3：calc_prnt_targets height_cm=NaN/负 → ValueError（此前穿透产出 NaN
     + flag=consistent）；0=未提供哨兵放行。"""
-    import math
 
     for bad in (float("nan"), -5.0, float("inf")):
         try:
@@ -117,7 +117,6 @@ def test_p14_score_range_0_100():
 def test_p15_floor_protein_guard():
     """P1-5：assess_pew_risk floor_protein_g 校验（0/-5/nan/inf/bool 拒绝，
     此前 floor=0 → PEW 假阴性、inf → 恒 medium）。"""
-    import math
 
     with as_caller("doctor_assistant"):
         for bad in (0.0, -5.0, float("nan"), float("inf"), True):
@@ -278,7 +277,6 @@ def test_p02_prnt_age_gt18_rejected():
 def test_p03_albumin_strict_validation():
     """P0-3（四审）：assess_pew_risk albumin_g_L 严格校验（NaN/Inf/负/非数值/bool
     拒绝，不再静默转 None 漏扣 20 分）。"""
-    import math
 
     from CKDNutri_nutrition_mcp import core
 
@@ -314,7 +312,6 @@ def test_p04_pharma_arb_split():
 
 def test_p16_nan_grams_blocked():
     """P1-6（四审）：scale_nutrients / to_household 阻断 NaN/Inf/bool 克重。"""
-    import math
 
     from CKDNutri_nutrition_mcp import fooddb, measures
 

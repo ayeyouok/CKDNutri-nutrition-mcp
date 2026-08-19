@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """内置食物成分表的加载、检索与分级。
 
 数据文件：data/food_data.csv，每 100 g 可食部。本模块只做数据访问与派生计算，
@@ -8,9 +7,9 @@ from __future__ import annotations
 
 import csv
 import difflib
+import math
 import os
 import re
-import math
 import threading
 from typing import Any
 

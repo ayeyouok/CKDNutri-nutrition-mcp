@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """食物查询、替换建议、量具换算与磷蛋白比。"""
 from __future__ import annotations
 
@@ -137,7 +136,7 @@ def lookup_food_nutrients(food: str, portion: str | None = None,
     “早籼（标一）”）仍返回单条并计算，保证计算路径精确不变。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     row = find_food(food)
     if row is None:
@@ -213,7 +212,7 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
     候选池按食物角色收敛，杜绝把油脂当肉、把内脏当主食等荒谬替换。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     row = find_food(food)
     if row is None:
@@ -333,7 +332,7 @@ def convert_to_household_measure(food: str, grams: float) -> dict[str, Any]:
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     row = find_food(food)
     if row is None:
@@ -361,7 +360,7 @@ def calc_pnpr(food: str | None = None, protein_g: float | None = None,
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     if food:
         row = find_food(food)

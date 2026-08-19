@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """腹透葡萄糖吸收的能量估算（与 PRNT 2020 相关的目标计算已移至 M3）。
 
 本模块不知道患者是谁：透析液糖量、留腹时长、交换次数、转运类型由调用方显式传入。
@@ -51,7 +50,7 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
     """
     import math
 
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     for _name, _val in (("dialysate_glucose_g", dialysate_glucose_g),
                         ("dwell_hours", dwell_hours),
@@ -68,14 +67,21 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
     transport = str(transport_type or "average").strip().lower()
     factor = PD_TRANSPORT_FACTOR.get(transport)
     if factor is None:
-        # P3：未知转运类型不再静默回退 average，给出显式提示
-        factor = 1.0
-        warnings: list[str] = [f"未识别的 transport_type「{transport}」已按 average(1.0) 计算，"
-                               f"可用：{'/'.join(PD_TRANSPORT_FACTOR)}"]
-    else:
-        warnings: list[str] = []
+        # 审查（2026-08-19，BUG-4）：未知 transport_type **fail-closed**——此前回退
+        # average(1.0) 仍产生临床数值（错误输入被静默接受并给出看似合法的结果）。
+        # 营养计算（尤其 PD 葡萄糖吸收）不得对非法输入产出数值，显式 INVALID_INPUT。
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"未知 transport_type={transport!r}，合法值：{'/'.join(PD_TRANSPORT_FACTOR)}"}
+    warnings: list[str] = []
     fraction = min(max(_absorption_fraction(float(dwell_hours)) * factor, 0.20), 0.90)
-    exchanges = max(int(exchanges_per_day or 1), 1)
+    # 审查（2026-08-19，BUG-3）：exchanges_per_day 是"次数"，必须正整数——
+    # 旧 `int(exchanges_per_day or 1)` 把 1.9 → 1（静默截断，真实输入被算错）。
+    # bool 是 int 子类须排除；float 非整数值显式拒绝（不静默截断）。
+    if isinstance(exchanges_per_day, bool) or not isinstance(exchanges_per_day, int) \
+            or exchanges_per_day <= 0:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"exchanges_per_day 必须为正整数，收到：{exchanges_per_day!r}"}
+    exchanges = exchanges_per_day
 
     absorbed_per_exchange = float(dialysate_glucose_g) * fraction
     absorbed_total = absorbed_per_exchange * exchanges

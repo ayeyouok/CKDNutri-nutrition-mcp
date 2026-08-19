@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """家庭量具与克重的双向换算。
 
 设计目标：家长看到的是"半碗饭""掌心一块肉"，医护看到的是克重与营养素。
@@ -158,7 +157,7 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
     _trail = re.search(r"[（(]([^）)]*)[)）]$", text)
     if _trail:
         _inner = _trail.group(1).strip()
-        _gm = re.match(r"^(\d+(?:\.\d+)?)\s*(g|克|ml|毫升)$", _inner, re.I)
+        _gm = re.match(r"^(\d+(?:\.\d+)?)\s*(g|克|ml|毫升)$", _inner, re.IGNORECASE)
         if _gm:
             _v = float(_gm.group(1))
             return {"grams": _v, "resolved": True,

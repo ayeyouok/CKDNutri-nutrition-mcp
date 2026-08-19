@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M7 食谱生成纯函数：按 PRNT 目标生成一周/多日食谱（3 餐 + 加餐），并算达成率。
 
 不依赖 fastmcp，可直接 import 单测。本包自带 CKD 适宜食物子集（data/foods_ckd.json），
@@ -16,7 +15,6 @@ import json
 import math
 import os
 import threading
-from typing import Optional
 
 from a207_policy import enforce_nutrition_tool, get_caller
 
@@ -33,7 +31,7 @@ _MEAL_SPLIT = {
 }
 
 _FOODS_PATH = os.path.join(os.path.dirname(__file__), "data", "foods_ckd.json")
-_FOODS: Optional[list[dict]] = None
+_FOODS: list[dict] | None = None
 # S3（2026-08-12 五包审查）：懒加载并发锁（double-checked locking）
 _FOODS_LOCK = threading.Lock()
 
@@ -54,7 +52,7 @@ def _load_foods() -> list[dict]:
             if _FOODS is None:  # S3：防多线程首调重复 I/O
                 from .fooddb import find_food
 
-                with open(_FOODS_PATH, "r", encoding="utf-8") as fh:
+                with open(_FOODS_PATH, encoding="utf-8") as fh:
                     spec = json.load(fh)["foods"]
                 merged: list[dict] = []
                 for f in spec:
@@ -170,12 +168,40 @@ def _split_meals(items: list[dict]) -> list[dict]:
 
 def _overall_achievement(days_out: list[dict], t_energy: float, t_protein: float, t_k: float,
                          t_p: float, t_na: float, days: int) -> dict:
-    keys = ("energy_pct", "protein_pct", "potassium_pct", "phosphorus_pct", "sodium_pct")
-    agg = {k: 0 for k in keys}
+    """多日整体达成率（审查 2026-08-19，BUG-1：**先汇总实际摄入，再算平均/目标**）。
+
+    旧实现 `avg(每日 achievement_pct)` 有数学失真：每日 achievement 对钾/磷/钠已
+    cap 到 100%（限制性上限目标），"先 cap 再平均"会掩盖严重超限日——如钾
+    200%→100% 与 0% 平均得 50%，而真实两天平均摄入 (200%+0%)/2=100%（超限被
+    隐藏）。现先汇总 day_totals 实际摄入（未 cap 的原始量），取平均每日摄入，
+    再对能量/蛋白算 pct（不 cap）、对钾/磷/钠算 cap_pct（限制性上限，超限标注）。
+    """
+    actual = {"energy_kcal": 0.0, "protein_g": 0.0,
+              "potassium_mg": 0.0, "phosphorus_mg": 0.0, "sodium_mg": 0.0}
     for d in days_out:
-        for k in keys:
-            agg[k] += d["achievement"][k]
-    return {k: round(v / days) for k, v in agg.items()}
+        dt = d["day_totals"]
+        for k in actual:
+            actual[k] += float(dt.get(k, 0.0))
+    n = max(len(days_out), 1)
+    avg = {k: v / n for k, v in actual.items()}
+
+    def pct(actual_value: float, target: float) -> int:
+        if target <= 0:
+            return 0
+        return round(actual_value / target * 100)
+
+    def cap_pct(actual_value: float, target: float) -> int:
+        if target <= 0:
+            return 0
+        return min(round(actual_value / target * 100), 100)
+
+    return {
+        "energy_pct": pct(avg["energy_kcal"], t_energy),
+        "protein_pct": pct(avg["protein_g"], t_protein),
+        "potassium_pct": cap_pct(avg["potassium_mg"], t_k),
+        "phosphorus_pct": cap_pct(avg["phosphorus_mg"], t_p),
+        "sodium_pct": cap_pct(avg["sodium_mg"], t_na),
+    }
 
 
 def generate_meal_plan(
@@ -186,7 +212,7 @@ def generate_meal_plan(
     target_na_mg: float,
     days: int = 7,
     vegetarian: bool = False,
-    exclude_foods: Optional[list[str]] = None,
+    exclude_foods: list[str] | None = None,
 ) -> dict:
     """按 PRNT 目标生成多日食谱（3 餐 + 加餐），返回餐次明细、每日汇总与达成率。
 
@@ -233,8 +259,7 @@ def generate_meal_plan(
     # P2 修复（2026-08-13）：days 上限钳制（默认 7）——days=90 会把 90 天×4 餐刷进
     # LLM 上下文。食谱是"周计划"粒度，超出 14 天钳制并告警，不报错。
     _DAYS_MAX = 14
-    if days > _DAYS_MAX:
-        days = _DAYS_MAX
+    days = min(days, _DAYS_MAX)
 
     foods = _load_foods()
     excl = set(exclude_foods or [])
@@ -284,8 +309,16 @@ def generate_meal_plan(
         for offset in range(len(staple_pool)):
             cand = staple_pool[(d + offset) % len(staple_pool)]
             sg = max(10, round(prot_staple_quota / max(cand["protein_per_100g"], 0.1) * 100))
-            est_kp = sg * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
-            if est_kp <= (target_k_mg + target_p_mg) * 0.45 or offset == len(staple_pool) - 1:
+            # 审查（2026-08-19，BUG-2）：K+P 联合筛选由"mg 直接相加"改为**占用率**
+            # ——100mg 钾与 100mg 磷不是同一限制单位（如目标钾 2000/磷 800，相加
+            # 2800 后比较会让钾磷互相抵消）。分别算 K/target_K、P/target_P 占用率
+            # 求和与阈值比较；target≤0（不设限）时对应占用率计 0。
+            k_ratio = (sg * cand["potassium_per_100g"] / 100 / target_k_mg
+                       if target_k_mg > 0 else 0.0)
+            p_ratio = (sg * cand["phosphorus_per_100g"] / 100 / target_p_mg
+                       if target_p_mg > 0 else 0.0)
+            est_kp = k_ratio + p_ratio
+            if est_kp <= 0.45 or offset == len(staple_pool) - 1:
                 staple = cand
                 break
         prot = None
@@ -301,7 +334,13 @@ def generate_meal_plan(
             # 贡献 ≈ 估计的 1.5 倍）。改用实际补差口径估计。
             prot_est_protein = max(1.0, target_protein_g * 0.60 - 2.0)
             pg = max(10, round(prot_est_protein / max(cand["protein_per_100g"], 0.1) * 100))
-            est_kp = pg * (cand["potassium_per_100g"] + cand["phosphorus_per_100g"]) / 100
+            # 审查（2026-08-19，BUG-2）：K+P 占用率口径（同主食）——mg 直接相加会让
+            # 钾磷单位抵消；分别算 K/P 占用率求和与阈值比较。
+            k_ratio = (pg * cand["potassium_per_100g"] / 100 / target_k_mg
+                       if target_k_mg > 0 else 0.0)
+            p_ratio = (pg * cand["phosphorus_per_100g"] / 100 / target_p_mg
+                       if target_p_mg > 0 else 0.0)
+            est_kp = k_ratio + p_ratio
             # P2-3（2026-08-15）：蛋白源选品加钠考量——此前只按 K+P 选品，高钠蛋白源
             # （如虾仁 Na=429/100g）被选中，单日钠可达 900mg+ 且钠无任何约束。
             # 按同口径克重估钠，目标钠的 35% 闸门（target_na_mg<=0 时跳过，无钠目标不约束）。
@@ -309,7 +348,7 @@ def generate_meal_plan(
             if target_na_mg > 0:
                 est_na = pg * cand["sodium_per_100g"] / 100
                 na_ok = est_na <= target_na_mg * 0.35
-            if (est_kp <= (target_k_mg + target_p_mg) * 0.35 and na_ok) \
+            if (est_kp <= 0.35 and na_ok) \
                     or offset == len(prot_pool) - 1:
                 prot = cand
                 break
@@ -358,8 +397,18 @@ def generate_meal_plan(
         # 此前用"蛋白g × 4 kcal/g"简化——对鸡蛋/瘦肉等含脂肪蛋白源会低估其能量贡献，
         # 导致 rem（脂肪额度）偏高、day_totals 实际能量系统性超 target。
         e_prot = prot_g * prot["energy_per_100g"] / 100
-        # 4) 油脂：固定额度 ≤25g/天（N-S6 油脂炸弹防护），补足能量缺口
-        fat_g = int(_FAT_MAX_G) if fat["energy_per_100g"] > 0 else 0
+        # 4) 油脂：25g/天为**上限**，按剩余能量动态补足（审查 2026-08-19，BUG-5）——
+        # 旧实现无论目标能量多少都先塞满 25g（≈225 kcal），主食/蛋白/蔬果已接近
+        # 目标时直接超供（如 1200 目标实际 1225 还标 warning），不是"目标反推"。
+        # 现 remaining_energy > 0 才补油脂（min(25g, 剩余能量折算克重)）；剩余 ≤0
+        # 则 0（不硬凑油脂补能，缺口交由下方显式警告 + 临床加餐）。
+        e_before_fat = e_staple + e_prot + e_veg + e_fruit
+        remaining_energy = target_energy_kcal - e_before_fat
+        if fat["energy_per_100g"] > 0 and remaining_energy > 0:
+            fat_g = min(int(_FAT_MAX_G), remaining_energy / fat["energy_per_100g"] * 100)
+            fat_g = max(0, round(fat_g))
+        else:
+            fat_g = 0
         e_fat = fat_g * fat["energy_per_100g"] / 100
         # 5) 能量缺口显式警告（34 项子集能量密度有限，缺口交由临床加餐，不硬凑油脂）
         e_total = e_staple + e_prot + e_veg + e_fruit + e_fat

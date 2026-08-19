@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """参考表与阈值常量。
 
 单位口径（与 contracts/pcp-schema.json 一致）：

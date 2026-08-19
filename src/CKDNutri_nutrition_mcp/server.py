@@ -9,16 +9,14 @@ v0.3.2 修复：工具包装层签名与 core 全面对齐（此前 11 个工具
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
+from typing import Any
 
-from typing import Any, Optional
-
+from a207_policy import enforce_nutrition_tool, get_caller, translate_error
 from fastmcp import FastMCP
 
-from a207_policy import translate_error, enforce_nutrition_tool, get_caller
-
+from .constants import DIALYSIS_ALIAS
 from .core import (
     assess_intake_vs_target,
     assess_pew_risk,
@@ -29,7 +27,6 @@ from .core import (
     record_pew_risk,
     upsert_food_diary,
 )
-from .constants import DIALYSIS_ALIAS
 from .diary import sum_diet_intake
 from .foods import (
     lookup_food_nutrients,
@@ -104,7 +101,7 @@ def main():
             from .nutrition_repository import ensure_tablestore_tables
 
             ensure_tablestore_tables()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error(
                 "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
                 "环境变量与网络后重试；服务未启动。", type(exc).__name__)
@@ -116,7 +113,7 @@ def main():
 
 @mcp.tool
 def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = True,
-                           guardian_token: Optional[str] = None) -> dict[str, Any]:
+                           guardian_token: str | None = None) -> dict[str, Any]:
     """写入每日饮食日记。家长/医生可写，家长须携带 guardian_token 完成患儿绑定。
 
     entries 每项：{date, meal, food, energy_kcal, protein_g, potassium_mg, phosphorus_mg, sodium_mg}
@@ -128,7 +125,7 @@ def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = Tr
 
 
 @mcp.tool
-def get_food_diary_summary_tool(patient_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
+def get_food_diary_summary_tool(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
     """查最近饮食日记摘要（含最近 3 日均值 diet_diary_3d；摘要含食物名称，非脱敏展示）。家长须携带 guardian_token。"""
     try:
         return get_food_diary_summary(patient_id, guardian_token)
@@ -139,7 +136,7 @@ def get_food_diary_summary_tool(patient_id: str, guardian_token: Optional[str] =
 # ---- food 组（食物查询，全角色可见） ----
 
 @mcp.tool
-def lookup_food_nutrients_tool(food_name: str, portion: Optional[str] = None,
+def lookup_food_nutrients_tool(food_name: str, portion: str | None = None,
                                include_household: bool = True) -> dict[str, Any]:
     """查食物营养成分。portion 可传家庭量具（如“一碗”“半个”），缺省按 100 g。
 
@@ -162,7 +159,7 @@ def substitute_food_tool(food: str, constraint: str = "等能量", top_n: int = 
 
 
 @mcp.tool
-def sum_diet_intake_tool(diary: list, target: Optional[dict] = None) -> dict[str, Any]:
+def sum_diet_intake_tool(diary: list, target: dict | None = None) -> dict[str, Any]:
     """汇总多日饮食日记并对照目标给出达成率。
 
     diary 每项：{"food": 名称, "grams": 克重 或 "portion": 家庭量具,
@@ -177,7 +174,7 @@ def sum_diet_intake_tool(diary: list, target: Optional[dict] = None) -> dict[str
 
 
 @mcp.tool
-def check_drug_nutrient_interaction_tool(drug_name: str, nutrient: Optional[str] = None) -> dict[str, Any]:
+def check_drug_nutrient_interaction_tool(drug_name: str, nutrient: str | None = None) -> dict[str, Any]:
     """检查药物-营养素相互作用。nutrient 传营养素名（如“钙”“铁”“钾”“磷”），不传则返回该药全部条目。"""
     try:
         return check_drug_nutrient_interaction(drug_name, nutrient)
@@ -196,7 +193,7 @@ def generate_meal_plan_tool(
     target_na_mg: float = 0.0,
     days: int = 7,
     vegetarian: bool = False,
-    exclude_foods: Optional[list] = None,
+    exclude_foods: list | None = None,
 ) -> dict[str, Any]:
     """按 PRNT 目标生成多日食谱（3 餐 + 加餐）。仅 CKD 临床助手。
 
@@ -236,8 +233,8 @@ def calc_prnt_targets_tool(
     vegetarian_mode: str = "mixed",
     growth_status: str = "normal",
     is_edema: bool = False,
-    pd_glucose_kcal_per_day: Optional[float] = None,
-    height_age_years: Optional[float] = None,
+    pd_glucose_kcal_per_day: float | None = None,
+    height_age_years: float | None = None,
     high_urea_persistent: bool = False,
 ) -> dict[str, Any]:
     """计算 PRNT 2020 每日能量与蛋白目标。仅 CKD 临床助手。
@@ -271,9 +268,9 @@ def calc_prnt_targets_tool(
 def calc_growth_zscore_tool(
     age_years: float,
     sex: str,
-    height_cm: Optional[float] = None,
-    weight_kg: Optional[float] = None,
-    bmi: Optional[float] = None,
+    height_cm: float | None = None,
+    weight_kg: float | None = None,
+    bmi: float | None = None,
 ) -> dict[str, Any]:
     """计算儿童生长 Z 评分 HAZ / WAZ / BAZ（WS/T 423-2022 + WS/T 612-2018）。
 
@@ -292,7 +289,7 @@ def assess_pew_risk_tool(
     avg_energy_kcal: float,
     target_protein_g: float,
     target_energy_kcal: float,
-    albumin_g_L: Optional[float] = None,
+    albumin_g_L: float | None = None,
 ) -> dict[str, Any]:
     """PEW（蛋白质-能量消耗）风险筛查：传入已算好的摄入均值与 PRNT 目标。
 
@@ -340,19 +337,19 @@ def comprehensive_nutrition_assessment_tool(
     dialysis_mode: str = "none",
     vegetarian_mode: str = "mixed",
     is_edema: bool = False,
-    serum_albumin_g_l: Optional[float] = None,
-    avg_protein_g: Optional[float] = None,
-    avg_energy_kcal: Optional[float] = None,
+    serum_albumin_g_l: float | None = None,
+    avg_protein_g: float | None = None,
+    avg_energy_kcal: float | None = None,
     include_intake: bool = False,
     patient_id: str = "",
-    pd_glucose_kcal_per_day: Optional[float] = None,
-    pd_dwell_hours: Optional[float] = None,
-    pd_dialysate_glucose_g: Optional[float] = None,
-    pd_dialysate_volume_ml: Optional[float] = None,
-    pd_glucose_conc_pct: Optional[float] = None,
+    pd_glucose_kcal_per_day: float | None = None,
+    pd_dwell_hours: float | None = None,
+    pd_dialysate_glucose_g: float | None = None,
+    pd_dialysate_volume_ml: float | None = None,
+    pd_glucose_conc_pct: float | None = None,
     pd_exchanges_per_day: int = 1,
     pd_transport_type: str = "average",
-    height_age_years: Optional[float] = None,
+    height_age_years: float | None = None,
     high_urea_persistent: bool = False,
 ) -> dict[str, Any]:
     """一键营养评估：Z 评分 → PRNT 目标 → 摄入达成率 → PEW 评定。仅 CKD 临床助手。
@@ -447,7 +444,7 @@ def comprehensive_nutrition_assessment_tool(
         d = result["data"]
 
         # 3) 摄入均值：显式入参优先，其次查饮食日记
-        diet: Optional[dict[str, Any]] = None
+        diet: dict[str, Any] | None = None
         if avg_protein_g is not None and avg_energy_kcal is not None:
             diet = {"avg_protein_g": float(avg_protein_g),
                     "avg_energy_kcal": float(avg_energy_kcal)}
@@ -492,7 +489,6 @@ def comprehensive_nutrition_assessment_tool(
                 floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
             )
             if pew.get("ok"):
-                level = pew["data"]["pew_risk"]
                 # N-S5 修复（2026-08-14）：PEW score 统一为 assess_pew_risk 的信号加权
                 # 0-100 分——此前用 _PEW_SCORE（low=0/medium=1/high=2）覆盖并把 0/1/2
                 # 语义经 hint 引导传给 record_pew_risk 落库，历史 PEW 分数全错。

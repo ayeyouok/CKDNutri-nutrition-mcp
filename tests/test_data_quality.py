@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """X5（2026-08-14）：数据质量校验——food_data.csv 重名行数值冲突 + foods_ckd.json 双源偏差。
 
 策略：已知冲突行登记在 DOCUMENTED_CONFLICTS（人工核对/待营养师修正，仅告警）；
@@ -8,6 +7,7 @@
 """
 # ---------------------------------------------------------------- 数据路径
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import csv
@@ -101,8 +101,6 @@ def test_ckd_json_vs_csv_no_new_drift():
     ③ 明确"熟制/干制"状态语义：state=cooked 的条目不得指向干制行
     （能量/钾磷差 3 倍+，如米粉熟 109 vs 干 349）。
     """
-    rows = _load_csv()
-    by_name = {r["name"]: r for r in rows}
     ckd = json.loads(CKD_JSON_PATH.read_text(encoding="utf-8"))
     ckd_foods = ckd if isinstance(ckd, list) else ckd.get("foods", [])
 

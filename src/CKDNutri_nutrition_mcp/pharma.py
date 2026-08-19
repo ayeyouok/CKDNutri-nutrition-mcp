@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """药物-营养素交互查询（儿童 CKD 常用药）。"""
 from __future__ import annotations
 
@@ -241,7 +240,7 @@ def check_drug_nutrient_interaction(drug: str, nutrient: str | None = None) -> d
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未注入 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     hit = _resolve_drug(drug)
     if hit is None:

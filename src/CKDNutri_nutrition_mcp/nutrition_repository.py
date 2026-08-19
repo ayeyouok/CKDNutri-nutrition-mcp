@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """P2 营养域数据访问层（DAO）：饮食日记 + PEW 历史。
 
 v0.5（2026-08-13）：统一后端语义 = **默认 Tablestore（生产）+ A207_STORAGE_BACKEND=json
@@ -27,7 +26,10 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from a207_policy import atomic_write_json, resolve_state_path
-from a207_policy.storage import TablestoreBase, ensure_json_backend_allowed  # 2026-08-15：共享 Tablestore 基础设施
+from a207_policy.storage import (  # 2026-08-15：共享 Tablestore 基础设施
+    TablestoreBase,
+    ensure_json_backend_allowed,
+)
 
 logger = logging.getLogger("CKDNutri-nutrition-mcp.repository")
 
@@ -137,7 +139,7 @@ def _read_json_fail_closed(path: str, label: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
@@ -412,13 +414,13 @@ def get_repository() -> NutritionRepository:
 
 
 __all__ = [
-    "NutritionRepository",
+    "DIARY_STORE_FILENAME",
+    "PEW_STORE_FILENAME",
+    "TABLE_FOOD_DIARY",
+    "TABLE_PEW_HISTORY",
     "LocalJsonRepository",
+    "NutritionRepository",
     "TablestoreRepository",
     "ensure_tablestore_tables",
     "get_repository",
-    "TABLE_FOOD_DIARY",
-    "TABLE_PEW_HISTORY",
-    "DIARY_STORE_FILENAME",
-    "PEW_STORE_FILENAME",
 ]

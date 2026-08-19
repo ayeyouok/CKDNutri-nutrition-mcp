@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M3 核心逻辑（纯函数，无 fastmcp 依赖，可单测）。
 
 内容：
@@ -15,23 +14,22 @@ from __future__ import annotations
 
 import json
 import math
-import threading
 import os
+import threading
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
-from pathlib import Path
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from a207_policy import (
-    enforce_nutrition_tool,
     PARENT_ROLE,
+    enforce_nutrition_tool,
     get_caller,
     validate_patient_id,
     verify_guardian_token,
 )
+
 from .constants import DIALYSIS_ALIAS
-from .nutrition_repository import DIARY_STORE_FILENAME, PEW_STORE_FILENAME
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -57,14 +55,18 @@ def _require(value: Any, name: str) -> Any:
 
     P0-7：此前只拦 None——`NaN < 0` 恒为 False，calc_growth_zscore(NaN) 会静默产出
     "成人参照 Z 分"、assess_pew_risk(NaN) 会"PEW 恒判 low"，比报错危险得多。
+    审查（2026-08-19，问题-8）：**拒绝字符串/bool 等非数值**——`age_years="8"` 此前
+    通过本函数（非 None 非 NaN）后 math.isfinite("8") 抛 TypeError→500；统一显式
+    类型校验（bool 是 int 子类须排除）。
     """
     if value is None:
         raise ValueError(f"{name} 不能为 None")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        import math
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须为数值（int/float），收到 {value!r}")
+    import math
 
-        if math.isnan(value) or math.isinf(value):
-            raise ValueError(f"{name} 必须为有效的有限数值，收到 {value!r}")
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError(f"{name} 必须为有效的有限数值，收到 {value!r}")
     return value
 
 
@@ -79,6 +81,9 @@ def _repo():
 # 改为每次读写时解析，测试/部署中切换 A207_DATA_DIR 立即生效。
 # 路径解析与 fail-closed 校验已下沉到 nutrition_repository（LocalJson 后端）。
 # 常量保留导出（smoke 测试引用），实际存储经 _repo()。
+# noqa: F401（ruff 误判未使用——tests 经 core.DIARY_STORE_FILENAME 引用）；
+# noqa: E402（有意置于 _repo 之后，保持与 BUG-18 注释分组）。
+from .nutrition_repository import DIARY_STORE_FILENAME, PEW_STORE_FILENAME  # noqa: F401, E402
 
 # 写权判定经 enforce_nutrition_tool 工具级 ACL（P1-1：单一事实源在 a207_policy），
 # 本包不再维护本地写白名单（2026-08-12 双轨制清理）。
@@ -224,10 +229,8 @@ def _ws586_overweight_threshold(age_years: float, sex: str) -> float | None:
     if age_years < 6.0 or age_years > 18.0:
         return None
     band = int(age_years * 2) / 2.0          # 实足年龄向下取半岁档
-    if band < 6.0:
-        band = 6.0
-    if band > 18.0:
-        band = 18.0
+    band = max(band, 6.0)
+    band = min(band, 18.0)
     return _WS586_OVERWEIGHT.get((band, sex))
 
 
@@ -500,7 +503,9 @@ def calc_prnt_targets(
             e_basis = "超重/肥胖：向下调整以实现适宜体重增长（不损害营养状况）"
         else:
             e_pt = (e_lo + e_hi) / 2.0
-            e_basis = "生长正常：取 SDI 中点（约 100% SDI）"
+            # 审查（2026-08-19，问题-6）：文案修正——"约 100% SDI" 误导（范围中点
+            # 不等于 100% SDI 的独立定义值），改为如实描述临床策略。
+            e_basis = "生长正常：取 PRNT SDI 推荐范围中点"
         if ha_years is not None:
             e_basis += f"；按身高年龄 {ha_years} 岁查 SDI（实际年龄 {age_years} 岁）"
 
@@ -546,7 +551,17 @@ def calc_prnt_targets(
                     "葡萄糖，禁止扣减；请核对输入")
             if dialysis_mode == "peritoneal" and pd_glucose_kcal_per_day > 0:
                 pd_deduction = float(pd_glucose_kcal_per_day)
-                energy_day = max(energy_day - pd_deduction, 0.0)
+                # 审查（2026-08-19，问题-7）：PD 葡萄糖供能达到或超过膳食能量目标时
+                # **拒绝生成目标**——旧 `max(energy_day - pd_deduction, 0.0)` 会静默
+                # 产出 0 kcal 膳食目标（临床无意义：膳食能量目标为 0 意味着"不进食"，
+                # 且后续蛋白/微量目标按 0 能量比例失真），且 ok=True 无任何提示。
+                # 显式 ValueError（fail-closed），提示核对透析液葡萄糖输入。
+                if pd_deduction >= energy_day:
+                    raise ValueError(
+                        f"腹透葡萄糖供能 {_round(pd_deduction, 1)} kcal/day 达到或超过"
+                        f"膳食能量目标 {_round(energy_day, 1)} kcal/day，无法生成有效的"
+                        "膳食能量目标——请核对透析液糖浓度/留腹时间输入，或重新评估能量目标")
+                energy_day = energy_day - pd_deduction
                 e_basis += f"；腹透葡萄糖供能扣减 {_round(pd_deduction, 1)} kcal/day"
 
         # 蛋白质：默认目标=SDI 上限（促生长）；高尿素血症 → 目标降至 SDI 下限（保能量）；
@@ -1175,14 +1190,15 @@ def upsert_food_diary(
         # 追加（每次新 uuid4 entry_id），家长弱网重试同一顿饭 → 两行，day_count/均值
         # 失真。现按内容键合并：同 date+meal+food 已存在 → 用本次值**替换**该条目
         # （幂等更新，保留原 entry_id），否则新增。多条目同键取最后一条（后写者意图）。
-        content_key = lambda e: (e.get("date"), e.get("meal") or "", e.get("food") or "")
+        def _content_key(e):
+            return (e.get("date"), e.get("meal") or "", e.get("food") or "")
         newest = {}
         for e in stamped:
-            newest[content_key(e)] = e
+            newest[_content_key(e)] = e
         merged: list[dict] = []
         seen: set = set()
         for e in existing:
-            k = content_key(e)
+            k = _content_key(e)
             if k in newest:
                 if k not in seen:           # 同键旧条目被本次值替换（保留原 entry_id）
                     repl = dict(newest[k])
@@ -1285,7 +1301,7 @@ def _load_growth_ref() -> dict:
     if _GROWTH_REF is None:
         with _GROWTH_REF_LOCK:
             if _GROWTH_REF is None:  # S3：防多线程首调重复 I/O
-                with open(_GROWTH_REF_PATH, "r", encoding="utf-8") as f:
+                with open(_GROWTH_REF_PATH, encoding="utf-8") as f:
                     _GROWTH_REF = json.load(f)
     return _GROWTH_REF
 
@@ -1370,6 +1386,10 @@ def _z_from_bands(x: float, bands: tuple) -> float:
         return 1.0 + (x - p1) / (p2 - p1)
     if x <= p3:
         return 2.0 + (x - p2) / (p3 - p2)
+    # ⚠ 2026-08-19（审查 问题-9，P2）：超出 +3SD 后沿 +2→+3SD 斜率**线性外推**——
+    # 本实现采用的外推策略（与原口径一致），但儿童 BMI 高尾 +3SD 以上的真实分布未必
+    # 线性（WS/T 423 界值在高尾间距显著增大）。**需权威标准再次确认**该外推规定；
+    # 当前保留（与 -3SD 对称），临床解读超出 +3SD 的 Z 值时应意识到其为外推值。
     return 3.0 + (x - p3) / (p3 - p2)               # 高于 +3SD：最外侧斜率外推
 
 
