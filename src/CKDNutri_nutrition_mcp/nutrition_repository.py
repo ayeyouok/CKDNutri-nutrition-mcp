@@ -46,10 +46,15 @@ OTS_AK_SECRET_ENV = "A207_OTS_ACCESS_KEY_SECRET"
 # Tablestore 表名（单一事实源）
 TABLE_FOOD_DIARY = "food_diary"
 TABLE_PEW_HISTORY = "pew_history"
+# 2026-08-21：孩子自报饮食记录表（child_foodlog）——仅 child_assistant 可写；
+# 参考数据（不作医疗结论），按 patient_id 分片，行 = {entries, total_points,
+# daily_points, last_points_date}。
+TABLE_CHILD_FOODLOG = "child_foodlog"
 
 # JSON 文件名（LocalJson 后端；core 测试仍引用 DIARY_STORE_FILENAME 常量）
 DIARY_STORE_FILENAME = "diary_store.json"
 PEW_STORE_FILENAME = "pew_history_store.json"
+CHILD_FOODLOG_STORE_FILENAME = "child_foodlog_store.json"
 
 # Tablestore 乐观锁版本列与重试次数（对齐 care repository）
 _REV_COL = "_rev"
@@ -118,6 +123,24 @@ class NutritionRepository(Protocol):
     def save_patient_pew(self, patient_id: str,
                          points: list[dict[str, Any]]) -> None:
         """原子持久化**单个患者**的 PEW 历史（行级写，N-MEM-3）。
+
+        覆盖写该患者行（行级 _rev 乐观锁防并发丢更新），不触碰其他患者。
+        """
+        ...
+
+    # ---- 孩子自报饮食（child_foodlog，2026-08-21）----
+    def load_patient_child_foodlog(self, patient_id: str) -> dict[str, Any]:
+        """读取**单个患者**的孩子自报饮食行（行级读，N-MEM-2 同口径）。
+
+        返回 {entries: [...], total_points, daily_points, last_points_date}；
+        无记录返回 {"entries": [], "total_points": 0, "daily_points": 0,
+        "last_points_date": ""}；损坏 JSON fail-closed 抛 RuntimeError。
+        """
+        ...
+
+    def save_patient_child_foodlog(self, patient_id: str,
+                                   row: dict[str, Any]) -> None:
+        """原子持久化**单个患者**的孩子自报饮食行（行级写）。
 
         覆盖写该患者行（行级 _rev 乐观锁防并发丢更新），不触碰其他患者。
         """
@@ -213,6 +236,38 @@ class LocalJsonRepository:
             store = self.load_pew()
             store[patient_id] = list(points)
             self.save_pew(store)
+
+    # ---- 孩子自报饮食（child_foodlog，2026-08-21）----
+    def _load_child_foodlog_file(self) -> dict[str, Any]:
+        return _read_json_fail_closed(_state_path(CHILD_FOODLOG_STORE_FILENAME),
+                                      "孩子自报饮食库", {})
+
+    def load_patient_child_foodlog(self, patient_id: str) -> dict[str, Any]:
+        store = self._load_child_foodlog_file()
+        row = store.get(patient_id)
+        if not isinstance(row, dict):
+            return {"entries": [], "total_points": 0,
+                    "daily_points": 0, "last_points_date": ""}
+        # 缺键行（旧数据/手工写入）→ 安全默认；entries 非 list 视为损坏 fail-closed
+        entries = row.get("entries")
+        if not isinstance(entries, list):
+            raise RuntimeError(
+                f"孩子自报饮食行 entries 类型错误（patient_id={patient_id}）："
+                f"期望 list，实际 {type(entries).__name__}——拒绝静默清空")
+        return {
+            "entries": entries,
+            "total_points": int(row.get("total_points", 0) or 0),
+            "daily_points": int(row.get("daily_points", 0) or 0),
+            "last_points_date": str(row.get("last_points_date", "") or ""),
+        }
+
+    def save_patient_child_foodlog(self, patient_id: str,
+                                   row: dict[str, Any]) -> None:
+        # N4：RMW 全程持锁（同 save_patient_diary，防 TOCTOU 覆盖）
+        with self._LOCAL_JSON_LOCK:
+            store = self._load_child_foodlog_file()
+            store[patient_id] = dict(row)
+            atomic_write_json(_state_path(CHILD_FOODLOG_STORE_FILENAME), store)
 
 
 class TablestoreRepository(TablestoreBase):
@@ -372,6 +427,52 @@ class TablestoreRepository(TablestoreBase):
                               {"points": self._json_col(list(points)),
                                "updated_at": _now_iso()})
 
+    # ---- 孩子自报饮食（child_foodlog，2026-08-21）----
+
+    def load_patient_child_foodlog(self, patient_id: str) -> dict[str, Any]:
+        """行级读**单个患者**孩子自报饮食（GetRow(pk=patient_id)，不扫全表）。
+
+        无该患者行 → {"entries": [], "total_points": 0, "daily_points": 0,
+        "last_points_date": ""}；损坏 JSON/类型错误 fail-closed 抛 RuntimeError
+        （X1 口径：拒绝静默清空后经 save 覆盖写回丢数据）。
+        """
+        row = self._get_row(TABLE_CHILD_FOODLOG, self._pk_patient(patient_id))
+        if row is None:
+            return {"entries": [], "total_points": 0,
+                    "daily_points": 0, "last_points_date": ""}
+        entries: list[dict[str, Any]] = []
+        raw = row.get("entries")
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"孩子自报饮食列 entries 损坏（非法 JSON，patient_id={patient_id}）："
+                    f"{exc}——拒绝静默清空，请人工修复 Tablestore 该行数据") from exc
+            if not isinstance(data, list):
+                raise RuntimeError(
+                    f"孩子自报饮食列 entries 类型错误（patient_id={patient_id}）："
+                    f"期望 list，实际 {type(data).__name__}——拒绝静默清空")
+            entries = data
+        elif raw is not None:
+            raise RuntimeError(
+                f"孩子自报饮食列 entries 类型错误（patient_id={patient_id}）："
+                f"期望 JSON 字符串，实际 {type(raw).__name__}——拒绝静默清空")
+        return {
+            "entries": entries,
+            "total_points": int(row.get("total_points", 0) or 0),
+            "daily_points": int(row.get("daily_points", 0) or 0),
+            "last_points_date": str(row.get("last_points_date", "") or ""),
+        }
+
+    def save_patient_child_foodlog(self, patient_id: str,
+                                   row: dict[str, Any]) -> None:
+        """行级写**单个患者**孩子自报饮食（行级 _rev 乐观锁，只写该患者行）。"""
+        attrs = dict(row)
+        attrs["entries"] = self._json_col(list(row.get("entries", [])))
+        attrs["updated_at"] = _now_iso()
+        self._save_row_locked(TABLE_CHILD_FOODLOG, self._pk_patient(patient_id), attrs)
+
 
 def _now_iso() -> str:
     # C2 修复（2026-08-14）：aware UTC——此前 naive datetime.now() 与 care/P1 的
@@ -386,6 +487,7 @@ def ensure_tablestore_tables() -> None:
     TablestoreBase().ensure_tables({
         TABLE_FOOD_DIARY: [("patient_id", "STRING")],
         TABLE_PEW_HISTORY: [("patient_id", "STRING")],
+        TABLE_CHILD_FOODLOG: [("patient_id", "STRING")],
     })
 
 
@@ -414,8 +516,10 @@ def get_repository() -> NutritionRepository:
 
 
 __all__ = [
+    "CHILD_FOODLOG_STORE_FILENAME",
     "DIARY_STORE_FILENAME",
     "PEW_STORE_FILENAME",
+    "TABLE_CHILD_FOODLOG",
     "TABLE_FOOD_DIARY",
     "TABLE_PEW_HISTORY",
     "LocalJsonRepository",

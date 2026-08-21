@@ -24,6 +24,7 @@ from .core import (
     calc_prnt_targets,
     get_food_diary_summary,
     get_pew_history,
+    record_child_food,
     record_pew_risk,
     upsert_food_diary,
 )
@@ -126,9 +127,28 @@ def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = Tr
 
 @mcp.tool
 def get_food_diary_summary_tool(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
-    """查最近饮食日记摘要（含最近 3 日均值 diet_diary_3d；摘要含食物名称，非脱敏展示）。家长须携带 guardian_token。"""
+    """查最近饮食日记摘要（含最近 3 日均值 diet_diary_3d；摘要含食物名称，非脱敏展示）。家长须携带 guardian_token。
+
+    2026-08-21 起双段输出：food_diary（家长/医生记录，diet_diary_3d 仅聚合此段）
+    + child_foodlog（孩子自报，参考数据，不计入营养评估）。
+    """
     try:
         return get_food_diary_summary(patient_id, guardian_token)
+    except Exception as exc:
+        return _invalid(exc)
+
+
+@mcp.tool
+def record_child_food_tool(patient_id: str, entries: list, write_mode: bool = True) -> dict[str, Any]:
+    """孩子自报饮食记录（写 child_foodlog，**仅患儿身份 child_assistant 可写**）。
+
+    参考数据（不作医疗结论、不进营养评估），家长/医生只读。每次成功写入 +1 分
+    （同一天最多 +5，跨天重置），返回累计积分与"小肾侠"段位/鼓励话术。
+
+    entries 每项：{date, meal?, food, amount?}（amount 为孩子自述量，自由文本）
+    """
+    try:
+        return record_child_food(patient_id, entries, write_mode)
     except Exception as exc:
         return _invalid(exc)
 

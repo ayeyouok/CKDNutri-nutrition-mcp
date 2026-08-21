@@ -22,12 +22,14 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from a207_policy import (
+    CHILD_ROLE,
     DEMO_ALLOWED_PATIENTS,
     DEMO_PARENT_ROLE,
     PARENT_EQUIVALENT_ROLES,
     PARENT_ROLE,
     enforce_nutrition_tool,
     get_caller,
+    get_child_patient_id,
     validate_patient_id,
     verify_guardian_token,
 )
@@ -39,6 +41,32 @@ from .constants import DIALYSIS_ALIAS
 # ---------------------------------------------------------------------------
 GUIDELINE = "PRNT 2020 (Shaw et al., Pediatr Nephrol 35:519-531)"
 MCP_NAME = "CKDNutri-nutrition-mcp"
+
+# ---- 孩子自报饮食·小肾侠段位（2026-08-21）----
+# 用户指定阈值（按累计积分 total_points 分档），鼓励话术本地模板（不依赖 LLM）。
+# 段位名仿游戏风格（青铜→全球精英），用于孩子记录饮食后的即时激励。
+_XIAOSHENXIA_BANDS: tuple[tuple[int, str, str], ...] = (
+    (0,   "小肾侠·青铜",   "小肾侠出发啦！记下第一笔，健康之路开始啦～"),
+    (10,  "小肾侠·白银",   "记录越来越稳了，小肾侠继续加油！"),
+    (26,  "小肾侠·黄金",   "真棒！坚持记录的你超厉害！"),
+    (46,  "小肾侠·铂金",   "哇，小肾侠已经是记录高手了！"),
+    (71,  "小肾侠·钻石",   "太强了！离星耀只差一步！"),
+    (101, "小肾侠·星耀",   "闪闪发光的星耀小肾侠！保持下去！"),
+    (151, "小肾侠·大师",   "大师级小肾侠！你的坚持让医生都点赞！"),
+    (221, "小肾侠·王者",   "👑 王者小肾侠！你是最闪亮的记录之星！"),
+    (366, "小肾侠·全球精英", "🏆 全球精英小肾侠！你已经是传奇啦！"),
+)
+
+
+def _child_band(points: int) -> tuple[str, str]:
+    """按累计积分返回 (段位名, 鼓励话术)。阈值单调递增，首个 >= 即命中。"""
+    band, text = _XIAOSHENXIA_BANDS[0][1], _XIAOSHENXIA_BANDS[0][2]
+    for threshold, name, msg in _XIAOSHENXIA_BANDS:
+        if points >= threshold:
+            band, text = name, msg
+        else:
+            break
+    return band, text
 
 # P1-3：运行时写库不落安装目录；v0.5 起存储统一经 nutrition_repository DAO
 # （默认 Tablestore；json 开发模式落 A207_NUTRITION_ASSESSMENT_DATA_DIR / A207_DATA_DIR）。
@@ -113,6 +141,16 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
 
     校验走 a207_policy.verify_guardian_token（统一实现，含过期校验，BUG-30/36）。
     """
+    if caller == CHILD_ROLE:
+        # 2026-08-21：患儿身份单实例绑单患儿（env A207_CHILD_PATIENT_ID，如 P0020）。
+        # 免令牌，但读写范围钉死绑定患儿——跨患儿一律 FORBIDDEN（fail-closed，
+        # 模型不可自证患儿；未设置 env 时 get_child_patient_id 抛 CallerUnknown 拒绝）。
+        bound = get_child_patient_id()
+        if patient_id != bound:
+            return {"ok": False, "error": "FORBIDDEN",
+                    "detail": f"child_assistant 仅可访问绑定患儿 {bound}，"
+                              f"收到 patient_id={patient_id}"}
+        return None
     if caller not in PARENT_EQUIVALENT_ROLES:
         return None                      # 医生/风险管线：不进家长闸
     if caller == DEMO_PARENT_ROLE:
@@ -1040,6 +1078,82 @@ def _save_patient_store(patient_id: str, entries: list[dict[str, Any]]) -> None:
     _repo().save_patient_diary(patient_id, entries)
 
 
+# ---- 孩子自报饮食（child_foodlog，2026-08-21）----
+
+def _load_child_foodlog(patient_id: str) -> dict[str, Any]:
+    """行级读该患儿孩子自报饮食行（child_foodlog；无记录返回空行）。"""
+    return _repo().load_patient_child_foodlog(patient_id)
+
+
+def _save_child_foodlog(patient_id: str, row: dict[str, Any]) -> None:
+    """行级写该患儿孩子自报饮食行（child_foodlog；行级 _rev 乐观锁）。"""
+    _repo().save_patient_child_foodlog(patient_id, row)
+
+
+def record_child_food(patient_id: str,
+                      entries: list[dict[str, Any]] | None = None,
+                      write_mode: bool = True) -> dict[str, Any]:
+    """孩子自报饮食记录（写 child_foodlog 表，**仅 child_assistant 可写**）。
+
+    2026-08-21 设计：孩子自报"吃了什么/吃多少"是**参考数据，不作医疗结论**
+    （get_food_diary_summary 的 diet_diary_3d 只聚合 food_diary——计算隔离，
+    孩子自报绝不进营养评估）。家长/医生对 child_foodlog 只读，无写权限、无审阅流
+    （家长不服自己记 food_diary）。
+
+    积分（小肾侠）：每次成功写入 +1 分，同一天最多 +5（第 6 笔起记录照写、不加分），
+    跨天重置当日计数；返回累计积分与"小肾侠"段位/鼓励话术（本地模板，不依赖 LLM）。
+    """
+    caller = get_caller()
+    enforce_nutrition_tool(caller, "record_child_food")   # gate 收口：仅 child_assistant
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+    denied = _guard_guardian(caller, patient_id, None, "record_child_food")  # child 分支绑 env 患儿
+    if denied:
+        return denied
+    if not entries:
+        return {"ok": False, "error": "INVALID_INPUT", "detail": "entries 不能为空"}
+    for _i, _e in enumerate(entries):
+        if not isinstance(_e, dict):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"entries[{_i}] 必须为对象（dict），收到 {type(_e).__name__}"}
+        # 宽松校验：孩子自报字段（date/meal/food/amount 自由文本），日期归一 + 拒未来
+        _raw = _e.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            _norm = _normalize_date(_raw, "date")
+        except ValueError as exc:
+            return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+        if _norm > datetime.now(timezone.utc).date().isoformat():
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"条目日期 {_norm} 晚于今天（未来日期），拒绝写入"}
+        _e["date"] = _norm
+    with _STORE_LOCK:
+        row = _load_child_foodlog(patient_id)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if row.get("last_points_date") != today:
+            row["daily_points"] = 0
+            row["last_points_date"] = today
+        awarded = int(row.get("daily_points", 0) or 0) < 5
+        if awarded:
+            row["daily_points"] = int(row.get("daily_points", 0) or 0) + 1
+            row["total_points"] = int(row.get("total_points", 0) or 0) + 1
+        row["entries"] = list(row.get("entries", [])) + [dict(_e) for _e in entries]
+        _save_child_foodlog(patient_id, row)
+    band, msg = _child_band(int(row.get("total_points", 0) or 0))
+    return {"ok": True, "data": {
+        "patient_id": patient_id,
+        "entry_count": len(row.get("entries", [])),
+        "awarded": awarded,
+        "daily_points": int(row.get("daily_points", 0) or 0),
+        "total_points": int(row.get("total_points", 0) or 0),
+        "band": band,
+        "encourage": msg,
+        "source": "child_self_report",
+        "note": "孩子自报饮食，仅供参考，不作医疗结论",
+    }}
+
+
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """取最近 3 个不重复日期的条目，按**天数**求每日均值，返回 diet_diary_3d 形状。
 
@@ -1249,11 +1363,16 @@ def upsert_food_diary(
 
 
 def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
-    """读取并聚合某患者的饮食日记（只读，家长/医生/临床角色可读）。
+    """读取并聚合某患者的饮食日记（只读，家长/医生/临床角色/患儿可读）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     家长读取必须携带 guardian_token 完成患儿绑定核验（2026-08-12 修复：
     此前无绑定校验，家长可跨患者读取任意患儿日记原始条目）。
+
+    2026-08-21 双段输出：food_diary（家长/医生医疗记录，现有字段与 diet_diary_3d
+    语义不变）+ child_foodlog（孩子自报，参考数据，标 source=child_self_report）。
+    **计算隔离（用户明确要求 + 测试锁定）**：diet_diary_3d 只聚合 food_diary——
+    孩子自报数据绝不进营养评估（防污染临床结论）。
     """
     caller = get_caller()
     enforce_nutrition_tool(caller, "get_food_diary_summary")
@@ -1270,6 +1389,21 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     # 条目——此前 _load_store() 全表拉取后再 filter，医院级全库扫描。
     store = _load_patient_store(patient_id)
     entries = store.get("entries", [])
+    # 2026-08-21：孩子自报段（child_foodlog）——独立行级读，仅展示；不进聚合。
+    child_row = _load_child_foodlog(patient_id)
+    child_entries = child_row.get("entries", [])
+    child_band, _child_msg = _child_band(int(child_row.get("total_points", 0) or 0))
+    child_summary: dict[str, Any] = {
+        "entry_count": len(child_entries),
+        "day_count": len({_e.get("date") for _e in child_entries
+                          if isinstance(_e, dict) and _e.get("date")}),
+        "recent_entries": child_entries[-10:],
+        "total_points": int(child_row.get("total_points", 0) or 0),
+        "daily_points": int(child_row.get("daily_points", 0) or 0),
+        "band": child_band,
+        "source": "child_self_report",
+        "note": "孩子自报饮食，仅供参考，不作医疗结论（不计入营养评估）",
+    }
     if not entries:
         return {
             "ok": True,
@@ -1279,6 +1413,7 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
                 "entry_count": 0,
                 "diet_diary_3d": None,
                 "note": "暂无该患者的饮食日记记录。",
+                "child_foodlog": child_summary,
             },
         }
     agg = _aggregate(entries)
@@ -1290,6 +1425,7 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
             "entry_count": agg["entry_count"],
             "diet_diary_3d": {k: _round(v, 1) for k, v in agg["diet_diary_3d"].items()},
             "recent_entries": entries[-10:],
+            "child_foodlog": child_summary,
         },
     }
 
