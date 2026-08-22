@@ -264,6 +264,32 @@ def test_child_foodlog_recent_days_cross_day_visible():
     assert len(cs["recent_entries"]) == 10, cs["recent_entries"]
 
 
+# ---- 业务日时区（2026-08-22 用户指出：中国应走北京时间）----
+
+def test_business_day_uses_beijing_time():
+    """业务日基准必须为北京时间（UTC+8）而非 UTC——本地凌晨 0-8 点记录不得归前一天。"""
+    from datetime import datetime, timedelta, timezone
+    off = core._CN_TZ.utcoffset(None)
+    assert off == timedelta(hours=8), f"北京时间应为 UTC+8，实际 {off}"
+    # 北京时间日期 == UTC 日期 + 8 小时后的日期（跨 UTC 零点时两者不同，业务日取北京）
+    cn_date = datetime.now(core._CN_TZ).date()
+    utc_plus8 = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
+    assert cn_date == utc_plus8, f"业务日应与 UTC+8 对齐：{cn_date} vs {utc_plus8}"
+
+
+def test_child_foodlog_default_date_is_beijing_today():
+    """record_child_food 未传 date → 默认**北京时间**当天（此前 UTC，本地凌晨归前一天）。"""
+    from datetime import datetime, timedelta, timezone
+    _set_child_env()
+    with as_caller(CHILD):
+        r = core.record_child_food(BOUND, [{"meal": "早餐", "food": "面条", "amount": "1碗"}])
+    assert r["ok"] is True, r
+    row = core._load_child_foodlog(BOUND)
+    e = row["entries"][0]
+    expect = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    assert e["date"] == expect, f"默认日期应为北京时间今天 {expect}，实际 {e['date']}"
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

@@ -17,9 +17,17 @@ import math
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
+
+# 业务日基准（2026-08-22 用户指出）：**北京时间（UTC+8，固定偏移，中国无夏令时，
+# 零依赖）**。date 字段是用户感知的"今天"（孩子/家长记"今天吃了几号的饭"），
+# 必须按北京时区计算——此前用 datetime.now(timezone.utc)（UTC 日期），本地凌晨
+# 0:00-7:59 记录会归到"前一天"，跨天归错（如 8-22 本地凌晨被记为 8-21）。
+# 注意：recorded_at/updated_at **时间戳**仍用 UTC 存储（全球统一、无歧义），
+# 与业务日（date）解耦——时间戳归时间戳、业务日归业务日。
+_CN_TZ = timezone(timedelta(hours=8))
 
 from a207_policy import (
     CHILD_ROLE,
@@ -1119,18 +1127,18 @@ def record_child_food(patient_id: str,
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"entries[{_i}] 必须为对象（dict），收到 {type(_e).__name__}"}
         # 宽松校验：孩子自报字段（date/meal/food/amount 自由文本），日期归一 + 拒未来
-        _raw = _e.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _raw = _e.get("date") or datetime.now(_CN_TZ).strftime("%Y-%m-%d")
         try:
             _norm = _normalize_date(_raw, "date")
         except ValueError as exc:
             return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
-        if _norm > datetime.now(timezone.utc).date().isoformat():
+        if _norm > datetime.now(_CN_TZ).date().isoformat():
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"条目日期 {_norm} 晚于今天（未来日期），拒绝写入"}
         _e["date"] = _norm
     with _STORE_LOCK:
         row = _load_child_foodlog(patient_id)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(_CN_TZ).strftime("%Y-%m-%d")
         if row.get("last_points_date") != today:
             row["daily_points"] = 0
             row["last_points_date"] = today
@@ -1288,12 +1296,12 @@ def upsert_food_diary(
         stamped = []
         for e in entries:
             # BUG-60：写入前归一化日期（容忍 YYYY-M-D / YYYY/M/D 等变体，非法日期显式拒绝）
-            raw_date = e.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")  # C1（2026-08-15）：日记业务日期统一 UTC——此前 datetime.now() 本地 naive，与同库 recorded_at(UTC) 不一致，跨时区部署（UTC+8 等）行为漂移
+            raw_date = e.get("date") or datetime.now(_CN_TZ).strftime("%Y-%m-%d")  # C1（2026-08-15）+ 2026-08-22：业务日期统一 aware——此前 naive 与 recorded_at(UTC) 比较漂移；2026-08-22 起"今天"按北京时间（_CN_TZ，UTC+8），时间戳仍 UTC
             # F-4（2026-08-15）：未来日期拒绝——未来条目会成为 3 日锚点污染摄入评估
             # （sum_diet_intake 取最近 3 日窗口，未来条目把窗口拉向未来导致今日摄入
             # 缺失）。与 P1 report_date 未来拒绝同口径（UTC 业务日）。
             _norm_date = _normalize_date(raw_date, "date")
-            if _norm_date > datetime.now(timezone.utc).date().isoformat():
+            if _norm_date > datetime.now(_CN_TZ).date().isoformat():
                 return {"ok": False, "error": "INVALID_INPUT",
                         "detail": f"条目日期 {_norm_date} 晚于今天（未来日期），拒绝写入"}
             # N-S4 修复（2026-08-14）：写路径营养键有限性校验（fail-closed）——
@@ -1987,7 +1995,7 @@ def record_pew_risk(patient_id: str, date: str, score: float, level: str) -> dic
     date = _normalize_date(date, "date")
     # 边界（2026-08-15）：未来日期拒绝——未来 PEW 点会成为趋势窗口的"未来锚点"
     # 导致趋势反转（record_pew_risk 写入未来 → 最新点在未来 → 趋势误判恶化/好转）。
-    if date > datetime.now(timezone.utc).date().isoformat():
+    if date > datetime.now(_CN_TZ).date().isoformat():
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"PEW 记录日期 {date} 晚于今天（未来日期），拒绝写入"}
     with _STORE_LOCK:
