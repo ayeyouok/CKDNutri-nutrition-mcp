@@ -205,6 +205,65 @@ def test_band_thresholds():
     assert core._child_band(366)[0] == "小肾侠·全球精英"
 
 
+# ---- 幂等合并 + 跨天可见性（2026-08-22 用户反馈）----
+
+def test_child_foodlog_idempotent_same_meal_food():
+    """同日同餐次同食物重发 → 内容幂等替换（不叠加重复条目）。
+
+    用户实测：同早餐出现"鸡蛋 20 个 + 鸡蛋 2 个"、"米饭 20 碗 + 米饭 1 碗"——
+    record_child_food 此前无条件追加（无 S-3 幂等），LLM 重发/同日补记即重复。
+    """
+    _set_child_env()
+    with as_caller(CHILD):
+        r1 = core.record_child_food(BOUND, [
+            {"date": "2026-08-21", "meal": "早餐", "food": "鸡蛋", "amount": "20个"}])
+        assert r1["ok"] is True, r1
+        r2 = core.record_child_food(BOUND, [
+            {"date": "2026-08-21", "meal": "早餐", "food": "鸡蛋", "amount": "2个"}])
+        assert r2["ok"] is True, r2
+        row = core._load_child_foodlog(BOUND)
+    entries = row.get("entries", [])
+    assert len(entries) == 1, f"同键重发应收敛为 1 条，实际 {len(entries)}: {entries}"
+    assert entries[0]["amount"] == "2个", "后写者意图：重复条目被最新值替换"
+    # 不同食物不合并
+    with as_caller(CHILD):
+        core.record_child_food(BOUND, [
+            {"date": "2026-08-21", "meal": "早餐", "food": "豆浆", "amount": "1杯"}])
+        row = core._load_child_foodlog(BOUND)
+    assert len(row.get("entries", [])) == 2, "不同食物应各自保留"
+
+
+def test_child_foodlog_recent_days_cross_day_visible():
+    """跨天记录不被截断：recent_days 按 date 分组取最近 3 天，昨天的记录仍可见。
+
+    用户实测"为什么都是同一天"——recent_entries[-10:] 是 flat 最近 10 条，昨天记的
+    一旦被今天的 10+ 条挤出窗口就看不见。recent_days 分组后按天完整可见。
+    """
+    _set_child_env()
+    with as_caller(CHILD):
+        # 昨天 21 号：12 条（超过 recent_entries 10 条窗口）
+        for i in range(12):
+            core.record_child_food(BOUND, [
+                {"date": "2026-08-21", "meal": "早餐", "food": f"昨日食物{i}"}])
+        # 今天 22 号：2 条
+        core.record_child_food(BOUND, [
+            {"date": "2026-08-22", "meal": "早餐", "food": "今日食物A"}])
+        core.record_child_food(BOUND, [
+            {"date": "2026-08-22", "meal": "早餐", "food": "今日食物B"}])
+    with as_caller("doctor_assistant"):
+        r = core.get_food_diary_summary(BOUND)
+    assert r["ok"] is True, r
+    cs = r["data"]["child_foodlog"]
+    assert cs["day_count"] == 2, cs
+    # recent_days：最近 3 天分组，21 号 12 条完整可见（不截断）
+    rd = cs["recent_days"]
+    assert set(rd.keys()) == {"2026-08-21", "2026-08-22"}, rd
+    assert len(rd["2026-08-21"]) == 12, "昨天的 12 条在 recent_days 中完整可见"
+    assert len(rd["2026-08-22"]) == 2, "今天的 2 条在 recent_days 中可见"
+    # recent_entries 仍是 flat 最近 10 条（兼容旧消费方）
+    assert len(cs["recent_entries"]) == 10, cs["recent_entries"]
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

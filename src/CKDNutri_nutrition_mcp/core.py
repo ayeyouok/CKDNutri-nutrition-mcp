@@ -1138,7 +1138,30 @@ def record_child_food(patient_id: str,
         if awarded:
             row["daily_points"] = int(row.get("daily_points", 0) or 0) + 1
             row["total_points"] = int(row.get("total_points", 0) or 0) + 1
-        row["entries"] = list(row.get("entries", [])) + [dict(_e) for _e in entries]
+        # 2026-08-22（用户反馈"同一天记录叠加/重复"）：child_foodlog 此前**无条件追加**
+        # （`existing + new`，无幂等）——LLM 弱网重试/同一顿重发/同日多次补记会把
+        # 同 (date,meal,food) 条目重复落库（实测同早餐出现"鸡蛋 20 个 + 鸡蛋 2 个"、
+        # "米饭 20 碗 + 米饭 1 碗"）。对齐 upsert_food_diary 的 S-3 内容幂等语义：
+        # 同 date+meal+food 已存在 → 用本次值**替换**（后写者意图），不同键才追加。
+        def _content_key(e):
+            return (e.get("date"), e.get("meal") or "", e.get("food") or "")
+        newest = {}
+        for _e in entries:                 # 本次条目（date 已归一）
+            newest[_content_key(_e)] = _e
+        _merged: list[dict] = []
+        _seen: set = set()
+        for _e in row.get("entries", []):
+            _k = _content_key(_e)
+            if _k in newest:
+                if _k not in _seen:        # 同键旧条目被本次值替换（收敛重复）
+                    _merged.append(newest[_k])
+                    _seen.add(_k)
+            else:
+                _merged.append(_e)
+        for _k, _e in newest.items():      # 新键条目追加
+            if _k not in _seen:
+                _merged.append(_e)
+        row["entries"] = _merged
         _save_child_foodlog(patient_id, row)
     band, msg = _child_band(int(row.get("total_points", 0) or 0))
     return {"ok": True, "data": {
@@ -1393,11 +1416,21 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     child_row = _load_child_foodlog(patient_id)
     child_entries = child_row.get("entries", [])
     child_band, _child_msg = _child_band(int(child_row.get("total_points", 0) or 0))
+    # 2026-08-22（用户反馈"为什么都在同一天"）：recent_entries[-10:] 是 flat 最近 10 条，
+    # 跨天记录（昨天记的）一旦超过 10 条窗口就被挤掉，看起来"所有记录都是今天"。
+    # 新增 recent_days：按 date 分组取**最近 3 天**（对齐 diet_diary_3d 语义），
+    # 让昨天的记录不会被截断、跨天清晰可见；recent_entries 保留兼容（flat 最近 10 条）。
+    _by_day: dict[str, list[dict[str, Any]]] = {}
+    for _e in child_entries:
+        if isinstance(_e, dict) and _e.get("date"):
+            _by_day.setdefault(_e["date"], []).append(_e)
+    _recent_days = {d: _by_day[d] for d in sorted(_by_day.keys(), reverse=True)[:3]}
     child_summary: dict[str, Any] = {
         "entry_count": len(child_entries),
         "day_count": len({_e.get("date") for _e in child_entries
                           if isinstance(_e, dict) and _e.get("date")}),
         "recent_entries": child_entries[-10:],
+        "recent_days": _recent_days,
         "total_points": int(child_row.get("total_points", 0) or 0),
         "daily_points": int(child_row.get("daily_points", 0) or 0),
         "band": child_band,
