@@ -255,7 +255,7 @@ def generate_meal_plan_tool(
         plan = generate_meal_plan(
             float(target_energy_kcal), float(target_protein_g),
             float(target_k_mg), float(target_p_mg), float(target_na_mg),
-            days=int(days), vegetarian=bool(vegetarian), exclude_foods=exclude_foods,
+            days=int(days), vegetarian=_to_bool(vegetarian), exclude_foods=exclude_foods,
         )
         return {"ok": True, "data": plan}
     except Exception as exc:
@@ -308,8 +308,8 @@ def calc_prnt_targets_tool(
             growth_status=growth_status, is_edema=_to_bool(is_edema),
             pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
             height_age_years=float(height_age_years) if height_age_years is not None else None,
-            # 原样传递，由 core 层做严格 bool 校验（bool("false")==True 陷阱；pydantic 已先行解析）
-            high_urea_persistent=high_urea_persistent,
+            # 十四审（2026-08-24）：与 is_edema 同口径，包装层统一 _to_bool 归一，避免单工具与 DAG 口径不一
+            high_urea_persistent=_to_bool(high_urea_persistent),
         )
     except Exception as exc:
         return _invalid(exc)
@@ -561,7 +561,7 @@ def comprehensive_nutrition_assessment_tool(
                 diet, age_years=float(age_years), sex=sex, weight_kg=float(weight_kg),
                 ckd_stage=stage, dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
                 growth_status=growth_status, height_cm=float(height_cm or 0.0),
-                is_edema=bool(is_edema),
+                is_edema=_to_bool(is_edema),
                 pd_glucose_kcal_per_day=pd_kcal,  # BUG-08：透传腹透扣减
                 albumin_g_L=serum_albumin_g_l,  # BUG-61：白蛋白参与摄入路径 PEW 筛查
                 # 八审（2026-08-16）：M1 修复不完整——DAG 此前只给 calc_prnt_targets
@@ -586,7 +586,7 @@ def comprehensive_nutrition_assessment_tool(
             else:
                 pew = assess_pew_risk(
                     float(diet.get("avg_protein_g", 0.0)), float(diet.get("avg_energy_kcal", 0.0)),
-                    float(target_p), float(target_e), serum_albumin_g_l,
+                    float(target_p), float(target_e), albumin_g_L=serum_albumin_g_l,
                     # BUG-42：PEW 蛋白下限用 PRNT 官方 SDI 下限（floor_g_per_day），
                     # 不用"目标×85%"近似（婴儿段会把 1.52-2.1 g/kg 的合规摄入误判为低于安全下限）
                     floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
