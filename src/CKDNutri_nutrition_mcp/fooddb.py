@@ -107,7 +107,10 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                     # 钠单列 0 **不判**（H1 保留：谷物/天然食材低钠是成分表正常标注，
                     # 51% 钠 0 属正常分布）。空串分支上面已覆盖，此处仅补字面 0。
                     for _k in ("potassium_mg", "phosphorus_mg"):
-                        if (raw.get(_k) or "").strip() in ("0", "0.0") \
+                        # 复审 LOW-加固（2026-08-23 夜审）：字面 0 判定由硬编码字符串枚举
+                        # ("0"/"0.0") 升级为数值解析——覆盖 "0.00"/"0."/".0"/" 0.0 " 等
+                        # 所有数值零形式，避免缺失标记漏判（警示文案漏标，非数值逃逸）。
+                        if _to_float(raw.get(_k)) == 0.0 \
                                 and _k not in row["missing_nutrients"]:
                             row["missing_nutrients"].append(_k)
                 row["potassium_level"], row["potassium_label"] = classify(row["potassium_mg"], K_LEVELS)
@@ -305,6 +308,7 @@ def find_food_cluster(query: str) -> list[dict[str, Any]] | None:
     if not text:
         return None
     base = base_name(text)
+    load_foods()  # 复审 LOW-加固（2026-08-23 夜审）：确保 _CLUSTER 已初始化（独立单测/直接调用场景）
     group = _CLUSTER.get(base)
     if group and len(group) > 1:
         return group
@@ -387,7 +391,7 @@ def food_card(row: dict[str, Any]) -> dict[str, Any]:
     """食物基础卡片（每 100 g 可食部 + 分级 + 家庭量具锚点）。"""
     return {
         "name": row["name"],
-        "aliases": row["aliases"],
+        "aliases": list(row["aliases"]),  # 复审 LOW-加固：防御性浅拷贝，避免外部修改污染全局 _CACHE
         "category": row["category"],
         "subcategory": row["subcategory"],
         "edible_pct": row["edible_pct"],

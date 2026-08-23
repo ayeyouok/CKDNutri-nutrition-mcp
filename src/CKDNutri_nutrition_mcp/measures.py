@@ -187,6 +187,13 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
             text = text[len(token):]
     text = text or "1份"
 
+    # P3 复审 LOW-加固（2026-08-23 夜审）：负数份量（如 "-10" / "-10g"）此前绕过纯数字
+    # 分支（带负号 isdigit()=False）落入回退 100g，被当正向摄入计入（与 BUG11 负数克重
+    # 同口径拒绝）。统一在入口拦截前导负号。
+    if text.startswith("-"):
+        return {"grams": 0.0, "resolved": False,
+                "basis": f"份量「{portion}」含前导负号，已按 0 处理（录入错误）"}
+
     # P3（2026-08-23 复审）：纯数字无单位（如 "150"）直接作为克重——此前落入
     # unit is None 分支按 "份"×unit_grams（150×150=22500g），单次进食能量飙至数万
     # 千卡。纯阿拉伯数字串无量词语义，明确按克重直出（与 "150g" 行为一致）。
