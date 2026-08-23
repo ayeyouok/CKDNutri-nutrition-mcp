@@ -432,7 +432,13 @@ def _interp(lo_anchor: float, hi_anchor: float, lo_value: float, hi_value: float
 def schofield_bmr_kcal(sex: str, age_years: float, weight_kg: float,
                        height_cm: float) -> float | None:
     """Schofield 体重+身高方程，返回 kcal/d。"""
-    if weight_kg <= 0 or height_cm <= 0:
+    # 十二审（2026-08-24）：NaN 防御——Python 中 `float("nan") <= 0` 恒为 False，
+    # 会穿透至 megajoules=NaN 并最终 round(NaN) 返回 NaN；作为模块级纯计算函数须自身
+    # fail-soft（调用方未必先校验）。与 ideal_body_weight_kg 对称处理。
+    if (not math.isfinite(weight_kg) or not math.isfinite(height_cm)
+            or weight_kg <= 0 or height_cm <= 0):
+        return None
+    if not math.isfinite(age_years) or age_years < 0:
         return None
     # bracket 语义（Schofield 年龄分段）：3=<3 岁、10=3-10 岁、18=>10 岁——键 (sex, 分段)
     # 中的数字是"分段标识"而非年龄/系数本身，避免维护者误读为"3 岁专属系数"。
@@ -1355,11 +1361,17 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     # N-S4 已拒 NaN，但历史脏数据仍会经 sum() 产出 NaN 键；非有限值按 0 计（fail-soft，
     # 与 `or 0.0` 的 None 口径对齐）。
     def _num(v: Any) -> float:
-        if isinstance(v, bool):
+        # 十二审（2026-08-24）：历史脏数据（旧版本/外部库导入）可能以数字字符串
+        # 存储（如 "energy_kcal": "350.5"），原 isinstance(int,float) 判定会将其归零
+        # 致均值失真。改为 try float(v)；bool 前置返回 0.0（bool 是 int 子类，
+        # float(True)=1.0 会误计入），非有限值按 0.0（fail-soft，与 None 口径对齐）。
+        if isinstance(v, bool) or v is None:
             return 0.0
-        if isinstance(v, (int, float)) and math.isfinite(v):
-            return float(v)
-        return 0.0
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) else 0.0
     avg = {
         "avg_energy_kcal": sum(_num(e.get("energy_kcal")) for e in used) / num_days,
         "avg_protein_g": sum(_num(e.get("protein_g")) for e in used) / num_days,
@@ -1591,7 +1603,11 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
     _by_day: dict[str, list[dict[str, Any]]] = {}
     for _e in child_entries:
         if isinstance(_e, dict) and _e.get("date"):
-            _by_day.setdefault(_e["date"], []).append(_e)
+            # 十二审（2026-08-24）：脏数据 date 可能为 int（如 20260824），混入 str 键后
+            # sorted() 跨类型抛 TypeError 致接口 500；统一归一为 str 并 strip，保证键同构。
+            _d = str(_e["date"]).strip()
+            if _d:
+                _by_day.setdefault(_d, []).append(_e)
     _recent_days = {d: _by_day[d] for d in sorted(_by_day.keys(), reverse=True)[:3]}
     child_summary: dict[str, Any] = {
         "entry_count": len(child_entries),
@@ -2281,6 +2297,13 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     # points, trend} 与 record_pew_risk 的 {ok, data} 不一致（core.py:1346 注释自称
     # "统一"但并未统一），编排层需双形态兼容。消费方（care get_pew_timeline /
     # content 报告）均为参数注入不解析返回，改信封无破坏。
+    # 十二审（2026-08-24）：返回的 points 须与趋势计算同口径按 date 升序——前端图表
+    # 组件依赖单调时序渲染；底层存储乱序（并发/多格式写入）会直接传给前端。
+    if isinstance(pts, list):
+        pts = sorted(
+            pts,
+            key=lambda x: str(x.get("date", "")) if isinstance(x, dict) else "",
+        )
     return {
         "ok": True,
         "data": {
