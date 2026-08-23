@@ -67,9 +67,19 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
                 or math.isnan(weight_kg) or math.isinf(weight_kg) or weight_kg <= 0:
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"weight_kg 必须为正数，收到 {weight_kg!r}"}
-    if dialysate_glucose_g is None or dialysate_glucose_g < 0:
+    # BUG-TYPE-1（2026-08-23 审查）：dialysate_glucose_g / dwell_hours 此前仅在"已是
+    # 数值且非 bool"时才查 NaN/Inf，str 或 bool 会绕过并流入下方比较——`'50' < 0`
+    # 抛未捕获 TypeError（500 崩溃，违背 Fail-Closed），bool 被 float() 静默转 1.0
+    # （布尔注入临床误算）。统一白名单：非 None、非 bool、是 int/float、有限，否则拒绝。
+    for _name, _val in (("dialysate_glucose_g", dialysate_glucose_g),
+                        ("dwell_hours", dwell_hours)):
+        if _val is None or isinstance(_val, bool) or not isinstance(_val, (int, float)) \
+                or math.isnan(_val) or math.isinf(_val):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 必须为有效数值，收到 {_val!r}"}
+    if dialysate_glucose_g < 0:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "dialysate_glucose_g 不能为负"}
-    if dwell_hours is None or dwell_hours <= 0:
+    if dwell_hours <= 0:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "dwell_hours 必须为正数"}
 
     transport = str(transport_type or "average").strip().lower()

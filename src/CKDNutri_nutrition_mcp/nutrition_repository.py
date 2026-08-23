@@ -254,8 +254,10 @@ class LocalJsonRepository:
             raise RuntimeError(
                 f"孩子自报饮食行 entries 类型错误（patient_id={patient_id}）："
                 f"期望 list，实际 {type(entries).__name__}——拒绝静默清空")
+        # P2-9（2026-08-23 审查）：返回时对 entries 做隔离（list(entries)），避免调用方
+        # 原地修改内部列表引用而污染尚未持久化的内存结构（defense-in-depth）。
         return {
-            "entries": entries,
+            "entries": list(entries),
             "total_points": int(row.get("total_points", 0) or 0),
             "daily_points": int(row.get("daily_points", 0) or 0),
             "last_points_date": str(row.get("last_points_date", "") or ""),
@@ -342,8 +344,15 @@ class TablestoreRepository(TablestoreBase):
         if row is None:
             return {"entries": []}
         raw = row.get("entries")
-        if not isinstance(raw, str):
+        # X1 对齐（2026-08-23 审查）：无 entries 列（raw=None）视为无数据返回空；
+        # 但 raw 存在却非 str（脏类型/字段篡改）必须 fail-closed 抛错，否则下游
+        # 读-改-写会把历史日记经 save 覆盖清空。与 load_diary / load_patient_child_foodlog 口径一致。
+        if raw is None:
             return {"entries": []}
+        if not isinstance(raw, str):
+            raise RuntimeError(
+                f"饮食日记列 entries 类型错误（patient_id={patient_id}）："
+                f"期望 JSON 字符串，实际 {type(raw).__name__}——拒绝静默清空")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -406,8 +415,14 @@ class TablestoreRepository(TablestoreBase):
         if row is None:
             return {patient_id: []}
         raw = row.get("points")
-        if not isinstance(raw, str):
+        # X1 对齐（2026-08-23 审查）：无 points 列视为无数据；非 None 且非 str 必须
+        # fail-closed 抛错，防止读-改-写清空 PEW 历史。
+        if raw is None:
             return {patient_id: []}
+        if not isinstance(raw, str):
+            raise RuntimeError(
+                f"PEW 历史列 points 类型错误（patient_id={patient_id}）："
+                f"期望 JSON 字符串，实际 {type(raw).__name__}——拒绝静默清空")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -458,8 +473,10 @@ class TablestoreRepository(TablestoreBase):
             raise RuntimeError(
                 f"孩子自报饮食列 entries 类型错误（patient_id={patient_id}）："
                 f"期望 JSON 字符串，实际 {type(raw).__name__}——拒绝静默清空")
+        # P2-9（2026-08-23 审查）：返回时对 entries 做隔离（list(entries)），避免调用方
+        # 原地修改内部列表引用而污染尚未持久化的内存结构（defense-in-depth）。
         return {
-            "entries": entries,
+            "entries": list(entries),
             "total_points": int(row.get("total_points", 0) or 0),
             "daily_points": int(row.get("daily_points", 0) or 0),
             "last_points_date": str(row.get("last_points_date", "") or ""),

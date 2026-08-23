@@ -209,6 +209,19 @@ DRUGS: dict[str, dict[str, Any]] = {
 }
 
 
+# P0-药（2026-08-23 审查）：以下宽泛/短别名**仅**参与第二级"精确别名包含"
+# （text in keys），禁止参与第三级模糊匹配（前缀 startswith / 反向子串 in），
+# 否则会截胡歧义输入导致临床错配：
+#   - "激素"：甲状旁腺激素 / 性激素 / 抗利尿激素 等含"激素"词会误判为糖皮质激素泼尼松；
+#   - "碳酸"：碳酸钙 / 碳酸镧 / 碳酸司维拉姆 药理完全不同，"碳酸结合剂/碳酸"无法区分，
+#             且"碳酸"作为 name 前缀会被 startswith 截胡到字典序首个；
+#   - "普利" / "沙坦"：ACEI / ARB 类名，输入"xx普利/xx沙坦"会被反向 in 命中；
+#   - "铁剂"：输入"补铁剂"会被反向 in 命中琥珀酸亚铁。
+# 精确全名（如"碳酸钙""碳酸司维拉姆""泼尼松"）仍由第二级 text in keys 命中，不受影响；
+# 单独输入被排除别名（如"碳酸"）因既非完整别名也不参与模糊 → 返回 None（fail-closed 澄清）。
+FUZZY_EXCLUDE_ALIASES = {"激素", "碳酸", "普利", "沙坦", "铁剂"}
+
+
 def _resolve_drug(drug: str) -> tuple[str, dict[str, Any]] | None:
     text = str(drug or "").strip().lower()
     if not text:
@@ -221,15 +234,19 @@ def _resolve_drug(drug: str) -> tuple[str, dict[str, Any]] | None:
         keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
         if text in keys:
             return name, info
-    # 2. 模糊匹配（仅当输入长度 >= 2，避免单个字符如 "d"/"钙" 的误命中）
-    if len(text) >= 2:
+    # 2. 模糊匹配（仅当输入长度 >= 2 且非歧义短别名，避免单个字符如 "d"/"钙" 的
+    # 误命中，亦避免"碳酸"等被 name 前缀 startswith 截胡到字典序首个碳酸盐）。
+    # 被排除别名单独输入 → 不进模糊，精确阶段亦不命中 → 返回 None（fail-closed 澄清）。
+    if len(text) >= 2 and text not in FUZZY_EXCLUDE_ALIASES:
         for name, info in DRUGS.items():
-            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
+            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]
+                                     if alias.lower() not in FUZZY_EXCLUDE_ALIASES]
             if any(key.startswith(text) for key in keys):
                 return name, info
         # 子串包含（仅在输入足够长时，防短输入误判）
         for name, info in DRUGS.items():
-            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
+            keys = [name.lower()] + [alias.lower() for alias in info["aliases"]
+                                     if alias.lower() not in FUZZY_EXCLUDE_ALIASES]
             if any(key in text for key in keys):
                 return name, info
     return None
@@ -249,8 +266,12 @@ def check_drug_nutrient_interaction(drug: str, nutrient: str | None = None) -> d
                 "supported_drugs": list(DRUGS)}
     name, info = hit
 
-    key = NUTRIENT_ALIAS.get(str(nutrient or "").strip().lower()) if nutrient else None
-    if nutrient and key is None:
+    # P2-7（2026-08-23 审查）：nutrient 含空格（如 "   "）应先 strip 判空——原逻辑
+    # `if nutrient and key is None` 中空格串为 Truthy，会误报 NUTRIENT_NOT_SUPPORTED
+    # 而非按"未指定营养素返回全量交互"处理。
+    nutrient_clean = str(nutrient or "").strip().lower()
+    key = NUTRIENT_ALIAS.get(nutrient_clean) if nutrient_clean else None
+    if nutrient_clean and key is None:
         return {"ok": False, "error": "NUTRIENT_NOT_SUPPORTED",
                 "detail": f"未识别营养素「{nutrient}」，可用：{'、'.join(NUTRIENT_LABEL.values())}",
                 "supported_nutrients": list(NUTRIENT_LABEL.values())}

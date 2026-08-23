@@ -201,16 +201,18 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                               "basis": basis,
                               **{key: scaled[key] for key in
                                  ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg")}})
-    # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
-    # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
-    # BUG-P1-02（2026-08-23）：原 missing_foods 在循环内逐条 append，多餐重复食用
-    # 同款缺失食物会成倍虚夸种数与展示项。改为用 set 去重（保留首次出现的完整描述）。
-    if row.get("missing_nutrients"):
-        _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
-                   "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
-                   "fat_g": "脂肪", "carb_g": "碳水"}
-        missing_foods.append(
-            f"「{row['name']}」（缺 {'、'.join(_labels.get(k, k) for k in row['missing_nutrients'])}）")
+        # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
+        # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
+        # BUG-P0-03（2026-08-23）：该判定块必须位于 for 循环**内部**（缩进 8 格）逐条
+        # 收集，否则循环结束后 row 仅指向最后一条记录，前序缺失警示被静默吞噬；且当
+        # 全部条目均 continue（非 dict / 未匹配）时 row 未定义，循环外访问触发
+        # UnboundLocalError 致 MCP 工具 500 崩溃。去重展示由循环外 dict.fromkeys 负责。
+        if row.get("missing_nutrients"):
+            _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
+                       "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
+                       "fat_g": "脂肪", "carb_g": "碳水"}
+            missing_foods.append(
+                f"「{row['name']}」（缺 {'、'.join(_labels.get(k, k) for k in row['missing_nutrients'])}）")
 
     if not contributions:
         return {"ok": False, "error": "NO_MATCHED_ITEM",
