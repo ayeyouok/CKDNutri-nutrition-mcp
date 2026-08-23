@@ -62,9 +62,10 @@ def test_pharma_ambiguous_excluded():
               "琥珀酸亚铁", "碳酸钙", "司维拉姆"]:
         hit = _resolve_drug(q)
         assert hit is not None and hit[0] == q, f"确切药物 {q!r} 应命中自身"
-    # 英文缩写模糊仍可用（非歧义词）
-    assert _resolve_drug("acei") is not None
-    assert _resolve_drug("arb") is not None
+    # 注（2026-08-23 第三轮）：acei/arb 已在本轮扩充进 FUZZY_EXCLUDE_ALIASES
+    # （药理大类词 fail-closed 澄清，防同类药物单向遮蔽），现应返回 None。
+    assert _resolve_drug("acei") is None
+    assert _resolve_drug("arb") is None
     print("[OK] pharma 歧义类别词 fail-closed + 确切命中回归")
 
 

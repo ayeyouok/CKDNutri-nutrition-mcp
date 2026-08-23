@@ -214,12 +214,16 @@ class LocalJsonRepository:
 
     def save_patient_diary(self, patient_id: str,
                            entries: list[dict[str, Any]]) -> None:
+        # P3（2026-08-23 复审）：防御性规约——强制补全每条 entry 的 patient_id，
+        # 防止上层漏传/传 None 导致该条在 load_patient_diary 时被 `!= patient_id`
+        # 过滤成不可见的「幽灵数据」（LocalJson）或被跨患者保存静默丢弃（Tablestore）。
+        norm_entries = [{**e, "patient_id": patient_id} for e in entries]
         # N4：RMW 全程持锁——防并发 append 后写者覆盖先写条目（TOCTOU）
         with self._LOCAL_JSON_LOCK:
             store = self.load_diary()
             others = [e for e in store.get("entries", [])
                       if e.get("patient_id") != patient_id]
-            store["entries"] = others + list(entries)
+            store["entries"] = others + norm_entries
             self.save_diary(store)
 
     # ---- PEW 历史 ----
@@ -276,10 +280,22 @@ class LocalJsonRepository:
 
     def save_patient_child_foodlog(self, patient_id: str,
                                    row: dict[str, Any]) -> None:
+        # P3（2026-08-23 复审）：白名单清洗——整行写入前只提取标量键并过滤 None /
+        # 未序列化容器，防止后续切到 Tablestore 后端时 PutRow 因 None 值或非标类型
+        # （如 list/dict 扩展字段）抛 OTSClientError / TypeError 崩溃。LocalJson 下
+        # 此清洗亦消除幽灵 None 列、保证 round-trip 稳定（entries 在 LocalJson 直接存
+        # list，不需 _json_col 序列化；Tablestore 后端同名方法走 _json_col）。
+        attrs: dict[str, Any] = {
+            "entries": list(row.get("entries", [])),
+            "total_points": int(row.get("total_points", 0) or 0),
+            "daily_points": int(row.get("daily_points", 0) or 0),
+            "last_points_date": str(row.get("last_points_date", "") or ""),
+            "updated_at": _now_iso(),
+        }
         # N4：RMW 全程持锁（同 save_patient_diary，防 TOCTOU 覆盖）
         with self._LOCAL_JSON_LOCK:
             store = self._load_child_foodlog_file()
-            store[patient_id] = dict(row)
+            store[patient_id] = attrs
             atomic_write_json(_state_path(CHILD_FOODLOG_STORE_FILENAME), store)
 
 
@@ -379,8 +395,11 @@ class TablestoreRepository(TablestoreBase):
     def save_patient_diary(self, patient_id: str,
                            entries: list[dict[str, Any]]) -> None:
         """行级写**单个患者**日记（N-MEM-2：只写该患者行，行级 _rev 乐观锁）。"""
+        # P3（2026-08-23 复审）：防御性规约——强制补全 patient_id（同 LocalJson 后端），
+        # 防止上层漏传条目变幽灵数据。
+        norm_entries = [{**e, "patient_id": patient_id} for e in entries]
         self._save_row_locked(TABLE_FOOD_DIARY, self._pk_patient(patient_id),
-                              {"entries": self._json_col(list(entries)),
+                              {"entries": self._json_col(norm_entries),
                                "updated_at": _now_iso()})
 
     # ---- PEW 历史（{patient_id: [points]} ↔ 按患者分片）----
@@ -496,9 +515,16 @@ class TablestoreRepository(TablestoreBase):
     def save_patient_child_foodlog(self, patient_id: str,
                                    row: dict[str, Any]) -> None:
         """行级写**单个患者**孩子自报饮食（行级 _rev 乐观锁，只写该患者行）。"""
-        attrs = dict(row)
-        attrs["entries"] = self._json_col(list(row.get("entries", [])))
-        attrs["updated_at"] = _now_iso()
+        # P3（2026-08-23 复审）：白名单清洗——Tablestore 属性列仅支持标量类型，
+        # None 值或非序列化容器（如 list/dict 扩展字段）直接 PutRow 会抛
+        # OTSClientError / TypeError。只提取已知标量键 + 序列化 entries。
+        attrs: dict[str, Any] = {
+            "entries": self._json_col(list(row.get("entries", []))),
+            "total_points": int(row.get("total_points", 0) or 0),
+            "daily_points": int(row.get("daily_points", 0) or 0),
+            "last_points_date": str(row.get("last_points_date", "") or ""),
+            "updated_at": _now_iso(),
+        }
         self._save_row_locked(TABLE_CHILD_FOODLOG, self._pk_patient(patient_id), attrs)
 
 

@@ -201,6 +201,12 @@ def _overall_achievement(days_out: list[dict], t_energy: float, t_protein: float
         "potassium_pct": cap_pct(avg["potassium_mg"], t_k),
         "phosphorus_pct": cap_pct(avg["phosphorus_mg"], t_p),
         "sodium_pct": cap_pct(avg["sodium_mg"], t_na),
+        # P3（2026-08-23 复审）：多日整体达成率补齐超限布尔——单日 _achievement
+        # 已输出 *_exceeded，但整体平均（cap_pct 封顶 100）若无此标志，患儿 7 天
+        # 平均钾超 160% 仍显示 potassium_pct=100，医生误判"全周完美合规"。
+        "potassium_exceeded": avg["potassium_mg"] > t_k if t_k > 0 else False,
+        "phosphorus_exceeded": avg["phosphorus_mg"] > t_p if t_p > 0 else False,
+        "sodium_exceeded": avg["sodium_mg"] > t_na if t_na > 0 else False,
     }
 
 
@@ -344,7 +350,12 @@ def generate_meal_plan(
             p_ratio = (sg * cand["phosphorus_per_100g"] / 100 / target_p_mg
                        if target_p_mg > 0 else 0.0)
             est_kp = k_ratio + p_ratio
-            if est_kp <= 0.45 or offset == len(staple_pool) - 1:
+            # P3（2026-08-23 复审）：兜底跳出必须用「当前活跃池」长度——高比场景
+            # _active_staple_pool 是低蛋白池（可能仅 2 种），而 staple_pool 是全量
+            # （8 种）。若错用 len(staple_pool)-1，低蛋白池全部 est_kp>0.45 时循环
+            # 在 offset=1 正常结束、staple 仍为 None，随后 staple["energy_per_100g"]
+            # 触发 TypeError → MCP 500 崩溃。
+            if est_kp <= 0.45 or offset == len(_active_staple_pool) - 1:
                 staple = cand
                 break
         prot = None

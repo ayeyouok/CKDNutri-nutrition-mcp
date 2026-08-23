@@ -203,8 +203,10 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         contributions.append({"food": row["name"], "date": date,
                               "meal": entry.get("meal"), "grams": scaled["grams"],
                               "basis": basis,
-                              **{key: scaled[key] for key in
-                                 ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg")}})
+                              # P3（2026-08-23 复审）：明细展开全部 SUM_KEYS（含钠/脂肪/
+                              # 碳水/钙）——此前仅 4 项，下游审查单餐高钠来源时无法从
+                              # 明细获取钠克重，饮食追溯数据不完整。统一为全键展开。
+                              **{key: scaled[key] for key in SUM_KEYS}})
         # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
         # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
         # BUG-P0-03（2026-08-23）：该判定块必须位于 for 循环**内部**（缩进 8 格）逐条
@@ -247,6 +249,10 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         "per_day": day_rows,
         "total": {key: round(total[key], 1) for key in SUM_KEYS},
         "daily_average": average,
+        # P3（2026-08-23 复审）：暴露完整单餐明细 contributions（含全 SUM_KEYS：
+        # 能量/蛋白/脂肪/碳水/钾/磷/钠/钙）——下游审查单餐高钠/高钙来源时可直接消费，
+        # 此前仅经 _top 暴露部分字段，单餐级追溯数据不完整。
+        "contributions": contributions,
         "top_potassium_sources": _top(contributions, "potassium_mg"),
         "top_phosphorus_sources": _top(contributions, "phosphorus_mg"),
         "top_protein_sources": _top(contributions, "protein_g"),

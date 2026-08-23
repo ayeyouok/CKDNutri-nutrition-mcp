@@ -93,8 +93,13 @@ def _cn_numeral(s: str) -> float | None:
             return float(base)
         if s[1] == "十":
             # 二十 / 二十三 / 九十
+            # P3（2026-08-23 复审）：排除 "两" 作数词——"二十两"是"20 两"（重量单位
+            # =1000g），不是 22；此前 s[2]=="两" 被 digits 判定为数字 2，致 二十两→22
+            # 、三十两→32，系统性多算 100g（22×50=1100 vs 正确 20×50=1000）。
+            # "两"作数词仅用于首字（"两碗"已在 len==1 分支）或复合（"二两"在下方
+            # len(s)==2 且 s[1]=="两" 已被第 100 行排除逻辑覆盖）。
             base = digits[s[0]] * 10
-            if len(s) >= 3 and s[2] in digits:
+            if len(s) >= 3 and s[2] in digits and s[2] != "两":
                 return float(base + digits[s[2]])
             return float(base)
         if s[1] in digits and s[1] != "两":
@@ -181,6 +186,20 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
         elif text.startswith(token) and text != token:
             text = text[len(token):]
     text = text or "1份"
+
+    # P3（2026-08-23 复审）：纯数字无单位（如 "150"）直接作为克重——此前落入
+    # unit is None 分支按 "份"×unit_grams（150×150=22500g），单次进食能量飙至数万
+    # 千卡。纯阿拉伯数字串无量词语义，明确按克重直出（与 "150g" 行为一致）。
+    # 注意 diary 入口已把字符串数字转 float 走克重分支，此处兜底 measures 被直接
+    # 调用（mealplan/量具工具）时的边界；中文数词（"一千五百"）不在此列——它们
+    # 无阿拉伯数字，交给下方 _parse_quantity 按量词/单位解析。
+    if text.replace(".", "", 1).isdigit():
+        val = float(text)
+        if val < 0:
+            return {"grams": 0.0, "resolved": False,
+                    "basis": f"纯数字份量 {val:.0f} 为负，已按 0 处理（录入错误）"}
+        return {"grams": val, "resolved": True,
+                "basis": f"按输入数值直接作为克重 {val:.0f} g 计"}
 
     # P2-4（2026-08-18）：尾部括号解析——
     # ① "1碗(200g)"：括号内克重为**权威值**（此前被无视，按碗 150g 计，摄入低估 25%）；

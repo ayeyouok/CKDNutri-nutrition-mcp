@@ -1,6 +1,7 @@
 """食物查询、替换建议、量具换算与磷蛋白比。"""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from a207_policy import enforce_read, get_caller
@@ -396,9 +397,21 @@ def calc_pnpr(food: str | None = None, protein_g: float | None = None,
                     "detail": "未提供 food 时，protein_g 与 phosphorus_mg 均必填"}
         protein, phosphorus = float(protein_g), float(phosphorus_mg)
         origin, name = "调用方直接提供的数值", "自定义食物"
+    # P3（2026-08-23 复审）：自定义模式有限数值 + 非负性防御——NaN 经 `protein <= 0`
+    # 判断时为 False（绕过拦截）致 ratio=nan、classify 全 False 落默认"caution"并
+    # 返回含 NaN 的非标准 JSON；负数磷（phosphorus_mg=-50）ratio<0 被误判为最优质
+    # "preferred"。显式拒绝（fail-closed）。
+    if not (math.isfinite(protein) and math.isfinite(phosphorus)):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "protein_g / phosphorus_mg 必须为有限数值（收到 "
+                          f"protein={protein!r}, phosphorus={phosphorus!r}）"}
     if protein <= 0:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "蛋白质为 0 时磷蛋白比无临床意义，请改查磷绝对量"}
+    if phosphorus < 0:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "磷含量不能为负（收到 "
+                          f"phosphorus_mg={phosphorus!r}）——负磷通常是录入错误"}
     ratio = phosphorus / protein
     code, label = pnpr_grade(ratio)
     return {"ok": True, "data": {
