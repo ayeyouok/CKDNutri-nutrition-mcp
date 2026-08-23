@@ -97,6 +97,9 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     # 否则与写入路径（_normalize_date fail-closed 拒绝）行为割裂，用户算出一版
     # "能算但存不进"的结果，跨天统计被静默拆散。
     bad_dates: list[str] = []
+    # P2（2026-08-23）：未来日期与「无法归一化」分开计数告警——未来日期实际被跳过
+    # （未参与汇总），与非法格式日期（已按原样分桶）语义不同，不可混在同一告警里。
+    future_dates: list[str] = []
     # MED-1（2026-08-15）：缺失营养素食物汇总提示（按 0 计会低估全天摄入）
     missing_foods: list[str] = []
 
@@ -165,7 +168,7 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         if date != "未标注日期":
             try:
                 if _date.fromisoformat(date) > datetime.now(timezone.utc).date():
-                    bad_dates.append(str(raw_date))
+                    future_dates.append(str(raw_date))
                     continue
             except ValueError:
                 pass  # 非 ISO 日期已在上面分桶（宽容归一化路径），不重复拦截
@@ -244,6 +247,12 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         data["warnings"] = (data.get("warnings") or []) + [
             f"{len(bad_dates)} 条记录日期无法归一化为 YYYY-MM-DD（如 {bad_dates[0]!r}），"
             "已按原样分桶，跨天统计可能被拆散；请使用 YYYY-MM-DD 格式。"]
+    # P2（2026-08-23）：未来日期独立告警——此类条目已被跳过（未参与汇总），与上面
+    # 「无法归一化但已分桶」的语义相反，误报"已按原样分桶"会误导排查。
+    if future_dates:
+        data["warnings"] = (data.get("warnings") or []) + [
+            f"{len(future_dates)} 条记录日期为未来日期（如 {future_dates[0]!r}），"
+            "已跳过、未参与本次汇总；日记日期请使用不超过今天的日期。"]
     # MED-1（2026-08-15）：缺失营养素食物汇总提示——缺项按 0 计会低估全天钾/磷，
     # CKD 患儿限钾限磷场景下该低估直接影响临床判断，必须显式警示。
     if missing_foods:

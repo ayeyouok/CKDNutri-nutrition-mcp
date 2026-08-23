@@ -68,7 +68,12 @@ def _cn_numeral(s: str) -> float | None:
                     return float(base + 10 + digits[rest[1]])
                 return float(base + 10)
             if rest[0] in digits:
-                return float(base + digits[rest[0]])
+                # P2（2026-08-23）：余部为 "五十"/"二十三" 等复合数词——递归解析其数字
+                # 前缀（自动忽略尾随单位"克"）。此前只取 rest[0] 单字，导致
+                # "一百五十"→105、"一百二十三"→105 等系统性低估 ~30%。
+                rest_val = _cn_numeral(rest)
+                if rest_val is not None:
+                    return float(base + rest_val)
             return float(base)
         if s[1] == "十":
             # 二十 / 二十三 / 九十
@@ -76,8 +81,10 @@ def _cn_numeral(s: str) -> float | None:
             if len(s) >= 3 and s[2] in digits:
                 return float(base + digits[s[2]])
             return float(base)
-        if s[1] in digits:
-            # 十一~九十九 的无"十"简写（如"三五"），按十位+个位
+        if s[1] in digits and s[1] != "两":
+            # 十一~九十九 的无"十"简写（如"三五"），按十位+个位。
+            # P2（2026-08-23）：排除 "两"——"二两"是"2 两"（重量单位=100g），不是 22；
+            # "两"作数词仅用于"两碗"等（首字情形已在上面 len==1 / 非复合分支处理）。
             return float(digits[s[0]] * 10 + digits[s[1]])
         return float(digits[s[0]])
     return None

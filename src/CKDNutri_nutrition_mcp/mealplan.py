@@ -242,6 +242,11 @@ def generate_meal_plan(
             raise ValueError(f"{_name} 不能为负（收到 {_val}），0 表示不设限")
     if days <= 0:
         raise ValueError("days 必须 > 0")
+    # P2（2026-08-23）：days 类型校验——bool 是 int 子类须排除；float（如 3.5）会令
+    # 后续 range(days) 抛 TypeError（500 崩溃），True 会被 min() 静默转为 1 天。
+    # 与 vegetarian 入口校验同口径（core 为纯函数库可被编排层直调绕过 FastMCP pydantic）。
+    if not isinstance(days, int) or isinstance(days, bool):
+        raise ValueError(f"days 必须为正整数，收到 {days!r}（浮点/布尔会被静默误用）")
     # 边界（2026-08-15）：exclude_foods 传 str 会被 set(str) 拆成单字符静默失效——
     # 显式校验列表类型；str 转 [str] 宽容（编排层常见传法）。
     if exclude_foods is not None:
@@ -431,7 +436,10 @@ def generate_meal_plan(
             _item(veg, veg_g), _item(fr, fruit_g), _item(fat, fat_g),
         ]
         meals = _split_meals(items)
-        day_tot = _sum_items(items)
+        # P2（2026-08-23）：day_tot 由分餐明细聚合得出，保证「早餐+午餐+晚餐+加餐」
+        # 相加与日总计严格自洽。此前 day_tot 用全天整份 item 单独 round 求和，与已
+        # 按餐次 round 的 meal.totals 存在 ±0.1/项 漂移，医生核对时两者对不上。
+        day_tot = _sum_items([m["totals"] for m in meals])
         ach = _achievement(day_tot, target_energy_kcal, target_protein_g, target_k_mg, target_p_mg, target_na_mg)
         # M2 修复（2026-08-14）：限钾/磷/钠目标**超限进入 plan_warnings**——此前超限
         # 只标 *_exceeded 布尔（achievement 内），限钾磷患儿的食谱"静默超限"，医生
