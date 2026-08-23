@@ -234,12 +234,16 @@ def find_food(query: str) -> dict[str, Any] | None:
     for r in hits:
         if _match_score(r, text) == 0.0:
             return r
-    # 2) 组内代表值优先
-    for r in hits:
+    # 2) 以 Top1 候选基名建立同源食材组，代表值优先仅在**组内**生效
+    #    （BUG-02，2026-08-23：原实现在全局 hits 上扫描「代表值」，可能跨食材劫持——
+    #     返回非同源类的「X（代表值）」；与 N-S2 文档「组内代表值」契约一致，且对正常
+    #     查询行为完全等价，仅消除跨组劫持的潜在路径）。
+    target_base = base_name(hits[0]["name"])
+    group = [r for r in hits if base_name(r["name"]) == target_base]
+    for r in group:
         if "代表值" in r["name"]:
             return r
-    # 3) 基名分组：生物变异 vs 真数据冲突
-    group = [r for r in hits if base_name(r["name"]) == base_name(hits[0]["name"])]
+    # 3) 基名分组：生物变异 vs 真数据冲突（沿用上述 group）
     if len(group) > 1:
         # 3.5) B 方案（2026-08-14）：加工状态差异 ≠ 数据冲突——同基名但**名称不同**
         # （如"榛蘑（干）"vs"榛蘑（水发）"K 4629 vs 732）是干/水发/熟/生的正常

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date as _date
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from a207_policy import enforce_read, get_caller
@@ -35,9 +35,29 @@ LIMIT_KEYS = ("potassium_mg", "phosphorus_mg", "sodium_mg")
 FIELD_LABEL = {"energy_kcal": "能量", "protein_g": "蛋白质", "potassium_mg": "钾",
                "phosphorus_mg": "磷", "sodium_mg": "钠"}
 
+# 业务标准时区（中国标准时间 UTC+8）——未来日期判定、日期分桶均以北京业务日为准，
+# 避免 UTC 日期滞后导致中国早晨（UTC+8 00:00~08:00）记录的当天日记被误判为「未来」跳过
+# （BUG-01，2026-08-23）。
+_BIZ_TZ = timezone(timedelta(hours=8))
+
 
 def _blank_totals() -> dict[str, float]:
     return {key: 0.0 for key in SUM_KEYS}
+
+
+def _is_iso_day(d: str) -> bool:
+    """判断分桶键是否为可归一化 ISO 日期（用于日均值分母统计）。
+
+    "未标注日期" 与非法格式串（如「不是日期」）返回 False——它们仍计入 total（不丢
+    摄入数据）与 per_day 展示，但不得另算作一天（BUG-03 防稀释）。
+    """
+    if d == "未标注日期":
+        return False
+    try:
+        _date.fromisoformat(d)
+        return True
+    except ValueError:
+        return False
 
 
 def _normalize_target(target: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +187,7 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         # 被拉向未来、今日摄入缺失且无告警）；与写路径同口径（UTC 业务日）跳过并告警。
         if date != "未标注日期":
             try:
-                if _date.fromisoformat(date) > datetime.now(timezone.utc).date():
+                if _date.fromisoformat(date) > datetime.now(_BIZ_TZ).date():
                     future_dates.append(str(raw_date))
                     continue
             except ValueError:
@@ -205,7 +225,12 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         for key in SUM_KEYS:
             total[key] += bucket["totals"][key]
 
-    day_count = len(days)
+    # BUG-03（2026-08-23）：日均值分母防稀释——仅「可归一化 ISO 日期」计入天数，
+    # "未标注日期" 与非法格式日期虽仍分桶计入 total（不丢摄入数据）、并在 per_day 展示，
+    # 但不得另算一天；否则缺失/错填日期会把全天摄入均值除以多天，造成达标患儿被误判为
+    # 重度摄入不足、触发不必要的管饲建议。分母为 0 时退化为单日（所有摄入视为同一天）。
+    valid_day_keys = [d for d in days if _is_iso_day(d)]
+    day_count = len(valid_day_keys) if valid_day_keys else 1
     average = {key: round(total[key] / day_count, 1) for key in SUM_KEYS}
 
     data: dict[str, Any] = {

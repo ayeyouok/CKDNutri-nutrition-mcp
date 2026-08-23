@@ -59,6 +59,14 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
                 and (math.isnan(_val) or math.isinf(_val)):
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"{_name} 必须为有效的有限数值，收到 {_val!r}"}
+    # BUG-04（2026-08-23）：weight_kg 此前未纳入强类型校验，传入 str("20")/bool 会在
+    # 下方 `if weight_kg and weight_kg > 0` 抛未捕获 TypeError（500 崩溃），NaN 亦应
+    # 显式拒绝。现与 Fail-Closed 契约对齐：非数值/布尔/非有限/非正数一律 INVALID_INPUT。
+    if weight_kg is not None:
+        if isinstance(weight_kg, bool) or not isinstance(weight_kg, (int, float)) \
+                or math.isnan(weight_kg) or math.isinf(weight_kg) or weight_kg <= 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"weight_kg 必须为正数，收到 {weight_kg!r}"}
     if dialysate_glucose_g is None or dialysate_glucose_g < 0:
         return {"ok": False, "error": "INVALID_INPUT", "detail": "dialysate_glucose_g 不能为负"}
     if dwell_hours is None or dwell_hours <= 0:
