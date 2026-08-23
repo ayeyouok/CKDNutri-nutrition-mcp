@@ -211,6 +211,14 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
     if rest in ("克", "g", "G"):
         return {"grams": quantity, "resolved": True,
                 "basis": f"按中文数量「{text}」计 {quantity:.0f} g"}
+    # BUG10 修复（2026-08-23）：中文数词 + 重量单位"千克/公斤"（如"一千克""两公斤"）
+    # 此前因"千/公斤"不在 GENERIC_UNIT_GRAMS 且 _GRAM_RE 要求阿拉伯数字开头，
+    # 中文数词前缀解析后 rest="千克" 无法识别 → 回落 1 份（100g），1000g 被低估 10 倍。
+    # 此处将"千克/公斤"识别为 ×1000 重量后缀（与 _GRAM_RE 对阿拉伯数字"1千克"的处理一致）。
+    if rest in ("千克", "公斤"):
+        grams = quantity * 1000.0
+        return {"grams": grams, "resolved": True,
+                "basis": f"按中文数量「{text}」计 {grams:.0f} g（{quantity:.0f} {rest}）"}
     unit = _find_unit(rest) or _find_unit(text)
     if unit is None:
         if "份" in text or not rest:
@@ -256,6 +264,10 @@ def to_household(row: dict[str, Any], grams: float) -> dict[str, Any]:
         raise ValueError(f"grams 必须为数值（收到 {grams!r}）")
     if not math.isfinite(grams):
         raise ValueError(f"grams 必须为有限数值（收到 {grams!r}），NaN/Inf 拒绝")
+    # BUG11 修复（2026-08-23）：负数克重此前漏校验，输出"约 -0.5份"异常文本。
+    # 与 scale_nutrients 同口径（grams < 0 显式拒绝）。
+    if grams < 0:
+        raise ValueError(f"grams 不能为负（收到 {grams!r}）——负克重通常是录入错误")
     unit_grams = row.get("unit_grams") or 100.0
     unit_name = row.get("unit_name") or "份"
     count = grams / unit_grams if unit_grams else 0.0

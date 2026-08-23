@@ -191,7 +191,11 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                     future_dates.append(str(raw_date))
                     continue
             except ValueError:
-                pass  # 非 ISO 日期已在上面分桶（宽容归一化路径），不重复拦截
+                # BUG12 修复（2026-08-23）：_normalize_date 失败的非 ISO 串（如
+                # "2099/13/45"）走到此处，原 pass 静默放过 → 该非法串仍被 setdefault
+                # 分桶污染有效时间序列。现将其归入 bad_dates 并跳过（不污染 per_day）。
+                bad_dates.append(str(raw_date))
+                continue
         bucket = per_day.setdefault(date, {"date": date, "items": 0, "totals": _blank_totals()})
         bucket["items"] += 1
         for key in SUM_KEYS:
@@ -260,6 +264,13 @@ def sum_diet_intake(diary: list[dict[str, Any]],
         data["warnings"] = (data.get("warnings") or []) + [
             f"日记仅 {day_count} 天（不足 3 天），日均值与磷蛋白比参考性有限，"
             "建议补足 3 天以上再作临床判断。"]
+    # BUG3 增强（2026-08-23）：存在无日期/非法日期条目与有效 ISO 日期混合时，total 已
+    # 计入无日期桶摄入（不丢数据），但日均值按有效天数均摊，会高估日均（无日期摄入被
+    # 平摊进更少的有效天），在限钾限磷场景易误判电解质超标。显式提示。
+    if len(valid_day_keys) > 0 and len(valid_day_keys) < len(days):
+        data["warnings"] = (data.get("warnings") or []) + [
+            f"日记含 {len(days) - len(valid_day_keys)} 条未标注/非法日期记录，已计入总量并"
+            f"平摊至 {day_count} 个有效天，日均值可能被高估；建议补全所有记录的具体日期。"]
     # v2.4 工具收敛：磷蛋白比（PNPR）作为汇总派生字段输出（原 calc_pnpr 独立工具下沉）。
     avg_protein = average.get("protein_g", 0.0)
     avg_phosphorus = average.get("phosphorus_mg", 0.0)
@@ -295,7 +306,12 @@ def sum_diet_intake(diary: list[dict[str, Any]],
     if target:
         # 五审（2026-08-13）：先归一化 PRNT 信封（{ok,data} 嵌套）——此前直接透传
         # 导致目标对照静默为空（achievement.items=[]）。兼容扁平简表不受影响。
-        data["achievement"] = _achievement(average, _normalize_target(target))
+        # BUG6 修复（2026-08-23）：_pick_target 检测到 target 含 avg_* 误用键会
+        # raise ValueError，原未捕获 → 升级为 500 崩溃。受控为 INVALID_TARGET。
+        try:
+            data["achievement"] = _achievement(average, _normalize_target(target))
+        except ValueError as exc:
+            return {"ok": False, "error": "INVALID_TARGET", "detail": str(exc)}
         data["guideline"] = GUIDELINE
     return {"ok": True, "data": data}
 
@@ -340,4 +356,8 @@ def _achievement(average: dict[str, float], target: dict[str, Any]) -> dict[str,
         if field == "phosphorus_mg" and percent > 100:
             result["actions"].append("磷摄入超限：削减加工食品与含磷添加剂饮料，"
                                      "并核对磷结合剂是否随餐服用。")
+        if field == "sodium_mg" and percent > 100:
+            result["actions"].append(
+                "钠摄入超限：严格控制食盐、酱油等调味品用量，避免咸菜、加工肉制品及"
+                "高钠膨化食品，注意水肿与血压监测。")
     return result

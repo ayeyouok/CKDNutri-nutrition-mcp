@@ -232,6 +232,16 @@ def generate_meal_plan(
         if isinstance(_val, (int, float)) and not isinstance(_val, bool) \
                 and (_math.isnan(_val) or _math.isinf(_val)):
             raise ValueError(f"{_name} 必须为有效的有限数值，收到 {_val!r}")
+    # BUG5 修复（2026-08-23）：强类型白名单——上面 NaN 检查仅对 (int,float) 且非 bool
+    # 生效，若调用方传入字符串数字（如 "1500"）或 bool，isinstance 判定为 False 绕过
+    # 检查，随后 `target <= 0` 触发 TypeError（'str' < 'int'）致 500 崩溃而非受控 ValueError。
+    # 显式拒绝非 (int,float) 或 bool 注入，统一返回受控错误。
+    for _name, _val in (("target_energy_kcal", target_energy_kcal),
+                        ("target_protein_g", target_protein_g),
+                        ("target_k_mg", target_k_mg), ("target_p_mg", target_p_mg),
+                        ("target_na_mg", target_na_mg)):
+        if isinstance(_val, bool) or not isinstance(_val, (int, float)):
+            raise ValueError(f"{_name} 必须为数值（收到 {_val!r}），字符串/布尔注入拒绝")
     if target_energy_kcal <= 0 or target_protein_g <= 0:
         raise ValueError("target_energy_kcal 与 target_protein_g 必须 > 0")
     # 边界（2026-08-15）：K/P/Na 目标允许 0（=不设限/忽略），但**负值拒绝**——负目标
@@ -375,8 +385,31 @@ def generate_meal_plan(
         e_fruit = fruit_g * fr["energy_per_100g"] / 100
         # 2) 主食：按「目标蛋白 40% 配额」折算——主食蛋白计入预算，避免剩余能量全吸
         #    收进主食导致克数/蛋白失控（N-S6）
-        staple_g = max(10, round(prot_staple_quota / staple["protein_per_100g"] * 100)) \
-            if staple["protein_per_100g"] > 0 else 0
+        # BUG2 增强（2026-08-23）：限蛋白高压场景（能量/蛋白比 > 60，典型 CKD 3~5 期
+        # 非透析严格限蛋白）下，普通主食（米/面 7~12g 蛋白/100g）按 40% 蛋白配额折算
+        # 仅数十克，能量贡献微乎其微，而蛋白源/蔬果能量有限、油脂封顶 25g，导致全天
+        # 能量缺口可达 1000+ kcal（仅达标 30%）。此时优先采用低蛋白淀粉类
+        # （protein<1.5g/100g：麦淀粉、米粉、粉丝、藕粉等，食物库已含 24 种），
+        # 在不增加蛋白负荷的前提下按能量需求补足基础能量（仍受 _STAPLE_MAX_G 钳制）。
+        if (staple["protein_per_100g"] < 1.5
+                and target_energy_kcal / max(target_protein_g, 1.0) > 60):
+            # 能量缺口优先由低蛋白淀粉填补：先估剩余能量，淀粉按上限克数折算能量
+            # prot_veg_fruit 在下方定义，此处内联估算（蔬果蛋白贡献，约 2g）
+            _prot_veg_fruit_est = (veg_g * veg["protein_per_100g"]
+                                   + fruit_g * fr["protein_per_100g"]) / 100
+            _e_rem_before_staple = (target_energy_kcal - e_veg - e_fruit
+                                    - max(0.0, target_protein_g - _prot_veg_fruit_est)
+                                    * (prot["energy_per_100g"] / max(prot["protein_per_100g"], 0.1))
+                                    - _FAT_MAX_G * (fat["energy_per_100g"] / 100))
+            staple_g = max(10, round(_e_rem_before_staple
+                                     / max(staple["energy_per_100g"], 1) * 100))
+            plan_warnings.append(
+                f"第 {d + 1} 天：限蛋白高压（能量/蛋白比>{60:.0f}），主食「{staple['name']}」"
+                f"（蛋白 {staple['protein_per_100g']:.1f}g/100g）按能量需求补足至 {staple_g}g，"
+                "在不增加蛋白负荷下补充基础能量；蛋白缺口由蛋白源/营养补充剂补足")
+        else:
+            staple_g = max(10, round(prot_staple_quota / staple["protein_per_100g"] * 100)) \
+                if staple["protein_per_100g"] > 0 else 0
         # P0-2（2026-08-18）：低蛋白主食按 40% 蛋白配额折算会爆量（米粉(熟) 0.9g/100g →
         # 1556g/天、能量超 130%）。钳制到上限，蛋白缺口由蛋白源/补充剂补足，避免"主食炸弹"。
         if staple_g > _STAPLE_MAX_G:

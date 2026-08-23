@@ -148,57 +148,63 @@ def lookup_food_nutrients(food: str, portion: str | None = None,
     cluster = find_food_cluster(food)
     if cluster is not None and len(cluster) >= 3 and base_name(food) == food:
         return _cluster_view(food, cluster)
-    resolved = parse_portion(portion, row)
-    scaled = scale_nutrients(row, resolved["grams"], cooking)
-    warnings = food_warnings(row, scaled)
-    if not resolved["resolved"]:
-        warnings.append(resolved["basis"])
-    # BUG-63（2026-08-12）：可食部克重契约提示——系统按"可食部克重"计算营养素，
-    # 带皮/骨/壳食物（edible_pct<100）若调用方按"买来重量"录入会高估实际摄入
-    # （如排骨可食部 60%，150g 带骨按可食部算会高估 1.67 倍）。
-    if row.get("edible_pct", 100) < 100:
-        warnings.append(
-            f"「{row['name']}」可食部约 {row['edible_pct']:.0f}%，系统按可食部克重计算；"
-            "若输入克重含皮/骨/壳，请先换算为去骨去皮后的可食部重量。")
+    # BUG7 修复（2026-08-23）：底层 parse_portion / scale_nutrients / to_household
+    # 会抛 ValueError（非法量具串、负克重、NaN）。作为 MCP 入口未捕获会 500 穿透，
+    # 统一受控为 INVALID_INPUT。
+    try:
+        resolved = parse_portion(portion, row)
+        scaled = scale_nutrients(row, resolved["grams"], cooking)
+        warnings = food_warnings(row, scaled)
+        if not resolved["resolved"]:
+            warnings.append(resolved["basis"])
+        # BUG-63（2026-08-12）：可食部克重契约提示——系统按"可食部克重"计算营养素，
+        # 带皮/骨/壳食物（edible_pct<100）若调用方按"买来重量"录入会高估实际摄入
+        # （如排骨可食部 60%，150g 带骨按可食部算会高估 1.67 倍）。
+        if row.get("edible_pct", 100) < 100:
+            warnings.append(
+                f"「{row['name']}」可食部约 {row['edible_pct']:.0f}%，系统按可食部克重计算；"
+                "若输入克重含皮/骨/壳，请先换算为去骨去皮后的可食部重量。")
 
-    data = {
-        "query": food,
-        "food": food_card(row),
-        "portion": {"input": portion, "grams": scaled["grams"], "basis": resolved["basis"]},
-        "cooking": {"method": scaled["cooking"], "label": scaled["cooking_label"]},
-        "intake": {key: scaled[key] for key in
-                   ("energy_kcal", "protein_g", "fat_g", "carb_g",
-                    "potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")},
-        "household_translation": nutrient_anchors(scaled["protein_g"], scaled["energy_kcal"]),
-        "warnings": warnings,
-        "source": FOOD_TABLE_REF,
-    }
-    # v2.4 工具收敛：量具表达（克重↔家用单位）从独立工具下沉为查询投影字段。
-    if include_household:
-        measure = to_household(row, scaled["grams"])
-        data["measure"] = {
-            "grams": measure["grams"],
-            "primary": measure["primary"],
-            "alternatives": measure["alternatives"],
+        data = {
+            "query": food,
+            "food": food_card(row),
+            "portion": {"input": portion, "grams": scaled["grams"], "basis": resolved["basis"]},
+            "cooking": {"method": scaled["cooking"], "label": scaled["cooking_label"]},
+            "intake": {key: scaled[key] for key in
+                       ("energy_kcal", "protein_g", "fat_g", "carb_g",
+                        "potassium_mg", "phosphorus_mg", "sodium_mg", "calcium_mg")},
+            "household_translation": nutrient_anchors(scaled["protein_g"], scaled["energy_kcal"]),
+            "warnings": warnings,
+            "source": FOOD_TABLE_REF,
         }
-    # v2.4 工具收敛：磷蛋白比（PNPR）从独立工具下沉为派生字段。
-    protein = scaled["protein_g"]
-    phosphorus = scaled["phosphorus_mg"]
-    if protein and protein > 0:
-        ratio = phosphorus / protein
-        code, label = pnpr_grade(ratio)
-        data["pnpr"] = {
-            "pnpr_mg_per_g": round(ratio, 1), "grade": code, "grade_label": label,
-            "interpretation": f"每摄入 1 g 蛋白质同时带入 {ratio:.1f} mg 磷。"
-                              f"限磷患儿应优先选择磷蛋白比低的蛋白来源（如蛋清）。",
-        }
-    if row["potassium_level"] in ("high", "very_high"):
-        data["dekalium_tip"] = _dekalium_tip(row)
-    alternatives = [item["name"] for item in search_food(food, limit=4)
-                    if item["name"] != row["name"]]
-    if alternatives:
-        data["other_matches"] = alternatives
-    return {"ok": True, "data": data}
+        # v2.4 工具收敛：量具表达（克重↔家用单位）从独立工具下沉为查询投影字段。
+        if include_household:
+            measure = to_household(row, scaled["grams"])
+            data["measure"] = {
+                "grams": measure["grams"],
+                "primary": measure["primary"],
+                "alternatives": measure["alternatives"],
+            }
+        # v2.4 工具收敛：磷蛋白比（PNPR）从独立工具下沉为派生字段。
+        protein = scaled["protein_g"]
+        phosphorus = scaled["phosphorus_mg"]
+        if protein and protein > 0:
+            ratio = phosphorus / protein
+            code, label = pnpr_grade(ratio)
+            data["pnpr"] = {
+                "pnpr_mg_per_g": round(ratio, 1), "grade": code, "grade_label": label,
+                "interpretation": f"每摄入 1 g 蛋白质同时带入 {ratio:.1f} mg 磷。"
+                                  f"限磷患儿应优先选择磷蛋白比低的蛋白来源（如蛋清）。",
+            }
+        if row["potassium_level"] in ("high", "very_high"):
+            data["dekalium_tip"] = _dekalium_tip(row)
+        alternatives = [item["name"] for item in search_food(food, limit=4)
+                        if item["name"] != row["name"]]
+        if alternatives:
+            data["other_matches"] = alternatives
+        return {"ok": True, "data": data}
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
 def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) -> dict[str, Any]:
@@ -225,6 +231,19 @@ def substitute_food(food: str, constraint: str = "等能量", top_n: int = 4) ->
     field, label, mode = mapped
     role, pool = _candidate_pool(row)
     if mode == "iso_energy":
+        # BUG1 修复（2026-08-23）：基准食物密度关键营养素缺失校验——若 row 自身钾/磷/钠
+        # 在 missing_nutrients 中（值存 0.0），密度基准 k_density_row=0.0，下游过滤
+        # `item[...]/item["energy_kcal"] <= 0.0` 会剔除所有正常候选（除非候选也缺失→
+        # 同 0.0 才通过），导致候选池清空或误推脏数据（假 0 密度）。基准缺失必须显式拒绝。
+        missing_density = set(row.get("missing_nutrients", [])) & set(_DENSITY_NUTRIENTS)
+        if missing_density:
+            _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠"}
+            _names = "、".join(_labels[k] for k in missing_density)
+            return {"ok": True, "data": {
+                "base": food_card(row), "constraint": label, "role": role, "options": [],
+                "message": f"「{row['name']}」的 {_names} 数据缺失，无法准确计算营养密度并"
+                           f"进行等能量替换，请先补充该食物营养数据。",
+                "tip": _dekalium_tip(row), "source": FOOD_TABLE_REF}}
         # BUG-64（2026-08-13）：零能量食物（矿泉水/无糖饮料等）无"等能量平替"意义——
         # 此前 base=row["energy"] or 1.0 会去找 1 kcal 级替代品，推荐一堆荒谬小份固体。
         if row["energy_kcal"] <= 0:

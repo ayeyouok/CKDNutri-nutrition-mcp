@@ -116,9 +116,14 @@ def load_foods(refresh: bool = False) -> list[dict[str, Any]]:
                 row["pnpr_mg_per_g"] = round(row["phosphorus_mg"] / row["protein_g"], 1) \
                     if row["protein_g"] > 0 else None
                 rows.append(row)
-        _CLUSTER.clear()
+        # BUG8 修复（2026-08-23）：原 _CLUSTER.clear() 后逐项填充，无锁读取方
+        # （find_food / find_food_cluster）在清空与重建间隙可能读到半空字典。
+        # 改为局部变量构建完成后原子切换全局引用（GIL 下引用赋值为原子操作）。
+        global _CLUSTER
+        new_cluster: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            _CLUSTER.setdefault(base_name(row["name"]), []).append(row)
+            new_cluster.setdefault(base_name(row["name"]), []).append(row)
+        _CLUSTER = new_cluster
         _CACHE = rows
     return rows
 
@@ -239,7 +244,10 @@ def find_food(query: str) -> dict[str, Any] | None:
     #     返回非同源类的「X（代表值）」；与 N-S2 文档「组内代表值」契约一致，且对正常
     #     查询行为完全等价，仅消除跨组劫持的潜在路径）。
     target_base = base_name(hits[0]["name"])
-    group = [r for r in hits if base_name(r["name"]) == target_base]
+    # BUG9 修复（2026-08-23）：原 group 从 limit=10 截断的 hits 过滤，若某基名变体 >10 种
+    # 且代表值行排第 11 位后，代表值优先（步骤 2）失效、可能选到缺失变体。改为优先从
+    # _CLUSTER 全量同源组取（与 N-S2 "组内代表值" 契约一致），截断列表仅作回退。
+    group = _CLUSTER.get(target_base) or [r for r in hits if base_name(r["name"]) == target_base]
     for r in group:
         if "代表值" in r["name"]:
             return r
