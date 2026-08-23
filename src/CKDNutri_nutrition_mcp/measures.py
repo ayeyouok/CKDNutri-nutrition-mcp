@@ -153,8 +153,17 @@ def parse_portion(portion: str | None, row: dict[str, Any]) -> dict[str, Any]:
                 "basis": f"未指定份量，按该食物 1 {unit_name}（{row.get('unit_desc') or ''}）计"}
     text = str(portion).strip().replace(" ", "")
     for token in (row.get("name", ""), *row.get("aliases", [])):
-        if token and text.endswith(token) and text != token:
+        if not token:
+            continue
+        # 同时剥离前缀与后缀食物名——上游大模型/意图识别常传递「食物名前置」份量
+        # （如「米饭2碗」「苹果3个」），此前只剥后缀，前缀残留导致 _parse_quantity
+        # 首字符非数字、数量截断为 1.0（2 碗米饭被算 1 碗，摄入腰斩 / 低估 50%+）。
+        # BUG-P0-01（2026-08-23）：仅 endswith 剥离时「米饭2碗」→ text 仍含「米饭」，
+        # 数量被静默回落 1 份，能量/钾磷系统性低估。
+        if text.endswith(token) and text != token:
             text = text[: -len(token)]
+        elif text.startswith(token) and text != token:
+            text = text[len(token):]
     text = text or "1份"
 
     # P2-4（2026-08-18）：尾部括号解析——

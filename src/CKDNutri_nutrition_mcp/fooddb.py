@@ -335,6 +335,7 @@ def scale_nutrients(row: dict[str, Any], grams: float,
     _is_combination = False
     if len(segments) > 1:
         all_known = True
+        temp_factors: dict[str, float] = {}
         for seg in segments:
             m = COOKING_ALIAS.get(seg)
             if m is None or m not in COOKING_LOSS:
@@ -342,9 +343,14 @@ def scale_nutrients(row: dict[str, Any], grams: float,
                 break
             f = COOKING_LOSS[m]["factor"]
             for k, v in f.items():
-                factors[k] = factors.get(k, 1.0) * v
+                temp_factors[k] = temp_factors.get(k, 1.0) * v
             _labels.append(COOKING_LOSS[m]["label"])
+        # BUG-P0-02（2026-08-23）：此前 factors 在循环中原地累积，遇到未知段 break 后
+        # factors 已被部分污染（非空），导致下面 `if not factors` 不触发、降级 raw 后
+        # 仍套用污染的 0.7 折减系数（如「焯水+红烧」红烧未知 → 焯水系数残留套用到生食）。
+        # 现用 temp_factors，仅当**全部段已知**才提交，否则保持 factors 为空 → 按 raw 回落。
         if all_known:
+            factors = temp_factors
             method = "+".join(_labels)
             _is_combination = True
     if method is None:

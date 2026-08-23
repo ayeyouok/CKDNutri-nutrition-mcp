@@ -201,14 +201,16 @@ def sum_diet_intake(diary: list[dict[str, Any]],
                               "basis": basis,
                               **{key: scaled[key] for key in
                                  ("energy_kcal", "protein_g", "potassium_mg", "phosphorus_mg")}})
-        # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
-        # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
-        if row.get("missing_nutrients"):
-            _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
-                       "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
-                       "fat_g": "脂肪", "carb_g": "碳水"}
-            missing_foods.append(
-                f"「{row['name']}」（缺 {'、'.join(_labels.get(k, k) for k in row['missing_nutrients'])}）")
+    # MED-1（2026-08-15）：缺失营养素食物显式提示——汇总把缺失项按 0 计入
+    # 会低估全天摄入（CKD 患儿钾/磷管控尤其危险），须在结果标注"按 0 计"。
+    # BUG-P1-02（2026-08-23）：原 missing_foods 在循环内逐条 append，多餐重复食用
+    # 同款缺失食物会成倍虚夸种数与展示项。改为用 set 去重（保留首次出现的完整描述）。
+    if row.get("missing_nutrients"):
+        _labels = {"potassium_mg": "钾", "phosphorus_mg": "磷", "sodium_mg": "钠",
+                   "calcium_mg": "钙", "energy_kcal": "能量", "protein_g": "蛋白质",
+                   "fat_g": "脂肪", "carb_g": "碳水"}
+        missing_foods.append(
+            f"「{row['name']}」（缺 {'、'.join(_labels.get(k, k) for k in row['missing_nutrients'])}）")
 
     if not contributions:
         return {"ok": False, "error": "NO_MATCHED_ITEM",
@@ -280,11 +282,13 @@ def sum_diet_intake(diary: list[dict[str, Any]],
             "已跳过、未参与本次汇总；日记日期请使用不超过今天的日期。"]
     # MED-1（2026-08-15）：缺失营养素食物汇总提示——缺项按 0 计会低估全天钾/磷，
     # CKD 患儿限钾限磷场景下该低估直接影响临床判断，必须显式警示。
+    # BUG-P1-02（2026-08-23）：去重后统计种数与展示——多餐重复同款缺失食物不再虚夸。
     if missing_foods:
+        unique_missing = list(dict.fromkeys(missing_foods))  # 保序去重
         data["warnings"] = (data.get("warnings") or []) + [
-            f"{len(missing_foods)} 种食物存在营养数据缺失（按 0 计，可能低估贡献）："
-            + "；".join(missing_foods[:5])
-            + ("；等" if len(missing_foods) > 5 else "")
+            f"{len(unique_missing)} 种食物存在营养数据缺失（按 0 计，可能低估贡献）："
+            + "；".join(unique_missing[:5])
+            + ("；等" if len(unique_missing) > 5 else "")
             + "。请谨慎解读汇总，或人工补充数据后重算。"]
     if target:
         # 五审（2026-08-13）：先归一化 PRNT 信封（{ok,data} 嵌套）——此前直接透传
