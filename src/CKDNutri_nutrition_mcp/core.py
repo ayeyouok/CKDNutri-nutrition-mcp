@@ -148,6 +148,11 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
     """家长每次读写日记前必须通过绑定核验，缺 token 即拒绝，不给降级视图。
 
     校验走 a207_policy.verify_guardian_token（统一实现，含过期校验，BUG-30/36）。
+    注（十一审 2026-08-24 澄清）：本函数收到的 `caller` 已由调用方经 a207_policy.get_caller()
+    双重 fail-closed 校验——空/缺失抛 CallerUnknown，非白名单值（如 "hacker"）亦抛
+    CallerUnknown（N-CALLER-1）。故 `caller not in PARENT_EQUIVALENT_ROLES` 分支只命中
+    「合法医生/风险管线角色」，不存在未识别 caller 默认放行的 fail-open 路径；无 caller
+    的非法请求早在入口 get_caller() 即被拒，不会流入此处。
     """
     if caller == CHILD_ROLE:
         # 2026-08-21：患儿身份单实例绑单患儿（env A207_CHILD_PATIENT_ID，如 P0020）。
@@ -454,6 +459,11 @@ def ideal_body_weight_kg(age_years: float, sex: str, height_cm: float) -> float 
         # 十审（2026-08-24）：NaN 防御——Python 中 `float("nan") <= 0` 恒为 False，
         # 会穿透并返回 NaN；作为模块级导出函数须自身 fail-soft（调用方未必先校验）。
         return None
+    if not math.isfinite(age_years) or age_years <= 0:
+        # 十一审（2026-08-24）：age_years=NaN 时 `max(nan, years[0])` 返回 nan，随后
+        # `[y for y in years if y <= nan]` 空列表 → `max([])` 抛 ValueError 500。
+        # 与 height_cm 防御对称，模块级导出函数自身 fail-soft。
+        return None
     years = sorted(BMI_P50)
     age = min(max(age_years, years[0]), years[-1])
     lower = max(y for y in years if y <= age)
@@ -627,6 +637,11 @@ def calc_prnt_targets(
                 e_basis += "；水肿但缺身高，未能按理想体重校正（dry weight 未生效），请补身高后复算"
 
         energy_day = e_pt * eff_weight
+        # 十一审（2026-08-24）：保留扣减前的总膳食能量目标副本——PD 患儿从腹透液吸收的
+        # 葡萄糖（pd_deduction）是非膳食来源总能量供给，Schofield 交叉校验比对的是 TDEE
+        # （全日总消耗），须用「总能量需求」（扣减前）而非「净膳食目标」（扣减后），否则
+        # PD 患儿 deviation 系统性偏负 20%~40% 被误标 divergent（见下方 schofield_cross）。
+        energy_day_before_pd = energy_day
 
         # 腹透葡萄糖供能扣减：PD 患者从腹透液吸收葡萄糖，等量减少膳食能量目标
         pd_deduction = 0.0
@@ -684,7 +699,9 @@ def calc_prnt_targets(
         if schofield_bmr:
             pal = _pal_for_age(age_years)
             pal_adjusted = round(schofield_bmr * pal, 1)
-            deviation = (energy_day - pal_adjusted) / pal_adjusted * 100.0 if pal_adjusted > 0 else 0.0
+            # 十一审（2026-08-24）：比对基准用扣减前总能量需求（PD 患儿实际获得的总能量
+            # = 净膳食 + 透析液糖，等价于 energy_day_before_pd），避免净膳食比对 TDEE 偏负。
+            deviation = (energy_day_before_pd - pal_adjusted) / pal_adjusted * 100.0 if pal_adjusted > 0 else 0.0
             schofield_cross = {
                 "bmr_kcal_per_day": schofield_bmr,
                 "pal": pal,
@@ -1032,17 +1049,24 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     # 六审修复（2026-08-23）：单位防御——儿科生化化验单常以 g/dL 为单位（如 3.8 g/dL），
     # 医生极易直接传入 3.5/4.2。此前硬编码 <38 按 g/L 判定，4.2（=42 g/L 正常）会误判
     # low_albumin=True（错扣 20 分把健康患儿误诊为低白蛋白血症/PEW 风险）。
-    # 生理学量级自动识别：(0,10] 显然是 g/dL，自动 ×10 换算为 g/L 并告警提示。
     # 单点落此处：assess_pew_risk(1072) 与 assess_intake_vs_target(902) 两路入口均汇聚，
     # 避免双处换算矛盾；eff_alb 仅用于判定，原始 albumin_g_L 仍用于 rationale 展示。
+    # 十一审（2026-08-24）收窄：仅当输入落在 g/dL 典型区间 [1.0, 6.0] 才自动 ×10 换算。
+    # 此前盲目 `eff_alb <= 10.0` 会把真实极重度低白蛋白血症（如 9.0 g/L）误判为 90 g/L，
+    # 彻底消除 20 分 PEW 预警信号（危重患儿漏诊）。>6 或 <1 的值（临床不存在的 g/dL 量级）
+    # 一律当 g/L 处理——9.0 g/L 危重值因此正确命中 <38 判低白蛋白。
     eff_alb = albumin_g_L
     unit_note = ""
-    if eff_alb is not None and eff_alb <= 10.0:
+    if eff_alb is not None and 1.0 <= eff_alb <= 6.0:
         # 八审（2026-08-24）：定点舍入防浮点抖动——`3.8 * 10.0` 某些架构得
         # 37.99999999999999，恰在 <38.0 临界会误判低白蛋白。round(,2) 消除抖动。
         eff_alb = round(eff_alb * 10.0, 2)
-        unit_note = f"（注：原输入 {albumin_g_L} ≤10，已按 g/dL 自动换算为 {eff_alb} g/L）"
+        unit_note = f"（注：原输入 {albumin_g_L} 处于 1~6 g/dL 典型区间，已自动换算为 {eff_alb} g/L）"
     low_albumin = (eff_alb is not None and eff_alb < 38.0)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
+    if eff_alb is not None and eff_alb < 15.0:
+        # 十一审（2026-08-24）：危急低白蛋白值（<15 g/L，极重度）显式提示，避免被
+        # 任何单位换算/阈值逻辑掩盖；属信息性告警，不改动 low_albumin 判定口径。
+        unit_note += f"；⚠ 血清白蛋白 {eff_alb} g/L 属极重度低下（危急值），请紧急评估"
 
     # S2：信号加权分（透明、可解释；与等级判定共用信号，不另立口径）
     score = sum((
@@ -1309,6 +1333,22 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
         # 而非全 0.0 字典——否则 DAG 的 `if dd:` 把空聚合误判为"真实摄入 0 kcal/0 g"
         # 触发虚假 PEW 高危报警。None 语义明确："无可用摄入数据"。
         return {"day_count": 0, "entry_count": 0, "diet_diary_3d": None}
+    # 十一审（2026-08-24）：跨日跨度检查——3 日日记临床要求为近期连续/准连续数据，
+    # 若最近 3 个不重复日期横跨数月（如 1/5/8 月各 1 天），均值无法反映当前摄入水平。
+    # 返回 day_span_days 供下游/UI 提示，不破坏 diet_diary_3d 形状与八审的 None 语义。
+    try:
+        _day_dates = sorted(
+            datetime.strptime(d, "%Y-%m-%d").date() for d in days if _is_iso_date(d)
+        )
+        day_span_days = (_day_dates[-1] - _day_dates[0]).days if len(_day_dates) >= 2 else 0
+    except (ValueError, TypeError):
+        day_span_days = 0
+    span_warning = None
+    if day_span_days > 14:
+        span_warning = (
+            f"日记跨度过大（最近 {len(days)} 天横跨 {day_span_days} 天，>14 天），"
+            "聚合均值可能无法反映当前摄入水平，建议补充近期连续日记后复核。"
+        )
     used = [e for d in days for e in by_day[d]]
     num_days = max(len(days), 1)
     # P3（2026-08-18）：NaN 清洗——`or 0.0` 拦不住 NaN（NaN 是 truthy），写路径
@@ -1327,7 +1367,13 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_phosphorus_mg": sum(_num(e.get("phosphorus_mg")) for e in used) / num_days,
         "avg_sodium_mg": sum(_num(e.get("sodium_mg")) for e in used) / num_days,
     }
-    return {"day_count": len(days), "entry_count": len(used), "diet_diary_3d": avg}
+    return {
+        "day_count": len(days),
+        "entry_count": len(used),
+        "diet_diary_3d": avg,
+        "day_span_days": day_span_days,
+        "span_warning": span_warning,
+    }
 
 
 def _normalize_date(value: Any, field: str = "date") -> str:
@@ -1344,6 +1390,16 @@ def _normalize_date(value: Any, field: str = "date") -> str:
         except ValueError:
             continue
     raise ValueError(f"{field} 必须为有效日期（YYYY-MM-DD），收到：{value!r}")
+
+
+def _is_iso_date(value: Any) -> bool:
+    """判断字符串是否为可解析的 ISO YYYY-MM-DD 日期（_aggregate 跨日跨度检查用）。"""
+    text = str(value or "").strip()
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
 
 
 def upsert_food_diary(
@@ -2205,6 +2261,10 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
                  if isinstance(p, dict)
                  and str(p.get("level", "")).strip().lower() in _PEW_LEVEL_ORDER]
         if len(valid) >= 2:
+            # 十一审（2026-08-24）：显式按 date 升序——`pts` 来自持久化存储（LocalJson 追加
+            # 顺序 / Tablestore 查询返回顺序均不确定），未排序时首尾对比可能因时序错乱而
+            # 反转（恶化判为好转）。排序后取首（最早）=baseline、尾（最新）=current。
+            valid.sort(key=lambda x: str(x.get("date", "")))
             first, last = valid[0], valid[-1]
             # 六审修复（2026-08-23）：构造 valid 时已用 .strip().lower() 过滤，但取权重
             # 时若仍用未归一化的原始 level 键（如 "HIGH"/" Medium"），会 KeyError 500。

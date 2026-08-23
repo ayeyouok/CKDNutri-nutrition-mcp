@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-nutrition-mcp"
-version = "0.5.66"
+version = "0.5.67"
 description = "P2 营养计算域——PRNT目标+食物DB+食谱+生长Z+PEW+日记"
 requires-python = ">=3.10"
 dependencies = [

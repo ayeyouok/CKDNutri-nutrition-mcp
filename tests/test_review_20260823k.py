@@ -70,7 +70,8 @@ def test_k02_albumin_gdl_auto_convert_no_false_low():
     r_low = core._screen_pew(avg_p=40.0, avg_e=1200.0, floor_p=35.0,
                              target_e=1400.0, albumin_g_L=3.5)
     assert "白蛋白 35.0 g/L <38" in r_low["rationale"], r_low
-    assert "（注：原输入 3.5 ≤10，已按 g/dL 自动换算为 35.0 g/L）" in r_low["rationale"], r_low
+    # 十一审（2026-08-24）P0-1：换算区间收窄为 1~6 g/dL，文案同步更新
+    assert "原输入 3.5 处于 1~6 g/dL 典型区间，已自动换算为 35.0 g/L" in r_low["rationale"], r_low
 
     # 已正确单位 42 g/L：不触发低白蛋白（无换算、无信号）
     r_norm = core._screen_pew(avg_p=40.0, avg_e=1200.0, floor_p=35.0,
