@@ -400,6 +400,11 @@ def schofield_bmr_kcal(sex: str, age_years: float, weight_kg: float,
         return None
     a, b, c = coefficients
     megajoules = a * weight_kg + b * (height_cm / 100.0) + c
+    # R-01（2026-08-23）：超低体重早产儿（如 1.0kg/35cm）线性回归可产出负能耗
+    # （0.0007×1.0 + 6.349×0.35 − 2.584 < 0）——负 BMR 会让下游 deviation 颠倒。
+    # 显式返回 None（缺 BMR 交叉校验），不产出无临床意义的负值。
+    if megajoules <= 0:
+        return None
     return round(megajoules * 1000.0 / KJ_PER_KCAL, 1)
 
 
@@ -540,7 +545,8 @@ def calc_prnt_targets(
         """单方案计算核心：standard（正常生长/未透析/实际年龄/蛋白上限）与 adjusted 共用。
 
         gs=growth_status；dm=dialysis_mode；ha_years=身高年龄（None=实际年龄）；
-        hup=持续高尿素血症。水肿/素食/PD 葡萄糖扣减为患者属性，两方案一致保留。
+        hup=持续高尿素血症。水肿/素食为患者属性两方案一致；**PD 葡萄糖扣减按本方案 dm**
+        （standard=未透析基准不扣、adjusted=实际透析模式扣，C-01，2026-08-23）。
         """
         band_age = ha_years if ha_years is not None else age_years
         band = _band_for_age(band_age, sex)
@@ -585,27 +591,25 @@ def calc_prnt_targets(
 
         # 腹透葡萄糖供能扣减：PD 患者从腹透液吸收葡萄糖，等量减少膳食能量目标
         pd_deduction = 0.0
-        # P1（2026-08-18）：① Inf/NaN 拒绝——inf 会把能量扣成 0，静默低估膳食目标；
-        # ② 非透析（dm="none"）不应扣 PD 葡萄糖：无腹透则无葡萄糖吸收，扣减属数据错配
-        # （standard 方案标签"未透析"却仍扣 PD，能量目标被错误下压）。
-        # P0-1（2026-08-18 四审）：扣减条件收紧为 **dm == "peritoneal"**——此前
-        # `dm != "none"` 使 **HD（hemodialysis）患儿也扣 PD 葡萄糖**（血液透析不吸收
-        # 透析液葡萄糖，膳食目标被错误下压）；且非 peritoneal 模式传入
-        # pd_glucose_kcal_per_day 属数据错配，显式拒绝（严禁带 Warning 的错误计算结果）。
+        # P1（2026-08-18）：① Inf/NaN 拒绝——inf 会把能量扣成 0，静默低估膳食目标。
+        # P0-1（2026-08-18 四审）+ 2026-08-23（C-01 修正）：扣减判定用**本方案 dm**
+        # （standard 恒传 "none"=未透析基准，不扣；adjusted 传患者实际透析模式，扣）——
+        # 此前用患者级 dialysis_mode 使 PD 患儿的 **standard 方案也扣减**（standard
+        # 名称"标准推荐（未透析）"名不副实，且两方案能量完全相同、失去对照意义）。
+        # 患者级数据错配校验（下方）仍用 dialysis_mode：非 PD 患儿传 pd_glucose 拒绝。
         if pd_glucose_kcal_per_day is not None:
             if not math.isfinite(pd_glucose_kcal_per_day) or pd_glucose_kcal_per_day < 0:
                 raise ValueError(
                     f"pd_glucose_kcal_per_day 必须为不小于 0 的有限数值"
                     f"（收到 {pd_glucose_kcal_per_day!r}）")
-            # 用**患者级 dialysis_mode**（外层归一化值）判定——_plan 内层 dm 是方案场景
-            # 标签（standard 方案恒传 "none"=未透析场景，与患者实际透析状态无关），
-            # 用 dm 会把腹膜透析患儿的两个方案都误拒。
+            # 患者级校验（与方案无关）：HD/未透析患儿不吸收透析液葡萄糖，传扣减值属
+            # 数据错配，显式拒绝（严禁带 Warning 的错误计算结果）。
             if pd_glucose_kcal_per_day > 0 and dialysis_mode != "peritoneal":
                 raise ValueError(
                     f"pd_glucose_kcal_per_day 仅适用于腹膜透析（peritoneal），"
                     f"当前 dialysis_mode={dialysis_mode!r}——HD/未透析患儿不吸收透析液"
                     "葡萄糖，禁止扣减；请核对输入")
-            if dialysis_mode == "peritoneal" and pd_glucose_kcal_per_day > 0:
+            if dm == "peritoneal" and pd_glucose_kcal_per_day > 0:
                 pd_deduction = float(pd_glucose_kcal_per_day)
                 # 审查（2026-08-19，问题-7）：PD 葡萄糖供能达到或超过膳食能量目标时
                 # **拒绝生成目标**——旧 `max(energy_day - pd_deduction, 0.0)` 会静默
@@ -850,6 +854,12 @@ def assess_intake_vs_target(
         if not isinstance(_v, (int, float)) or isinstance(_v, bool) or not math.isfinite(float(_v)):
             return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"{_name} 必须为有限数值（NaN/Inf 拒绝），收到 {_raw!r}"}
+        # R-02（2026-08-23）：负数摄入拦截——食物摄入量/能量物理不可能为负（上游
+        # 脏数据/手动构造），-500 kcal 会算出负达成率被 _intake_pct_status 静默判
+        # "deficit"，与 PEW 独立接口 assess_pew_risk 的 `_val < 0` 拦截同口径。
+        if float(_v) < 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 不能为负（收到 {_raw!r}），摄入值必须 ≥ 0"}
     avg_e = float(diet.get("avg_energy_kcal") or 0.0)
     avg_p = float(diet.get("avg_protein_g") or 0.0)
     avg_k = float(diet.get("avg_potassium_mg") or 0.0)
@@ -1138,44 +1148,50 @@ def record_child_food(patient_id: str,
         _e["date"] = _norm
     with _STORE_LOCK:
         row = _load_child_foodlog(patient_id)
-        today = datetime.now(_CN_TZ).strftime("%Y-%m-%d")
-        if row.get("last_points_date") != today:
-            row["daily_points"] = 0
-            row["last_points_date"] = today
-        awarded = int(row.get("daily_points", 0) or 0) < 5
-        if awarded:
-            row["daily_points"] = int(row.get("daily_points", 0) or 0) + 1
-            row["total_points"] = int(row.get("total_points", 0) or 0) + 1
-        # 2026-08-22（用户反馈"同一天记录叠加/重复"）：child_foodlog 此前**无条件追加**
-        # （`existing + new`，无幂等）——LLM 弱网重试/同一顿重发/同日多次补记会把
-        # 同 (date,meal,food) 条目重复落库（实测同早餐出现"鸡蛋 20 个 + 鸡蛋 2 个"、
-        # "米饭 20 碗 + 米饭 1 碗"）。对齐 upsert_food_diary 的 S-3 内容幂等语义：
-        # 同 date+meal+food 已存在 → 用本次值**替换**（后写者意图），不同键才追加。
-        def _content_key(e):
-            return (e.get("date"), e.get("meal") or "", e.get("food") or "")
-        newest = {}
-        for _e in entries:                 # 本次条目（date 已归一）
-            newest[_content_key(_e)] = _e
-        _merged: list[dict] = []
-        _seen: set = set()
-        for _e in row.get("entries", []):
-            _k = _content_key(_e)
-            if _k in newest:
-                if _k not in _seen:        # 同键旧条目被本次值替换（收敛重复）
-                    _merged.append(newest[_k])
-                    _seen.add(_k)
-            else:
-                _merged.append(_e)
-        for _k, _e in newest.items():      # 新键条目追加
-            if _k not in _seen:
-                _merged.append(_e)
-        row["entries"] = _merged
-        _save_child_foodlog(patient_id, row)
+        awarded = False  # D-01：预演（write_mode=False）不加分
+        # D-01（2026-08-23）：write_mode=False（预演/校验）**不修改持久化状态与积分**——
+        # 此前 write_mode 参数存在但被忽略，预演也落盘+加分（契约违背：预演污染积分与
+        # 条目）。对齐 upsert_food_diary 的 S5 语义：仅 write_mode=True 才改行并落盘。
+        if write_mode:
+            today = datetime.now(_CN_TZ).strftime("%Y-%m-%d")
+            if row.get("last_points_date") != today:
+                row["daily_points"] = 0
+                row["last_points_date"] = today
+            awarded = int(row.get("daily_points", 0) or 0) < 5
+            if awarded:
+                row["daily_points"] = int(row.get("daily_points", 0) or 0) + 1
+                row["total_points"] = int(row.get("total_points", 0) or 0) + 1
+            # 2026-08-22（用户反馈"同一天记录叠加/重复"）：child_foodlog 此前**无条件追加**
+            # （`existing + new`，无幂等）——LLM 弱网重试/同一顿重发/同日多次补记会把
+            # 同 (date,meal,food) 条目重复落库（实测同早餐出现"鸡蛋 20 个 + 鸡蛋 2 个"、
+            # "米饭 20 碗 + 米饭 1 碗"）。对齐 upsert_food_diary 的 S-3 内容幂等语义：
+            # 同 date+meal+food 已存在 → 用本次值**替换**（后写者意图），不同键才追加。
+            def _content_key(e):
+                return (e.get("date"), e.get("meal") or "", e.get("food") or "")
+            newest = {}
+            for _e in entries:                 # 本次条目（date 已归一）
+                newest[_content_key(_e)] = _e
+            _merged: list[dict] = []
+            _seen: set = set()
+            for _e in row.get("entries", []):
+                _k = _content_key(_e)
+                if _k in newest:
+                    if _k not in _seen:        # 同键旧条目被本次值替换（收敛重复）
+                        _merged.append(newest[_k])
+                        _seen.add(_k)
+                else:
+                    _merged.append(_e)
+            for _k, _e in newest.items():      # 新键条目追加
+                if _k not in _seen:
+                    _merged.append(_e)
+            row["entries"] = _merged
+            _save_child_foodlog(patient_id, row)
     band, msg = _child_band(int(row.get("total_points", 0) or 0))
     return {"ok": True, "data": {
         "patient_id": patient_id,
         "entry_count": len(row.get("entries", [])),
         "awarded": awarded,
+        "persisted": bool(write_mode),
         "daily_points": int(row.get("daily_points", 0) or 0),
         "total_points": int(row.get("total_points", 0) or 0),
         "band": band,
@@ -1200,7 +1216,14 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     for e in entries:
         if not isinstance(e, dict):
             continue
-        by_day.setdefault(e.get("date", ""), []).append(e)
+        _d = e.get("date")
+        if not _d or not str(_d).strip():
+            # D-03（2026-08-23）：空/脏日期跳过——此前 `e.get("date","")` 把空串归入
+            # "" 分组，患者仅记 1 天时 days=["2026-08-20",""] → num_days=2 → 日均摄入
+            # 腰斩，假阳性 PEW 高危报警。写端已归一（缺省今天），此为历史脏数据防御
+            # （与 P1-6 非 dict 跳过同口径，fail-soft）。
+            continue
+        by_day.setdefault(str(_d).strip(), []).append(e)
     days = sorted(by_day.keys(), reverse=True)[:3]
     used = [e for d in days for e in by_day[d]]
     num_days = max(len(days), 1)
@@ -1341,31 +1364,21 @@ def upsert_food_diary(
                 "phosphorus_mg": numeric["phosphorus_mg"],
                 "sodium_mg": numeric["sodium_mg"],
             })
-        # S-3（2026-08-15）：(date+meal+food) 内容幂等——此前无条件 `existing + stamped`
-        # 追加（每次新 uuid4 entry_id），家长弱网重试同一顿饭 → 两行，day_count/均值
-        # 失真。现按内容键合并：同 date+meal+food 已存在 → 用本次值**替换**该条目
-        # （幂等更新，保留原 entry_id），否则新增。多条目同键取最后一条（后写者意图）。
+        # S-3（2026-08-15）+ D-02（2026-08-23）：(date+meal+food) 内容幂等只对
+        # **跨调用残留**生效——家长弱网重试同一顿饭（第二次调用重发同键）→ 旧残留
+        # 被本次覆盖，不产生两行（day_count/均值不失真）。**本次调用内部同键多条全部
+        # 保留**（D-02：同餐 2 份米饭 [100g,100g] 是真实多份进食，此前 newest 字典
+        # 后者覆盖前者 → 摄入 200g 缩水为 100g，总量腰斩 + 假 PEW）。区分：
+        # 单次调用内 = 真实多份（保留）；跨调用同键 = 重试残留（本次覆盖）。
         def _content_key(e):
             return (e.get("date"), e.get("meal") or "", e.get("food") or "")
-        newest = {}
-        for e in stamped:
-            newest[_content_key(e)] = e
+        new_keys = {_content_key(e) for e in stamped}
         merged: list[dict] = []
-        seen: set = set()
         for e in existing:
-            k = _content_key(e)
-            if k in newest:
-                if k not in seen:           # 同键旧条目被本次值替换（保留原 entry_id）
-                    repl = dict(newest[k])
-                    repl["entry_id"] = e.get("entry_id") or newest[k]["entry_id"]
-                    merged.append(repl)
-                    seen.add(k)
-            else:
+            if _content_key(e) not in new_keys:
                 merged.append(e)
-        for k, e in newest.items():         # 新键条目追加
-            if k not in seen:
-                merged.append(e)
-                seen.add(k)
+            # 同键旧条目（重试残留）被本次覆盖：跳过，本次条目统一追加
+        merged.extend(stamped)  # 本次所有条目全保留（含同键多份）
         all_entries = merged
 
         if write_mode:
@@ -1452,6 +1465,7 @@ def get_food_diary_summary(patient_id: str, guardian_token: str | None = None) -
                 "patient_id": patient_id,
                 "day_count": 0,
                 "entry_count": 0,
+                "recent_entries": [],   # R-04（2026-08-23）：与非空分支 schema 一致（此前缺键，客户端/编排层按 key 解包 KeyError）
                 "diet_diary_3d": None,
                 "note": "暂无该患者的饮食日记记录。",
                 "child_foodlog": child_summary,
@@ -1734,6 +1748,7 @@ def calc_growth_zscore(age_years: float, sex: str,
     haz_z: float | None = None
     waz_z: float | None = None
     baz_z: float | None = None
+    whz_z: float | None = None  # C-02（2026-08-23）：急性消瘦 WHZ 原始值，参与 growth_status 判定
 
     # BUG-60：>18 岁（>216 月）超出 WS/T 423/612 适用域——不再静默按 216 月边界钳位，
     # 显式标注越界并提示结果仅供参考（负年龄已在入口拒绝）。
@@ -1790,6 +1805,7 @@ def calc_growth_zscore(age_years: float, sex: str,
             _bands = _interp_bands(_wf, height_cm)
             if _bands is not None:
                 whz = _z_from_bands(weight_kg, _bands)
+                whz_z = whz  # C-02：保存原始 WHZ 供 growth_status 判定（BUG-63 同口径）
                 d["whz"] = {
                     "z": _round(whz, 2),
                     "median_kg": _round(_bands[3], 2),
@@ -1872,6 +1888,15 @@ def calc_growth_zscore(age_years: float, sex: str,
         growth_status = "failure"          # 生长迟缓 → 能量取 SDI 上限
     elif waz_z is not None and waz_z < -2:
         growth_status = "failure"          # 低体重/消瘦 → 能量取 SDI 上限
+    elif whz_z is not None and whz_z < -2:
+        # C-02（2026-08-23）：**WHZ<-2 急性消瘦 → failure**——此前计算了 whz 却未参与
+        # growth_status 判定（HAZ/WAZ 正常但 WHZ=-2.6 重度消瘦的 10 月龄婴儿被判 normal，
+        # 与 d["whz"]["wasting"]="消瘦" 自相矛盾，能量按 SDI 中点而非上限，贻误促生长干预）。
+        # 与 P0-2（BAZ<-2）同口径：急性消瘦属生长衰竭，取 SDI 上限。
+        growth_status = "failure"
+        warnings.append(
+            f"WHZ {whz_z:.2f} < -2（急性消瘦/营养不良，身长/身高别体重），判生长衰竭，"
+            "能量按 SDI 上限（促生长）；请结合临床评估。")
     elif baz_z is not None and baz_z < -2:
         # P0-2（2026-08-18）：**BAZ<-2 消瘦 → failure**——此前决策链只认 HAZ/WAZ 负向
         # 与 BAZ 正向（≥1 超重），BAZ=-2.43 时 _baz_nutrition 判"消瘦"但 growth_status
@@ -1883,31 +1908,34 @@ def calc_growth_zscore(age_years: float, sex: str,
             "能量按 SDI 上限（促生长）；请结合临床评估。")
     elif baz_z is not None and baz_z >= 1:
         growth_status = "overweight"        # BAZ≥1 → 超重/肥胖，能量向下调整
-    elif baz_z is None and bmi is not None and age_months >= 84:
-        # M-3（2026-08-15）：≥7 岁无 BAZ 标准时用 WS/T 586-2018 年龄×性别别 BMI 超重
-        # 界值判超重——此前 BMI>24 统一粗判漏判大量患儿（7 岁男超重界值 17.0、12 岁男
-        # 20.7，BMI 17-24 区间本应超重却不判）。
+    elif baz_z is None and bmi is not None and age_years >= 6.0:
+        # M-3（2026-08-15）+ C-03（2026-08-23）：BAZ 参考不可用时用 WS/T 586-2018
+        # 年龄×性别别 BMI 超重界值判超重（_ws586 覆盖 6.0-18.0 岁）。
+        # C-03：此前条件 `age_months >= 84` 使 **81-83.9 月龄（6.75-6.99 岁）盲区**——
+        # WS/T 423 附录 B 止于 81 月（BAZ 无）、WS/T 586 起于 6.0 岁本可用，却被
+        # age_months>=84 拦截 → BMI 30 也判 normal。放宽为 age_years>=6.0 覆盖该窗口
+        # （72-81 月 baz_z 有值不落此分支，无影响）。
         _ov_thr = _ws586_overweight_threshold(age_years, sex)
         if _ov_thr is not None and bmi >= _ov_thr:
             growth_status = "overweight"
             warnings.append(
-                f"≥7 岁 BAZ 标准不可用，BMI {bmi:.1f} ≥ WS/T 586-2018 {age_years:.0f} 岁"
+                f"BAZ 参考不可用，BMI {bmi:.1f} ≥ WS/T 586-2018 {age_years:.0f} 岁"
                 f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}，判超重；"
                 "建议结合腰围/体脂综合评估。")
         elif _ov_thr is not None:
-            # BUG-63（2026-08-12）：≥7 岁 BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI
+            # BUG-63（2026-08-12）：BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI
             # 粗筛提示，杜绝"严重消瘦被判 normal 且无警告"的漏诊。**不改 growth_status**
             # （7-8 岁 BMI 14 属正常范围，扁平阈值直接调能量会误伤；仅提示人工评估）。
             if bmi < 14:
                 warnings.append(
-                    f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
+                    f"BAZ 参考不可用，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
                     "请立即结合中臂肌围等人体测量人工评估。")
             else:
                 _thr_txt = (f"（WS/T 586-2018 {age_years:.0f} 岁"
                             f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}）"
-                            if _ov_thr is not None else "（≥7 岁无界值）")
+                            if _ov_thr is not None else "（无界值）")
                 warnings.append(
-                    f"≥7 岁无 BAZ 标准，BMI {bmi:.1f} 未达超重界值{_thr_txt}；"
+                    f"BAZ 参考不可用，BMI {bmi:.1f} 未达超重界值{_thr_txt}；"
                     "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
             growth_status = "normal"
         else:
@@ -2030,6 +2058,10 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     :param patient_id: 患者标识
     :return: 按日期升序的历史点 + 趋势判断（improving / worsening / stable / no_data）
+
+    R-03（2026-08-23，文档澄清）：trend 为**全周期首尾基线对比**（首点 vs 最新点），
+    属整体趋势语义——中间恶化后回落（medium→high→medium）会判 stable，不反映近期
+    波动。需评估近期变化请结合 points 时间线人工判读，勿把 trend 当近期趋势。
     """
     caller = get_caller()
     # BUG-01 修复：PEW 历史属临床判读（NUTRITION_ASSESSMENT_CLINICAL_TOOLS 已登记），
