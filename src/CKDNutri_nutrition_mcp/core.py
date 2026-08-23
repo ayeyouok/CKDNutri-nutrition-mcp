@@ -1027,7 +1027,9 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     eff_alb = albumin_g_L
     unit_note = ""
     if eff_alb is not None and eff_alb <= 10.0:
-        eff_alb = eff_alb * 10.0
+        # 八审（2026-08-24）：定点舍入防浮点抖动——`3.8 * 10.0` 某些架构得
+        # 37.99999999999999，恰在 <38.0 临界会误判低白蛋白。round(,2) 消除抖动。
+        eff_alb = round(eff_alb * 10.0, 2)
         unit_note = f"（注：原输入 {albumin_g_L} ≤10，已按 g/dL 自动换算为 {eff_alb} g/L）"
     low_albumin = (eff_alb is not None and eff_alb < 38.0)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
 
@@ -1222,7 +1224,18 @@ def record_child_food(patient_id: str,
             # 复核：child 自报同量同名 = 重复提交，收敛为 1 正确（区别于 food_diary 家长
             # 记"一餐 2 份鸡蛋[100g,100g]"为不同 amount 表示真实多份，故 upsert 全保留）。
             def _content_key(e):
-                return (e.get("date"), e.get("meal") or "", e.get("food") or "")
+                # 八审（2026-08-24）：非哈希类型防御——前端/LLM 可能传
+                # {"food": ["牛奶","面包"]} 或 {"food": {"name":"米饭"}} 等结构化负载，
+                # 原 `(e.get("meal") or "", e.get("food") or "")` 对非空容器无效
+                # （list/dict truthy），生成不可哈希元组 → 后续 dict/set 操作抛
+                # TypeError: unhashable type 冒泡 500。此处 str() 强制标量化。
+                _m = e.get("meal")
+                _f = e.get("food")
+                return (
+                    str(e.get("date") or "").strip(),
+                    str(_m).strip() if _m is not None else "",
+                    str(_f).strip() if _f is not None else "",
+                )
             newest = {}
             for _e in entries:                 # 本次条目（date 已归一），同键收敛为 1
                 newest[_content_key(_e)] = _e
@@ -1280,6 +1293,11 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         by_day.setdefault(str(_d).strip(), []).append(e)
     days = sorted(by_day.keys(), reverse=True)[:3]
+    if not days:
+        # 八审（2026-08-24）：空有效天数（全为无效/脏日期被过滤）显式返回 None，
+        # 而非全 0.0 字典——否则 DAG 的 `if dd:` 把空聚合误判为"真实摄入 0 kcal/0 g"
+        # 触发虚假 PEW 高危报警。None 语义明确："无可用摄入数据"。
+        return {"day_count": 0, "entry_count": 0, "diet_diary_3d": None}
     used = [e for d in days for e in by_day[d]]
     num_days = max(len(days), 1)
     # P3（2026-08-18）：NaN 清洗——`or 0.0` 拦不住 NaN（NaN 是 truthy），写路径
@@ -1426,7 +1444,14 @@ def upsert_food_diary(
         # 后者覆盖前者 → 摄入 200g 缩水为 100g，总量腰斩 + 假 PEW）。区分：
         # 单次调用内 = 真实多份（保留）；跨调用同键 = 重试残留（本次覆盖）。
         def _content_key(e):
-            return (e.get("date"), e.get("meal") or "", e.get("food") or "")
+            # 八审（2026-08-24）：与 record_child_food 同口径，str() 标量防御非哈希类型。
+            _m = e.get("meal")
+            _f = e.get("food")
+            return (
+                str(e.get("date") or "").strip(),
+                str(_m).strip() if _m is not None else "",
+                str(_f).strip() if _f is not None else "",
+            )
         new_keys = {_content_key(e) for e in stamped}
         merged: list[dict] = []
         for e in existing:
@@ -1990,10 +2015,10 @@ def calc_growth_zscore(age_years: float, sex: str,
                 f"BAZ 参考不可用，BMI {bmi:.1f} ≥ WS/T 586-2018 {age_years:.0f} 岁"
                 f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}，判超重；"
                 "建议结合腰围/体脂综合评估。")
-        elif _wasting_thr is not None and bmi < _wasting_thr:
+        elif _wasting_thr is not None and bmi <= _wasting_thr:
             growth_status = "failure"
             warnings.append(
-                f"BAZ 参考不可用，BMI {bmi:.1f} < WS/T 456-2014 {age_years:.0f} 岁"
+                f"BAZ 参考不可用，BMI {bmi:.1f} ≤ WS/T 456-2014 {age_years:.0f} 岁"
                 f"{'男' if sex == 'M' else '女'}消瘦界值 {_wasting_thr:.1f}，判生长不良/消瘦，"
                 "能量推荐按 SDI 上限以促进追赶生长；请结合临床与中臂肌围评估。")
         elif _ov_thr is not None:

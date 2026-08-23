@@ -297,8 +297,11 @@ def calc_growth_zscore_tool(
     至少提供 height_cm / weight_kg / bmi 之一；同时给出 PRNT growth_status_suggestion。
     """
     try:
-        return calc_growth_zscore(float(age_years), sex,
-                                  height_cm=height_cm, weight_kg=weight_kg, bmi=bmi)
+        return calc_growth_zscore(
+            float(age_years), sex,
+            height_cm=float(height_cm) if height_cm is not None else None,
+            weight_kg=float(weight_kg) if weight_kg is not None else None,
+            bmi=float(bmi) if bmi is not None else None)
     except Exception as exc:
         return _invalid(exc)
 
@@ -310,16 +313,21 @@ def assess_pew_risk_tool(
     target_protein_g: float,
     target_energy_kcal: float,
     albumin_g_L: float | None = None,
+    floor_protein_g: float | None = None,
 ) -> dict[str, Any]:
     """PEW（蛋白质-能量消耗）风险筛查：传入已算好的摄入均值与 PRNT 目标。
 
     摄入均值可取 get_food_diary_summary_tool 的 diet_diary_3d；
-    目标可取 calc_prnt_targets_tool 的 target_g_per_day / target_kcal_per_day。
+    目标可取 calc_prnt_targets_tool 的 target_g_per_day / target_kcal_per_day；
+    floor_protein_g 取 calc_prnt_targets_tool 的 floor_g_per_day（官方蛋白安全下限，
+    BUG-42 修复——婴儿段须显式传入，否则退化为 target*0.85 致 PEW 假阳性）。
     """
     try:
         return assess_pew_risk(float(avg_protein_g), float(avg_energy_kcal),
                                float(target_protein_g), float(target_energy_kcal),
-                               albumin_g_L)
+                               albumin_g_L=albumin_g_L,
+                               floor_protein_g=float(floor_protein_g)
+                               if floor_protein_g is not None else None)
     except Exception as exc:
         return _invalid(exc)
 
@@ -469,6 +477,12 @@ def comprehensive_nutrition_assessment_tool(
             diet = {"avg_protein_g": float(avg_protein_g),
                     "avg_energy_kcal": float(avg_energy_kcal)}
             d["notes"].append("摄入均值来自调用方直接提供。")
+        elif ((avg_protein_g is not None) ^ (avg_energy_kcal is not None)):
+            # 八审（2026-08-24）：部分参数孤立传入——医生少传一个字段却静默跳过评估，
+            # 易误以为"系统不支持或患儿无异常"。显式提示需同时提供两者。
+            d["notes"].append(
+                "⚠ 仅提供了部分摄入数据（须同时提供 avg_protein_g 与 avg_energy_kcal "
+                "才能进行摄入与 PEW 评估），跳过摄入与 PEW 评估。")
         elif include_intake and patient_id:
             # BUG-29 说明（2026-08-12）：DAG 仅临床角色可调（入口 enforce_nutrition_tool 已拦家长），
             # 故此处 get_food_diary_summary 以 doctor 身份调用，_guard_guardian 对非 parent 直接放行，
