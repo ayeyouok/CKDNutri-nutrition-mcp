@@ -474,12 +474,20 @@ def comprehensive_nutrition_assessment_tool(
             # 故此处 get_food_diary_summary 以 doctor 身份调用，_guard_guardian 对非 parent 直接放行，
             # 无需（也不应）透传 guardian_token——若未来 DAG 入口放开给受限角色，此处须补绑定校验。
             summary = get_food_diary_summary(patient_id)
-            dd = (summary.get("data") or {}).get("diet_diary_3d") if summary.get("ok") else None
-            if dd:
-                diet = dict(dd)
-                d["notes"].append(f"摄入均值来自饮食日记最近 3 日（patient_id={patient_id}）。")
+            # 六审修复（2026-08-23）：区分失败原因——此前 summary.get("ok") 为 False
+            # （含 INVALID_INPUT 非法 patient_id、权限拒绝）时，dd 为 None 走 else 被
+            # 静默当"暂无日记"，误导医生以为患儿未记日记、掩盖录入错误。
+            if not summary.get("ok"):
+                d["notes"].append(
+                    f"获取患者 {patient_id} 饮食日记失败："
+                    f"{summary.get('detail', 'ID 非法或无权限')}，跳过摄入与 PEW 评估。")
             else:
-                d["notes"].append(f"患者 {patient_id} 暂无饮食日记，跳过摄入与 PEW 评估。")
+                dd = (summary.get("data") or {}).get("diet_diary_3d")
+                if dd:
+                    diet = dict(dd)
+                    d["notes"].append(f"摄入均值来自饮食日记最近 3 日（patient_id={patient_id}）。")
+                else:
+                    d["notes"].append(f"患者 {patient_id} 暂无饮食日记，跳过摄入与 PEW 评估。")
         else:
             d["notes"].append("未提供摄入数据（avg_* 或 include_intake+patient_id），跳过摄入与 PEW 评估。")
 

@@ -656,12 +656,9 @@ def calc_prnt_targets(
             }
 
         warnings: list[str] = []
-        # 六审（2026-08-13）：超龄显式提示（对齐 assessment adult_caveat）——age>18 会
-        # 静默套用 15-17 岁段参数，临床可能误当儿童处方执行。
-        if age_years > 18:
-            warnings.append(
-                f"age_years={age_years} 超出 PRNT 2020 儿童适用域（0-18 岁），目标按 15-17 岁段"
-                "参数计算，仅供参考，请改用成人营养指南。")
+        # 注（2026-08-23 六审）：原 age_years>18 警告块已删除——外层 calc_prnt_targets
+        # 第 491 行对 age>18 直接 raise ValueError（fail-closed），_plan 内层该分支永远
+        # 不可达，属死代码；超龄拦截已由入口统一负责，此处无需重复。
         if ckd_stage == 1:
             warnings.append("PRNT 2020 覆盖 CKD 2-5D；stage 1 暂沿用同表，请结合临床判断。")
         if dm != "none":
@@ -967,6 +964,10 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
     record_pew_risk 落库（其 score 契约字段本应来自本函数，此前 assess 不返回
     score 导致编排层无值可传）。打分规则透明：蛋白缺乏 40 分 + 能量缺乏 40 分 +
     低白蛋白 20 分；high ≥80、medium 40-60、low 0。
+
+    单位防御（2026-08-23 六审）：albumin_g_L 入参基准为 g/L（<38 判低白蛋白，CKiD 儿科
+    PEW 标准 3.8 g/dL=38 g/L）。若传入 (0,10] 量级（显然是 g/dL 误传，如 3.8/4.2），
+    自动 ×10 换算为 g/L 并在 rationale 标注，避免健康患儿因单位混淆被误诊。
     """
     # P0-3（2026-08-18 四审）：albumin 非法值防御性拒绝——入口 assess_pew_risk 已
     # INVALID_INPUT 拦截；此处兜底直调（_screen_pew 为模块内纯函数可被直调）——
@@ -980,7 +981,18 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
             "拒绝以脏值参与 PEW 判定")
     protein_deficit = avg_p < floor_p
     energy_deficit = (avg_e / target_e) < 0.8 if target_e > 0 else False
-    low_albumin = (albumin_g_L is not None and albumin_g_L < 38)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
+    # 六审修复（2026-08-23）：单位防御——儿科生化化验单常以 g/dL 为单位（如 3.8 g/dL），
+    # 医生极易直接传入 3.5/4.2。此前硬编码 <38 按 g/L 判定，4.2（=42 g/L 正常）会误判
+    # low_albumin=True（错扣 20 分把健康患儿误诊为低白蛋白血症/PEW 风险）。
+    # 生理学量级自动识别：(0,10] 显然是 g/dL，自动 ×10 换算为 g/L 并告警提示。
+    # 单点落此处：assess_pew_risk(1072) 与 assess_intake_vs_target(902) 两路入口均汇聚，
+    # 避免双处换算矛盾；eff_alb 仅用于判定，原始 albumin_g_L 仍用于 rationale 展示。
+    eff_alb = albumin_g_L
+    unit_note = ""
+    if eff_alb is not None and eff_alb <= 10.0:
+        eff_alb = eff_alb * 10.0
+        unit_note = f"（注：原输入 {albumin_g_L} ≤10，已按 g/dL 自动换算为 {eff_alb} g/L）"
+    low_albumin = (eff_alb is not None and eff_alb < 38.0)  # M-6：CKiD 儿科 PEW 标准 <3.8 g/dL
 
     # S2：信号加权分（透明、可解释；与等级判定共用信号，不另立口径）
     score = sum((
@@ -1004,7 +1016,7 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
         if energy_deficit:
             parts.append("能量 <80% 目标")
         if low_albumin:
-            parts.append(f"白蛋白 {albumin_g_L} g/L <38")
+            parts.append(f"白蛋白 {eff_alb} g/L <38{unit_note}")
         rationale = "存在以下 PEW 预警信号：" + "；".join(parts) + "。"
     else:
         risk = "low"
@@ -1582,10 +1594,8 @@ def _z_from_bands(x: float, bands: tuple) -> float:
     _dmp1 = (p1 - m) or 1e-9
     _dp1p2 = (p2 - p1) or 1e-9
     _dp2p3 = (p3 - p2) or 1e-9
-    if x <= n3:
-        return -3.0 + (x - n3) / _dn3n2          # 低于 -3SD：最外侧斜率外推
     if x <= n2:
-        return -3.0 + (x - n3) / _dn3n2
+        return -3.0 + (x - n3) / _dn3n2          # 低于 -3SD：最外侧斜率外推（覆盖 x<=n3 段，同式）
     if x <= n1:
         return -2.0 + (x - n2) / _dn2n1
     if x <= m:
@@ -2096,7 +2106,11 @@ def get_pew_history(patient_id: str) -> dict[str, Any]:
                  and str(p.get("level", "")).strip().lower() in _PEW_LEVEL_ORDER]
         if len(valid) >= 2:
             first, last = valid[0], valid[-1]
-            fo, lo = _PEW_LEVEL_ORDER[first["level"]], _PEW_LEVEL_ORDER[last["level"]]
+            # 六审修复（2026-08-23）：构造 valid 时已用 .strip().lower() 过滤，但取权重
+            # 时若仍用未归一化的原始 level 键（如 "HIGH"/" Medium"），会 KeyError 500。
+            # 此处统一归一化后再索引，与过滤口径一致，防历史/迁移脏数据崩溃。
+            fo = _PEW_LEVEL_ORDER[str(first.get("level", "")).strip().lower()]
+            lo = _PEW_LEVEL_ORDER[str(last.get("level", "")).strip().lower()]
             if lo > fo:
                 trend = "worsening"
             elif lo < fo:
