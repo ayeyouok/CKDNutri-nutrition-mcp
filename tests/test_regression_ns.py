@@ -375,7 +375,11 @@ def test_f4_diary_write_guards():
 
     from CKDNutri_nutrition_mcp import core
 
-    tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+    # 守卫以北京业务日（UTC+8）判定"今天"，测试须同口径构造未来日，否则在 UTC
+    # 时区的 CI 上 datetime.date.today() 落后 8 小时，构造的"明天"恰好等于北京
+    # 今日 → 守卫不触发 → 误判（2026-08-24 CI 失败根因）。
+    _cn_tz = datetime.timezone(datetime.timedelta(hours=8))
+    tomorrow = (datetime.datetime.now(_cn_tz).date() + datetime.timedelta(days=1)).isoformat()
     base = {"meal": "午餐", "food": "米饭", "energy_kcal": 100, "protein_g": 2,
             "potassium_mg": 10, "phosphorus_mg": 5, "sodium_mg": 1}
     r = core.upsert_food_diary("P0001", entries=[dict(base, date=tomorrow)])
