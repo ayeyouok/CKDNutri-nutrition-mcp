@@ -501,22 +501,33 @@ def comprehensive_nutrition_assessment_tool(
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake
 
-            pew = assess_pew_risk(
-                float(diet.get("avg_protein_g", 0.0)), float(diet.get("avg_energy_kcal", 0.0)),
-                float(target_p), float(target_e), serum_albumin_g_l,
-                # BUG-42：PEW 蛋白下限用 PRNT 官方 SDI 下限（floor_g_per_day），
-                # 不用"目标×85%"近似（婴儿段会把 1.52-2.1 g/kg 的合规摄入误判为低于安全下限）
-                floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
-            )
-            if pew.get("ok"):
-                # N-S5 修复（2026-08-14）：PEW score 统一为 assess_pew_risk 的信号加权
-                # 0-100 分——此前用 _PEW_SCORE（low=0/medium=1/high=2）覆盖并把 0/1/2
-                # 语义经 hint 引导传给 record_pew_risk 落库，历史 PEW 分数全错。
-                d["pew"] = {**pew["data"],
-                            "score": pew["data"]["score"],
-                            "hint": "如需留痕请调 record_pew_risk_tool(patient_id, date, score, level)，score 取本结果 data.score（0-100）"}
+            # 夜审（2026-08-23）P2-加固：摄入评估失败时**熔断** PEW 计算。
+            # 此前无论 intake.ok 与否均继续 assess_pew_risk，且用 diet.get(..., 0.0) 回退
+            # 0 蛋白/0 能量 → 在 intake 因上游参数非法返回 ok=False 时，PEW 会按"0 摄入"
+            # 强行评估，产出虚假 high 临床报警。fail-closed：摄入不可信则 PEW 不可信。
+            if not intake.get("ok"):
+                d["pew"] = {
+                    "ok": False,
+                    "error": "INTAKE_ASSESSMENT_FAILED",
+                    "detail": "摄入评估未通过，跳过 PEW 风险计算以防产生虚假高危结论",
+                }
             else:
-                d["pew"] = pew
+                pew = assess_pew_risk(
+                    float(diet.get("avg_protein_g", 0.0)), float(diet.get("avg_energy_kcal", 0.0)),
+                    float(target_p), float(target_e), serum_albumin_g_l,
+                    # BUG-42：PEW 蛋白下限用 PRNT 官方 SDI 下限（floor_g_per_day），
+                    # 不用"目标×85%"近似（婴儿段会把 1.52-2.1 g/kg 的合规摄入误判为低于安全下限）
+                    floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
+                )
+                if pew.get("ok"):
+                    # N-S5 修复（2026-08-14）：PEW score 统一为 assess_pew_risk 的信号加权
+                    # 0-100 分——此前用 _PEW_SCORE（low=0/medium=1/high=2）覆盖并把 0/1/2
+                    # 语义经 hint 引导传给 record_pew_risk 落库，历史 PEW 分数全错。
+                    d["pew"] = {**pew["data"],
+                                "score": pew["data"]["score"],
+                                "hint": "如需留痕请调 record_pew_risk_tool(patient_id, date, score, level)，score 取本结果 data.score（0-100）"}
+                else:
+                    d["pew"] = pew
         return result
     except Exception as exc:
         return _invalid(exc)

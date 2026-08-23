@@ -1573,25 +1573,34 @@ def _z_from_bands(x: float, bands: tuple) -> float:
     超出 ±3SD 用最外侧斜率外推（与原口径一致，仅 7-18 身高等距表触达）。
     """
     n3, n2, n1, m, p1, p2, p3 = bands
+    # 夜审（2026-08-23）P2-加固：国标数据严格递增，但热更/微调端点可能出现相邻界值
+    # 相等（如 p3==p2 或 n2==n3），未防护分母会抛 ZeroDivisionError 致评估工具 500。
+    # 分母为零时退化为极小正数（差值趋零 → 该段插值斜率趋近无穷，用 1e-9 兜底保持有限输出）。
+    _dn3n2 = (n2 - n3) or 1e-9
+    _dn2n1 = (n1 - n2) or 1e-9
+    _dn1m = (m - n1) or 1e-9
+    _dmp1 = (p1 - m) or 1e-9
+    _dp1p2 = (p2 - p1) or 1e-9
+    _dp2p3 = (p3 - p2) or 1e-9
     if x <= n3:
-        return -3.0 + (x - n3) / (n2 - n3)          # 低于 -3SD：最外侧斜率外推
+        return -3.0 + (x - n3) / _dn3n2          # 低于 -3SD：最外侧斜率外推
     if x <= n2:
-        return -3.0 + (x - n3) / (n2 - n3)
+        return -3.0 + (x - n3) / _dn3n2
     if x <= n1:
-        return -2.0 + (x - n2) / (n1 - n2)
+        return -2.0 + (x - n2) / _dn2n1
     if x <= m:
-        return -1.0 + (x - n1) / (m - n1)
+        return -1.0 + (x - n1) / _dn1m
     if x <= p1:
-        return (x - m) / (p1 - m)
+        return (x - m) / _dmp1
     if x <= p2:
-        return 1.0 + (x - p1) / (p2 - p1)
+        return 1.0 + (x - p1) / _dp1p2
     if x <= p3:
-        return 2.0 + (x - p2) / (p3 - p2)
+        return 2.0 + (x - p2) / _dp2p3
     # ⚠ 2026-08-19（审查 问题-9，P2）：超出 +3SD 后沿 +2→+3SD 斜率**线性外推**——
     # 本实现采用的外推策略（与原口径一致），但儿童 BMI 高尾 +3SD 以上的真实分布未必
     # 线性（WS/T 423 界值在高尾间距显著增大）。**需权威标准再次确认**该外推规定；
     # 当前保留（与 -3SD 对称），临床解读超出 +3SD 的 Z 值时应意识到其为外推值。
-    return 3.0 + (x - p3) / (p3 - p2)               # 高于 +3SD：最外侧斜率外推
+    return 3.0 + (x - p3) / _dp2p3               # 高于 +3SD：最外侧斜率外推
 
 
 def _valid_sd(s: Any) -> bool:
