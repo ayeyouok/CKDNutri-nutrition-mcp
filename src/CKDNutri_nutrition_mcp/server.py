@@ -151,7 +151,7 @@ def upsert_food_diary_tool(patient_id: str, entries: list, write_mode: bool = Tr
     entries 每项：{date, meal, food, energy_kcal, protein_g, potassium_mg, phosphorus_mg, sodium_mg}
     """
     try:
-        return upsert_food_diary(patient_id, entries, write_mode, guardian_token)
+        return upsert_food_diary(patient_id, entries, _to_bool(write_mode), guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
@@ -179,7 +179,7 @@ def record_child_food_tool(patient_id: str, entries: list, write_mode: bool = Tr
     entries 每项：{date, meal?, food, amount?}（amount 为孩子自述量，自由文本）
     """
     try:
-        return record_child_food(patient_id, entries, write_mode)
+        return record_child_food(patient_id, entries, _to_bool(write_mode))
     except Exception as exc:
         return _invalid(exc)
 
@@ -195,7 +195,7 @@ def lookup_food_nutrients_tool(food_name: str, portion: str | None = None,
     pnpr（磷蛋白比+分级），无需再单独调用换算/磷蛋白比工具。
     """
     try:
-        return lookup_food_nutrients(food_name, portion, include_household=include_household)
+        return lookup_food_nutrients(food_name, portion, include_household=_to_bool(include_household))
     except Exception as exc:
         return _invalid(exc)
 
@@ -306,7 +306,8 @@ def calc_prnt_targets_tool(
             height_cm=float(height_cm or 0.0), ckd_stage=_stage_int(ckd_stage),
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
             growth_status=growth_status, is_edema=_to_bool(is_edema),
-            pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
+            pd_glucose_kcal_per_day=(float(pd_glucose_kcal_per_day)
+                                     if pd_glucose_kcal_per_day is not None else None),
             height_age_years=float(height_age_years) if height_age_years is not None else None,
             # 十四审（2026-08-24）：与 is_edema 同口径，包装层统一 _to_bool 归一，避免单工具与 DAG 口径不一
             high_urea_persistent=_to_bool(high_urea_persistent),
@@ -356,7 +357,8 @@ def assess_pew_risk_tool(
     try:
         return assess_pew_risk(float(avg_protein_g), float(avg_energy_kcal),
                                float(target_protein_g), float(target_energy_kcal),
-                               albumin_g_L=albumin_g_L,
+                               albumin_g_L=(float(albumin_g_L)
+                                            if albumin_g_L is not None else None),
                                floor_protein_g=float(floor_protein_g)
                                if floor_protein_g is not None else None)
     except Exception as exc:
@@ -434,7 +436,9 @@ def comprehensive_nutrition_assessment_tool(
 
         # v2.4：腹透吸收在 DAG 内部计算（C3 下沉）——非腹透一律不触发。
         # 显式 pd_glucose_kcal_per_day 优先；否则按透析模式 + 处方参数内部算。
-        pd_kcal = pd_glucose_kcal_per_day
+        # 十五审（2026-08-24）：LLM 弱类型可能传字符串数字，强转防 core 运算 TypeError。
+        pd_kcal = (float(pd_glucose_kcal_per_day)
+                   if pd_glucose_kcal_per_day is not None else None)
         pd_notes: list[str] = []
         normalized_dialysis = DIALYSIS_ALIAS.get(
             str(dialysis_mode or "").strip().lower(), "none")
@@ -517,7 +521,7 @@ def comprehensive_nutrition_assessment_tool(
             diet = {"avg_protein_g": float(avg_protein_g),
                     "avg_energy_kcal": float(avg_energy_kcal)}
             d["notes"].append("摄入均值来自调用方直接提供。")
-        elif include_intake and patient_id:
+        elif _to_bool(include_intake) and patient_id:
             # 十三审（2026-08-24）：查库补全分支必须优先于"孤立参数告警"——此前 elif
             # 顺序把 `^` 短路放在前面，当调用方既孤立传了 avg_protein_g 又给定了
             # include_intake+patient_id 时，直接命中 `^` 分支告警并跳过查库，明明数据库
@@ -563,7 +567,8 @@ def comprehensive_nutrition_assessment_tool(
                 growth_status=growth_status, height_cm=float(height_cm or 0.0),
                 is_edema=_to_bool(is_edema),
                 pd_glucose_kcal_per_day=pd_kcal,  # BUG-08：透传腹透扣减
-                albumin_g_L=serum_albumin_g_l,  # BUG-61：白蛋白参与摄入路径 PEW 筛查
+                albumin_g_L=(float(serum_albumin_g_l)
+                             if serum_albumin_g_l is not None else None),  # BUG-61：白蛋白参与摄入路径 PEW 筛查
                 # 八审（2026-08-16）：M1 修复不完整——DAG 此前只给 calc_prnt_targets
                 # 透传 height_age_years/high_urea_persistent（:403-404），摄入评估段漏传，
                 # 默认 high_urea_persistent=False 重算目标 → 同一患儿 PRNT 区块（蛋白下限
@@ -586,7 +591,9 @@ def comprehensive_nutrition_assessment_tool(
             else:
                 pew = assess_pew_risk(
                     float(diet.get("avg_protein_g", 0.0)), float(diet.get("avg_energy_kcal", 0.0)),
-                    float(target_p), float(target_e), albumin_g_L=serum_albumin_g_l,
+                    float(target_p), float(target_e),
+                    albumin_g_L=(float(serum_albumin_g_l)
+                                 if serum_albumin_g_l is not None else None),
                     # BUG-42：PEW 蛋白下限用 PRNT 官方 SDI 下限（floor_g_per_day），
                     # 不用"目标×85%"近似（婴儿段会把 1.52-2.1 g/kg 的合规摄入误判为低于安全下限）
                     floor_protein_g=float(prnt["data"]["protein"]["floor_g_per_day"]),
