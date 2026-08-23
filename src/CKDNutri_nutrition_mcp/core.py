@@ -450,7 +450,9 @@ def ideal_body_weight_kg(age_years: float, sex: str, height_cm: float) -> float 
     BMI_P50 表仅覆盖 2–18 岁；age_years < 2 时自动夹取 2 岁基准，婴儿体成分与学龄儿童
     差异较大，推算值仅供参考。
     """
-    if height_cm <= 0:
+    if not math.isfinite(height_cm) or height_cm <= 0:
+        # 十审（2026-08-24）：NaN 防御——Python 中 `float("nan") <= 0` 恒为 False，
+        # 会穿透并返回 NaN；作为模块级导出函数须自身 fail-soft（调用方未必先校验）。
         return None
     years = sorted(BMI_P50)
     age = min(max(age_years, years[0]), years[-1])
@@ -711,10 +713,19 @@ def calc_prnt_targets(
                 f"素食模式蛋白需求×{veg}（蛋奶素 1.2 / 纯素 1.3，因植物蛋白生物利用度低）。"
             )
         if is_edema:
-            warnings.append(
-                f"已启用水肿校正：以理想体重 {_round(eff_weight,1)}kg（BMI-P50）替代实际体重 "
-                f"{_round(weight_kg,1)}kg 开处方。"
-            )
+            # 十审（2026-08-24）：warnings 文案须与实际校正状态绑定——is_edema=True 但
+            # 缺身高时 ideal_body_weight_kg 返回 None，weight_basis 记为"实际体重（⚠ 水肿未校正...）"，
+            # 此前无条件输出"已启用水肿校正"会误导医生以为已扣水重而开过高处方。
+            if "水肿校正理想体重" in weight_basis:
+                warnings.append(
+                    f"已启用水肿校正：以理想体重 {_round(eff_weight,1)}kg（BMI-P50）替代实际体重 "
+                    f"{_round(weight_kg,1)}kg 开处方。"
+                )
+            else:
+                warnings.append(
+                    f"已启用水肿校正，但缺少有效身高数据无法计算 BMI-P50 理想体重，"
+                    f"仍按实际体重 {_round(weight_kg,1)}kg 开处方，请补齐身高后复核。"
+                )
         if pd_glucose_kcal_per_day is not None and pd_glucose_kcal_per_day > 0:
             warnings.append(
                 f"已扣减腹透葡萄糖供能 {_round(pd_deduction,1)} kcal/day，避免能量超额。"
@@ -1814,6 +1825,10 @@ def calc_growth_zscore(age_years: float, sex: str,
         raise ValueError("weight_kg 必须 > 0")
     if bmi is not None and bmi <= 0:
         raise ValueError("bmi 必须 > 0")
+    if bmi is not None and bmi > 80:
+        # 十审（2026-08-24）：生理上界——儿童/青少年 BMI 极罕见 >60~80 kg/m²，
+        # 上游误填（如把身高数值当 BMI）会被 _z_from_bands 线性外推成荒谬超高 Z 分。
+        raise ValueError(f"bmi {bmi} 超出生理学合理范围（≤80 kg/m²），请核查数据")
     # BUG-63（2026-08-12）：生理学合理上界——过高/过重（录入错误）会算出荒谬 Z 分
     # （如 300cm → Z≈+26 判"上"）；**不做下限收紧**（早产儿 40-45cm 合法，下限保持 >0）。
     if height_cm is not None and height_cm > 250:
@@ -1995,6 +2010,16 @@ def calc_growth_zscore(age_years: float, sex: str,
             "能量按 SDI 上限（促生长）；请结合临床评估。")
     elif baz_z is not None and baz_z >= 1:
         growth_status = "overweight"        # BAZ≥1 → 超重/肥胖，能量向下调整
+    elif whz_z is not None and whz_z > 2:
+        # 十审（2026-08-24）：补齐 WHZ 超重判定——0-2 岁（身长别体重）及 2-7 岁（身高别体重）
+        # 患儿 WHZ 是首选指标（BAZ 敏感度弱）。此前决策链仅判 whz_z<-2（消瘦→failure），
+        # 漏判 whz_z>2（超重），导致 d["whz"]["wasting"]="超重" 但 growth_status="normal"
+        # 自相矛盾，超重婴儿能量未按 PRNT 向下调整。WHZ 仅在 <7 岁且身高落表域时非空
+        # （age_months<84 + 表域 45-130cm），≥7 岁自动不触发，不跨年龄误判。
+        growth_status = "overweight"
+        warnings.append(
+            f"WHZ {whz_z:.2f} > +2（身长/身高别体重超重，WS/T 423-2022），判超重；"
+            "能量推荐向下调整。")
     elif baz_z is None and bmi is not None and age_years >= 6.0:
         # M-3（2026-08-15）+ C-03（2026-08-23）：BAZ 参考不可用时用 WS/T 586-2018
         # 年龄×性别别 BMI 超重界值判超重（_ws586 覆盖 6.0-18.0 岁）。
