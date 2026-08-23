@@ -17,6 +17,12 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# 与项目其他测试文件（regression_ns*/golden_dataset/child_foodlog）一致的测试环境约定：
+# 显式声明测试环境 + 注入合法测试 caller，否则底层 get_caller() 会抛 CallerUnknown
+# （P0-1 身份校验 fail-closed）。setdefault 不覆盖 CI 已注入的值。
+os.environ.setdefault("A207_ENV", "test")
+os.environ.setdefault("A207_CALLER", "doctor_assistant")
+
 from CKDNutri_nutrition_mcp.measures import parse_portion
 from CKDNutri_nutrition_mcp.targets import calc_pd_glucose_absorption
 from CKDNutri_nutrition_mcp.pharma import _resolve_drug
