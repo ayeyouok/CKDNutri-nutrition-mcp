@@ -315,14 +315,25 @@ def generate_meal_plan(
     #   按 40% 蛋白配额折算会爆到 1500g+/天、能量超目标 130%+，钳制并提示蛋白缺口由蛋白源补足。
     _PROT_MAX_G = 400.0  # P0-2（2026-08-18）：蛋白源每日克数上限（同口径，防低蛋白"蛋白源"爆量）
 
+    # P3（2026-08-23 审查）：低蛋白淀粉候选池（protein<1.5g/100g：麦淀粉/米粉/粉丝/
+    # 藕粉等，食物库已含 24 种）。限蛋白高压场景（能量/蛋白比 > 60）每一天都必须选
+    # 低蛋白主食补能，否则轮换选中普通米/面（7~12g 蛋白/100g）按 40% 蛋白配额仅数十克、
+    # 全天能量缺口 1000+ kcal。现把轮换池在循环内动态切换为该低蛋白池，确保高比场景
+    # 天天低蛋白补能；池为空（食物库缺）则回退全量池，不丢健壮性。
+    _LOW_PROTEIN_STAPLES = [f for f in staples if f["protein_per_100g"] < 1.5]
+    _HIGH_E_RATIO = target_energy_kcal / max(target_protein_g, 1.0) > 60
+
     for d in range(days):
         # N-S6：主食/蛋白源按「预计 K+P 不超限」顺延选择——pool 已按低钾磷排序，
         # 但 8 个主食含土豆/红薯/麦片等高钾品种，7 天轮换必碰上；从当前位置起
         # 向后找第一个预计不超限的品种，找不到才用当前位置（兜底）。
+        # 高比场景切换为低蛋白池（见上方 _LOW_PROTEIN_STAPLES 说明）。
+        _active_staple_pool = (_LOW_PROTEIN_STAPLES if (_HIGH_E_RATIO and _LOW_PROTEIN_STAPLES)
+                               else staple_pool)
         prot_staple_quota = target_protein_g * 0.40
         staple = None
-        for offset in range(len(staple_pool)):
-            cand = staple_pool[(d + offset) % len(staple_pool)]
+        for offset in range(len(_active_staple_pool)):
+            cand = _active_staple_pool[(d + offset) % len(_active_staple_pool)]
             sg = max(10, round(prot_staple_quota / max(cand["protein_per_100g"], 0.1) * 100))
             # 审查（2026-08-19，BUG-2）：K+P 联合筛选由"mg 直接相加"改为**占用率**
             # ——100mg 钾与 100mg 磷不是同一限制单位（如目标钾 2000/磷 800，相加

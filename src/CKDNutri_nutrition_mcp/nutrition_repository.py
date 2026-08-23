@@ -189,12 +189,19 @@ class LocalJsonRepository:
     """
 
     # N4：本地 JSON 后端 RMW 写锁（进程内串行化 load→filter→atomic write）
-    _LOCAL_JSON_LOCK = threading.Lock()
+    # P3（2026-08-23 审查）：threading.Lock → RLock——读方法（load_diary/load_pew/
+    # _load_child_foodlog_file）此前全程无锁，多线程下与写线程的 atomic_write_json
+    # （写临时+os.replace）在 Windows/共享卷可能产生瞬时读空或 PermissionError。
+    # 升级 RLock 并在读流程加锁；RLock 可重入，save_* 内部调用 load_* 不会自死锁。
+    _LOCAL_JSON_LOCK = threading.RLock()
 
     # ---- 饮食日记 ----
     def load_diary(self) -> dict[str, Any]:
-        return _read_json_fail_closed(_state_path(DIARY_STORE_FILENAME),
-                                      "日记库", {"entries": []})
+        # P3（2026-08-23 审查）：读加锁，与写线程 atomic_write_json 互斥（防 rename
+        # 瞬间读空/PermissionError）。RLock 可重入，save_patient_diary 内调本方法安全。
+        with self._LOCAL_JSON_LOCK:
+            return _read_json_fail_closed(_state_path(DIARY_STORE_FILENAME),
+                                          "日记库", {"entries": []})
 
     def save_diary(self, store: dict[str, Any]) -> None:
         atomic_write_json(_state_path(DIARY_STORE_FILENAME), store)
@@ -217,8 +224,10 @@ class LocalJsonRepository:
 
     # ---- PEW 历史 ----
     def load_pew(self) -> dict[str, Any]:
-        return _read_json_fail_closed(_state_path(PEW_STORE_FILENAME),
-                                      "PEW 历史库", {})
+        # P3（2026-08-23 审查）：读加锁（同 load_diary）
+        with self._LOCAL_JSON_LOCK:
+            return _read_json_fail_closed(_state_path(PEW_STORE_FILENAME),
+                                          "PEW 历史库", {})
 
     def save_pew(self, store: dict[str, Any]) -> None:
         atomic_write_json(_state_path(PEW_STORE_FILENAME), store)
@@ -239,8 +248,10 @@ class LocalJsonRepository:
 
     # ---- 孩子自报饮食（child_foodlog，2026-08-21）----
     def _load_child_foodlog_file(self) -> dict[str, Any]:
-        return _read_json_fail_closed(_state_path(CHILD_FOODLOG_STORE_FILENAME),
-                                      "孩子自报饮食库", {})
+        # P3（2026-08-23 审查）：读加锁（同 load_diary）
+        with self._LOCAL_JSON_LOCK:
+            return _read_json_fail_closed(_state_path(CHILD_FOODLOG_STORE_FILENAME),
+                                          "孩子自报饮食库", {})
 
     def load_patient_child_foodlog(self, patient_id: str) -> dict[str, Any]:
         store = self._load_child_foodlog_file()

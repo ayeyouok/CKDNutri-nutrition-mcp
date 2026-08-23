@@ -74,9 +74,14 @@ PNPR_LEVELS = ((12.0, "preferred", "优选"), (16.0, "acceptable", "可接受"),
                (float("inf"), "caution", "慎选"))
 
 # --- 烹调处理对电解质的保留系数 ---------------------------------------------
+# P3（2026-08-23 审查）：COOKING_LOSS 的 factor 实为**保留率（retention rate）**而非
+# 损失率——如 blanch 的 potassium_mg=0.50 表示"焯水后钾保留 50%"（丢 50%），下游
+# scale_nutrients 用 raw * factor 折算。命名易望文生义写成 raw * (1 - factor) 导致逻辑
+# 颠倒，特显式标注：factor = 保留率，直接使用（勿 1−factor）。
 COOKING_LOSS = {
     "raw": {"factor": {"potassium_mg": 1.0, "phosphorus_mg": 1.0, "sodium_mg": 1.0},
             "label": "不做处理（生重/原值）"},
+    # factor = retention_rate（保留率，直接使用，勿写成 1−factor）
     "blanch": {"factor": {"potassium_mg": 0.50, "phosphorus_mg": 0.80, "sodium_mg": 0.90},
                "label": "焯水后弃汤（适用叶菜）"},
     "boil_discard": {"factor": {"potassium_mg": 0.40, "phosphorus_mg": 0.75, "sodium_mg": 0.85},

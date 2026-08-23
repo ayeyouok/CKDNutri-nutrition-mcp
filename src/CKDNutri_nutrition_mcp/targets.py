@@ -91,7 +91,11 @@ def calc_pd_glucose_absorption(dialysate_glucose_g: float, dwell_hours: float,
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"未知 transport_type={transport!r}，合法值：{'/'.join(PD_TRANSPORT_FACTOR)}"}
     warnings: list[str] = []
-    fraction = min(max(_absorption_fraction(float(dwell_hours)) * factor, 0.20), 0.90)
+    # P3（2026-08-23 审查）：下界截断由 0.20 改为 0.0——PD_ABSORB_ANCHORS 已含
+    # (0.0, 0.0) 零点锚点用于 APD 短留腹（18~71min）平滑插值。原 max(...,0.20) 把
+    # dwell<0.67h 的吸收率恒拉高到 20%，零点锚点实质失效，短留腹患儿非膳食糖倒灌
+    # 能量被虚高估算 100%~200%。现允许从 0 开始插值（上界仍封顶 0.90）。
+    fraction = min(max(_absorption_fraction(float(dwell_hours)) * factor, 0.0), 0.90)
     # 审查（2026-08-19，BUG-3）：exchanges_per_day 是"次数"，必须正整数——
     # 旧 `int(exchanges_per_day or 1)` 把 1.9 → 1（静默截断，真实输入被算错）。
     # bool 是 int 子类须排除；float 非整数值显式拒绝（不静默截断）。

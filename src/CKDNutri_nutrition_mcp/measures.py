@@ -36,12 +36,15 @@ _NUM_RE = re.compile(r"^(\d+(?:\.\d+)?)")
 
 
 def _cn_numeral(s: str) -> float | None:
-    """把中文数字前缀（1-999）解析为数值；不是数字前缀返回 None。
+    """把中文数字前缀（1-9999）解析为数值；不是数字前缀返回 None。
 
     P1-3（2026-08-18）：复合中文数词此前只取首字——"二十个"被解析成 2 个（10 倍
     低估）、"十二碗"解析成 1 碗。现支持 十/十一~十九/二十~九十九 组合。
     P1-7（2026-08-18 四审）：补"百"（一百/两百/一百零五/一百二十）——"一百克"
     此前解析成 1（"百"不识别），"两百克"静默回退 1 份（2 倍低估）。
+    P3（2026-08-23 审查）：补"千"位复合——"一千"/"一千五百"/"两千"此前遇"千"
+    提前退出返 1.0，导致 "一千五百克" 被断词为 quantity=1、rest="千五百克" 无法
+    识别 → 回落 1 份（100g），实际 1500g 被低估 15 倍。现支持 千/几千几百几十。
     """
     digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
               "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -55,6 +58,19 @@ def _cn_numeral(s: str) -> float | None:
     if s[0] in digits:
         if len(s) == 1:
             return float(digits[s[0]])
+        if s[1] == "千":
+            # P3（2026-08-23 审查）：千复合——"一千"/"两千"/"一千五百"/"一千二百三十"。
+            # 此前遇"千"提前退出返 1.0（如"一千五百克"→quantity=1、rest="千五百克"
+            # 无法识别 → 回落 1 份 100g，实际 1500g 被低估 15 倍）。
+            base = digits[s[0]] * 1000
+            rest = s[2:]
+            if not rest:
+                return float(base)
+            # 千后直接跟百部（"一千五百"）/ 十部（"一千二十"）/ 个位（口语"一千五"）
+            rest_val = _cn_numeral(rest)
+            if rest_val is not None:
+                return float(base + rest_val)
+            return float(base)
         if s[1] == "百":
             # 一百 / 两百 / 一百零五 / 一百二十 / 一百二十三
             base = digits[s[0]] * 100
@@ -90,7 +106,7 @@ def _cn_numeral(s: str) -> float | None:
     return None
 
 
-_CN_NUMERAL_CHARS = frozenset("零一二两三四五六七八九十百")
+_CN_NUMERAL_CHARS = frozenset("零一二两三四五六七八九十百千")
 
 
 def _parse_quantity(text: str) -> tuple[float, str]:

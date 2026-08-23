@@ -230,8 +230,14 @@ def _resolve_drug(drug: str) -> tuple[str, dict[str, Any]] | None:
     for name, info in DRUGS.items():
         if text == name.lower():
             return name, info
+    # 2. 完全匹配（规范别名，过滤歧义通用词）——P3（2026-08-23 审查）：原实现未过滤
+    #    FUZZY_EXCLUDE_ALIASES，导致"激素"/"普利"/"沙坦"/"铁剂"等泛指类别词被其所在
+    #    条目的别名精确命中（如"激素"→泼尼松、"普利"→依那普利、"沙坦"→氯沙坦），
+    #    单向遮蔽同类其他药物，与上方注释承诺的 fail-closed 澄清相悖。现与模糊阶段
+    #    同口径过滤歧义词，仅精确全名（如"泼尼松""依那普利"）命中，类别词返回 None。
     for name, info in DRUGS.items():
-        keys = [name.lower()] + [alias.lower() for alias in info["aliases"]]
+        keys = [alias.lower() for alias in info["aliases"]
+                if alias.lower() not in FUZZY_EXCLUDE_ALIASES]
         if text in keys:
             return name, info
     # 2. 模糊匹配（仅当输入长度 >= 2 且非歧义短别名，避免单个字符如 "d"/"钙" 的
