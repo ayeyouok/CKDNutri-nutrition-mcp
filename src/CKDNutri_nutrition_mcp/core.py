@@ -290,6 +290,43 @@ def _ws586_overweight_threshold(age_years: float, sex: str) -> float | None:
     return _WS586_OVERWEIGHT.get((band, sex))
 
 
+# WS/T 456-2014《学龄儿童青少年营养不良筛查》表 B.1 消瘦筛查界值（半岁档，kg/m²）
+# 取值为各档「轻度消瘦上限」——BMI ≤ 该值即判消瘦（含轻度+中重度）。
+# 来源：国家卫健委 WS/T 456-2014 附录 B（2020 复审继续有效），多源 PDF 文本一致核对。
+_WS456_WASTING: dict[tuple[float, str], float] = {
+    (6.0, "M"): 13.4, (6.5, "M"): 13.8, (7.0, "M"): 13.9, (7.5, "M"): 13.9,
+    (8.0, "M"): 14.0, (8.5, "M"): 14.0, (9.0, "M"): 14.1, (9.5, "M"): 14.2,
+    (10.0, "M"): 14.4, (10.5, "M"): 14.6, (11.0, "M"): 14.9, (11.5, "M"): 15.1,
+    (12.0, "M"): 15.4, (12.5, "M"): 15.6, (13.0, "M"): 15.9, (13.5, "M"): 16.1,
+    (14.0, "M"): 16.4, (14.5, "M"): 16.7, (15.0, "M"): 16.9, (15.5, "M"): 17.0,
+    (16.0, "M"): 17.3, (16.5, "M"): 17.5, (17.0, "M"): 17.7, (17.5, "M"): 17.9,
+    (18.0, "M"): 17.9,
+    (6.0, "F"): 13.1, (6.5, "F"): 13.3, (7.0, "F"): 13.4, (7.5, "F"): 13.5,
+    (8.0, "F"): 13.6, (8.5, "F"): 13.7, (9.0, "F"): 13.8, (9.5, "F"): 13.9,
+    (10.0, "F"): 14.0, (10.5, "F"): 14.1, (11.0, "F"): 14.3, (11.5, "F"): 14.5,
+    (12.0, "F"): 14.7, (12.5, "F"): 14.9, (13.0, "F"): 15.3, (13.5, "F"): 15.6,
+    (14.0, "F"): 16.4, (14.5, "F"): 16.7, (15.0, "F"): 16.6, (15.5, "F"): 16.8,
+    (16.0, "F"): 17.0, (16.5, "F"): 17.5, (17.0, "F"): 17.7, (17.5, "F"): 17.9,
+    (18.0, "F"): 17.9,
+}
+
+
+def _ws456_wasting_threshold(age_years: float, sex: str) -> float | None:
+    """WS/T 456-2014 表 B.1 消瘦筛查界值（半岁档取档，6.0-18.0 岁；超出返回 None）。
+
+    返回「轻度消瘦上限」——BMI ≤ 该值即判消瘦（与 HAZ/WAZ/BAZ<-2 同口径，
+    驱动 PRNT 能量取 SDI 上限促追赶生长）。BAZ 参考不可用（7-18 岁无连续表）
+    时作为 BMI 绝对值兜底筛查，消除「严重消瘦被判 normal」的 P0 盲区。
+    """
+    if age_years < 6.0 or age_years > 18.0:
+        return None
+    band = int(age_years * 2) / 2.0          # 与 _ws586 同口径：实足年龄向下取半岁档
+    band = max(band, 6.0)
+    band = min(band, 18.0)
+    return _WS456_WASTING.get((band, sex))
+
+
+
 # PRNT 2020 SDI 表
 # 每条：(age_min, age_max, 标签, 能量_M(lo,hi), 能量_F(lo,hi), 蛋白(lo,hi), 每日蛋白总量)
 #   婴儿段无性别拆分 → M/F 同值；蛋白总量对 15-17 岁按性别拆分（dict）。
@@ -1003,9 +1040,14 @@ def _screen_pew(avg_p: float, avg_e: float, floor_p: float, target_e: float,
 
     if protein_deficit and energy_deficit:
         risk = "high"
+        # 七审（2026-08-23）：high 分支动态拼接 low_albumin 说明——此前 rationale 写死，
+        # 危重低白蛋白患儿（如 20 g/L，score=100）的高风险报告完全丢失白蛋白报警，
+        # 生化解释链断裂。补 alb_extra 后医生可在 high 报告中直接看到低白蛋白信号。
+        alb_extra = (f"；血清白蛋白 {eff_alb} g/L 显著偏低（<38{unit_note}），"
+                     "加剧蛋白质-能量消耗" if low_albumin else "")
         # BUG-63（2026-08-12）：明确标注"简化筛查"——避免把摄入不足直接读成 PEW 确诊，
         # 防止对短期厌食患儿过度干预（管饲等）；确诊需结合人体测量与生化指标。
-        rationale = ("蛋白质低于安全下限且能量摄入 <80% 目标，提示 PEW 高风险。"
+        rationale = (f"蛋白质低于安全下限且能量摄入 <80% 目标{alb_extra}，提示 PEW 高风险。"
                      "（本结果为基于摄入/白蛋白的简化筛查；确诊需结合体重丢失、"
                      "中臂肌围等人体测量与生化指标）")
     elif protein_deficit or energy_deficit or low_albumin:
@@ -1173,22 +1215,23 @@ def record_child_food(patient_id: str,
             if awarded:
                 row["daily_points"] = int(row.get("daily_points", 0) or 0) + 1
                 row["total_points"] = int(row.get("total_points", 0) or 0) + 1
-            # 2026-08-22（用户反馈"同一天记录叠加/重复"）：child_foodlog 此前**无条件追加**
-            # （`existing + new`，无幂等）——LLM 弱网重试/同一顿重发/同日多次补记会把
-            # 同 (date,meal,food) 条目重复落库（实测同早餐出现"鸡蛋 20 个 + 鸡蛋 2 个"、
-            # "米饭 20 碗 + 米饭 1 碗"）。对齐 upsert_food_diary 的 S-3 内容幂等语义：
-            # 同 date+meal+food 已存在 → 用本次值**替换**（后写者意图），不同键才追加。
+            # 2026-08-22（用户反馈"同一天记录叠加/重复"）：child_foodlog 合并语义——
+            # 单次调用内同 (date,meal,food) 同名条目**收敛为 1 条**（孩子弱网重试/误点两次
+            # "早餐 鸡蛋 1个" 不表示吃了 2 个，应去重）；跨调用同键旧条目被本次值**覆盖**
+            # （重试残留收敛）。此语义经 test_review_20260823j P1-1 固化，七审（2026-08-23）
+            # 复核：child 自报同量同名 = 重复提交，收敛为 1 正确（区别于 food_diary 家长
+            # 记"一餐 2 份鸡蛋[100g,100g]"为不同 amount 表示真实多份，故 upsert 全保留）。
             def _content_key(e):
                 return (e.get("date"), e.get("meal") or "", e.get("food") or "")
             newest = {}
-            for _e in entries:                 # 本次条目（date 已归一）
+            for _e in entries:                 # 本次条目（date 已归一），同键收敛为 1
                 newest[_content_key(_e)] = _e
             _merged: list[dict] = []
             _seen: set = set()
             for _e in row.get("entries", []):
                 _k = _content_key(_e)
                 if _k in newest:
-                    if _k not in _seen:        # 同键旧条目被本次值替换（收敛重复）
+                    if _k not in _seen:        # 跨调用同键旧条目被本次值覆盖（收敛重试）
                         _merged.append(newest[_k])
                         _seen.add(_k)
                 else:
@@ -1934,28 +1977,35 @@ def calc_growth_zscore(age_years: float, sex: str,
         # WS/T 423 附录 B 止于 81 月（BAZ 无）、WS/T 586 起于 6.0 岁本可用，却被
         # age_months>=84 拦截 → BMI 30 也判 normal。放宽为 age_years>=6.0 覆盖该窗口
         # （72-81 月 baz_z 有值不落此分支，无影响）。
+        # P0（2026-08-23 七审）：BAZ 缺失且 BMI 极低——此前一律判 normal（仅 bmi<14
+        # 时给 warning 但不改 growth_status），导致 12 岁 BMI 12.44 消瘦患儿能量按 SDI
+        # 中点而非上限，处方系统性低估 ~25% 且下游被掩盖为"摄入达标"。引入 WS/T 456-2014
+        # 学龄消瘦界值：BMI ≤ 界值（轻度消瘦上限）判 failure（与 HAZ/WAZ/BAZ<-2 同口径，
+        # 能量取 SDI 上限促追赶生长）。7-8 岁 BMI 14 高于对应界值（13.9/13.6）不误伤。
         _ov_thr = _ws586_overweight_threshold(age_years, sex)
+        _wasting_thr = _ws456_wasting_threshold(age_years, sex)
         if _ov_thr is not None and bmi >= _ov_thr:
             growth_status = "overweight"
             warnings.append(
                 f"BAZ 参考不可用，BMI {bmi:.1f} ≥ WS/T 586-2018 {age_years:.0f} 岁"
                 f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}，判超重；"
                 "建议结合腰围/体脂综合评估。")
+        elif _wasting_thr is not None and bmi < _wasting_thr:
+            growth_status = "failure"
+            warnings.append(
+                f"BAZ 参考不可用，BMI {bmi:.1f} < WS/T 456-2014 {age_years:.0f} 岁"
+                f"{'男' if sex == 'M' else '女'}消瘦界值 {_wasting_thr:.1f}，判生长不良/消瘦，"
+                "能量推荐按 SDI 上限以促进追赶生长；请结合临床与中臂肌围评估。")
         elif _ov_thr is not None:
-            # BUG-63（2026-08-12）：BAZ 缺失且 BMI 未达超重界值——补消瘦/极低 BMI
-            # 粗筛提示，杜绝"严重消瘦被判 normal 且无警告"的漏诊。**不改 growth_status**
-            # （7-8 岁 BMI 14 属正常范围，扁平阈值直接调能量会误伤；仅提示人工评估）。
-            if bmi < 14:
-                warnings.append(
-                    f"BAZ 参考不可用，BMI {bmi:.1f} 极低（<14），提示消瘦/营养不良可能，"
-                    "请立即结合中臂肌围等人体测量人工评估。")
-            else:
-                _thr_txt = (f"（WS/T 586-2018 {age_years:.0f} 岁"
-                            f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}）"
-                            if _ov_thr is not None else "（无界值）")
-                warnings.append(
-                    f"BAZ 参考不可用，BMI {bmi:.1f} 未达超重界值{_thr_txt}；"
-                    "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
+            # BUG-63（2026-08-12）：BAZ 缺失且 BMI 未达超重/未达消瘦界值——补提示，
+            # 仅人工评估提示，不改 growth_status（正常区间）。
+            _thr_txt = (f"（WS/T 586-2018 {age_years:.0f} 岁"
+                        f"{'男' if sex == 'M' else '女'}超重界值 {_ov_thr:.1f}；"
+                        f"WS/T 456-2014 消瘦界值 {_wasting_thr:.1f}）"
+                        if _wasting_thr is not None else "（无界值）")
+            warnings.append(
+                f"BAZ 参考不可用，BMI {bmi:.1f} 处于超重与消瘦界值之间{_thr_txt}；"
+                "消瘦/营养不足判定请结合中臂肌围等人体测量人工评估。")
             growth_status = "normal"
         else:
             # P2-6（2026-08-18）：≥18 岁 WS/T 586 超窗（_ws586 上限 18.0）——此前
