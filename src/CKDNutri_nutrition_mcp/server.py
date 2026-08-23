@@ -52,16 +52,47 @@ def _invalid(exc):
     return translate_error(exc, domain="P2", logger=logger)
 
 
+def _to_bool(val: Any, default: bool = False) -> bool:
+    """严格布尔解析，防御 str('false')/'0' 在 Python 中 bool()==True 的陷阱。
+
+    十三审（2026-08-24）：此前 tool 层 is_edema=bool(is_edema) 对 LLM/前端传入的
+    字符串 'false'/'0' 会得到 True（bool('false')==True），导致无水肿患儿被误按
+    BMI-P50 干体重（dry weight）开出错误能量处方。此处显式白名单解析。
+    """
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "1", "yes", "y"):
+            return True
+        if s in ("false", "0", "no", "n", ""):
+            return False
+    if isinstance(val, (int, float)):
+        return val != 0
+    return default
+
+
 def _stage_int(value: Any, default: int = 1) -> int:
-    """把 '3' / 'G3a' / '3a' / 3 一律归一为 int 分期，供 core 的数值比较使用。"""
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
+    """把 '3' / 'G3a' / '3a' / 3 一律归一为 int 分期，供 core 的数值比较使用。
+
+    十三审（2026-08-24）：必须先排除 bool——Python 中 bool 是 int 的子类，
+    isinstance(True, int) 恒为 True，若 LLM 误传 ckd_stage=True/False，旧实现会
+    返回 1/0（0 为非法分期）而非回落 default。bool 一律按 default 处理。
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        val = int(value)
+        return val if 1 <= val <= 5 else default
     if not value:
         return default
     digits = "".join(ch for ch in str(value) if ch.isdigit())
-    return int(digits[0]) if digits else default
+    if digits:
+        val = int(digits[0])
+        return val if 1 <= val <= 5 else default
+    return default
 
 
 def _unwrap_plan(plan: Any) -> Any:
@@ -274,7 +305,7 @@ def calc_prnt_targets_tool(
             age_years=float(age_years), sex=sex, weight_kg=float(weight_kg),
             height_cm=float(height_cm or 0.0), ckd_stage=_stage_int(ckd_stage),
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
-            growth_status=growth_status, is_edema=bool(is_edema),
+            growth_status=growth_status, is_edema=_to_bool(is_edema),
             pd_glucose_kcal_per_day=pd_glucose_kcal_per_day,
             height_age_years=float(height_age_years) if height_age_years is not None else None,
             # 原样传递，由 core 层做严格 bool 校验（bool("false")==True 陷阱；pydantic 已先行解析）
@@ -408,9 +439,18 @@ def comprehensive_nutrition_assessment_tool(
         normalized_dialysis = DIALYSIS_ALIAS.get(
             str(dialysis_mode or "").strip().lower(), "none")
         if pd_kcal is None and normalized_dialysis == "peritoneal":
-            if pd_dialysate_glucose_g is None and (
-                    pd_dialysate_volume_ml is None or pd_glucose_conc_pct is None):
-                pd_notes.append("腹透患儿未提供透析液糖量/留腹时长，能量目标未扣减葡萄糖吸收。")
+            # 十三审（2026-08-24）：留腹时长与透析液糖量/浓度容量缺一不可——此前漏判
+            # pd_dwell_hours is None，医生只传 volume+conc 却漏传 dwell_hours 时走入 else
+            # 分支强制 float(pd_dwell_hours or 0.0)=0 小时，calc 对 0h 返回吸收 0kcal 且
+            # ok:True，制造"已扣减腹透吸收"的假象，掩盖漏填并致膳食能量目标偏高。此处
+            # 与糖量信息一并判缺，缺任一则明确提示未扣减，绝不静默算 0。
+            has_glucose_info = (pd_dialysate_glucose_g is not None) or (
+                pd_dialysate_volume_ml is not None and pd_glucose_conc_pct is not None
+            )
+            if not has_glucose_info or pd_dwell_hours is None:
+                pd_notes.append(
+                    "腹透患儿透析处方参数不全（需同时提供留腹时长及透析液糖量/浓度容量），"
+                    "能量目标未扣减葡萄糖吸收。")
             else:
                 glucose_g = pd_dialysate_glucose_g
                 if glucose_g is None:
@@ -448,10 +488,10 @@ def comprehensive_nutrition_assessment_tool(
             age_years=float(age_years), sex=sex, weight_kg=float(weight_kg),
             height_cm=float(height_cm or 0.0), ckd_stage=stage,
             dialysis_mode=dialysis_mode, vegetarian_mode=vegetarian_mode,
-            growth_status=growth_status, is_edema=bool(is_edema),
+            growth_status=growth_status, is_edema=_to_bool(is_edema),
             pd_glucose_kcal_per_day=pd_kcal,
             height_age_years=float(height_age_years) if height_age_years is not None else None,
-            high_urea_persistent=high_urea_persistent,
+            high_urea_persistent=_to_bool(high_urea_persistent),
         )
         if not prnt.get("ok"):
             return prnt
@@ -477,24 +517,27 @@ def comprehensive_nutrition_assessment_tool(
             diet = {"avg_protein_g": float(avg_protein_g),
                     "avg_energy_kcal": float(avg_energy_kcal)}
             d["notes"].append("摄入均值来自调用方直接提供。")
-        elif ((avg_protein_g is not None) ^ (avg_energy_kcal is not None)):
-            # 八审（2026-08-24）：部分参数孤立传入——医生少传一个字段却静默跳过评估，
-            # 易误以为"系统不支持或患儿无异常"。显式提示需同时提供两者。
-            d["notes"].append(
-                "⚠ 仅提供了部分摄入数据（须同时提供 avg_protein_g 与 avg_energy_kcal "
-                "才能进行摄入与 PEW 评估），跳过摄入与 PEW 评估。")
         elif include_intake and patient_id:
+            # 十三审（2026-08-24）：查库补全分支必须优先于"孤立参数告警"——此前 elif
+            # 顺序把 `^` 短路放在前面，当调用方既孤立传了 avg_protein_g 又给定了
+            # include_intake+patient_id 时，直接命中 `^` 分支告警并跳过查库，明明数据库
+            # 有完整日记却被残缺入参短路掉整体评估。此处把"可查库补全"前置。
+            summary = get_food_diary_summary(patient_id)
             # BUG-29 说明（2026-08-12）：DAG 仅临床角色可调（入口 enforce_nutrition_tool 已拦家长），
             # 故此处 get_food_diary_summary 以 doctor 身份调用，_guard_guardian 对非 parent 直接放行，
             # 无需（也不应）透传 guardian_token——若未来 DAG 入口放开给受限角色，此处须补绑定校验。
-            summary = get_food_diary_summary(patient_id)
             # 六审修复（2026-08-23）：区分失败原因——此前 summary.get("ok") 为 False
             # （含 INVALID_INPUT 非法 patient_id、权限拒绝）时，dd 为 None 走 else 被
             # 静默当"暂无日记"，误导医生以为患儿未记日记、掩盖录入错误。
             if not summary.get("ok"):
+                # 十三审（2026-08-24）R4 加固：ok:True 响应中不再内联底层 detail 原文
+                # （可能含业务拒绝原因等业务文案，虽非 OTS 内部信息，但保持成功语义中性）。
+                # 失败原因仅记服务端日志，对外给中性提示。
+                logger.warning(
+                    "comprehensive_nutrition_assessment 获取患者 %s 饮食日记失败: %s",
+                    patient_id, summary.get("detail", "未知原因"))
                 d["notes"].append(
-                    f"获取患者 {patient_id} 饮食日记失败："
-                    f"{summary.get('detail', 'ID 非法或无权限')}，跳过摄入与 PEW 评估。")
+                    f"获取患者 {patient_id} 饮食日记未成功，跳过摄入与 PEW 评估。")
             else:
                 dd = (summary.get("data") or {}).get("diet_diary_3d")
                 if dd:
@@ -502,6 +545,13 @@ def comprehensive_nutrition_assessment_tool(
                     d["notes"].append(f"摄入均值来自饮食日记最近 3 日（patient_id={patient_id}）。")
                 else:
                     d["notes"].append(f"患者 {patient_id} 暂无饮食日记，跳过摄入与 PEW 评估。")
+        elif ((avg_protein_g is not None) ^ (avg_energy_kcal is not None)):
+            # 十三审（2026-08-24）：孤立参数告警降级为"末位分支"——仅在既无完整显式入参、
+            # 又未请求查库时才触发（调用方确实只丢了一个字段且没开 include_intake）。
+            # 此前该 `^` 分支排在 include_intake 之前，会短路掉本可查库补全的评估。
+            d["notes"].append(
+                "⚠ 仅提供了部分摄入数据（须同时提供 avg_protein_g 与 avg_energy_kcal "
+                "才能进行摄入与 PEW 评估），跳过摄入与 PEW 评估。")
         else:
             d["notes"].append("未提供摄入数据（avg_* 或 include_intake+patient_id），跳过摄入与 PEW 评估。")
 
@@ -519,7 +569,7 @@ def comprehensive_nutrition_assessment_tool(
                 # 默认 high_urea_persistent=False 重算目标 → 同一患儿 PRNT 区块（蛋白下限
                 # 目标）与摄入达成率（上限目标）出现两个矛盾数字。此处与 :403-404 同口径。
                 height_age_years=float(height_age_years) if height_age_years is not None else None,
-                high_urea_persistent=high_urea_persistent,
+                high_urea_persistent=_to_bool(high_urea_persistent),
             )
             d["intake_assessment"] = intake.get("data") if intake.get("ok") else intake
 
